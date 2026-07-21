@@ -138,8 +138,7 @@ Visit [slatedb.io](https://slatedb.io) to learn more.
 - [x] Clones ([#49](https://github.com/slatedb/slatedb/issues/49))
 - [ ] Range deletions ([#577](https://github.com/slatedb/slatedb/issues/577))
 - [x] Change data capture (CDC) ([#249](https://github.com/slatedb/slatedb/issues/249))
-- [ ] Database splitting
-- [ ] Database merging
+- [x] Database split/merge
 
 ## Projects
 
