@@ -424,6 +424,7 @@ mod tests {
 
     use super::*;
     use crate::blob::ReadOnlyBlob;
+    use crate::block_cache_policy::BlockCachePolicy;
     use crate::block_iterator::{BlockIteratorLatest, BlockLike};
     use crate::bytes_range::BytesRange;
     use crate::db_state::{SsTableId, SsTableView};
@@ -487,6 +488,7 @@ mod tests {
             root_path.clone(),
             None,
             TableStoreKind::Main,
+            BlockCachePolicy::default(),
         );
         let path_resolver = PathResolver::new(root_path);
 
@@ -543,7 +545,7 @@ mod tests {
         let encoded = builder.build().await.unwrap();
         let compacted_id = SsTableId::Compacted(ulid::Ulid::new());
         table_store
-            .write_sst(&compacted_id, &encoded, false)
+            .write_sst(&compacted_id, &encoded)
             .await
             .unwrap();
         report(
@@ -560,10 +562,7 @@ mod tests {
         }
         let wal_encoded = wal_builder.build().await.unwrap();
         let wal_id = SsTableId::Wal(1);
-        table_store
-            .write_sst(&wal_id, &wal_encoded, false)
-            .await
-            .unwrap();
+        table_store.write_sst(&wal_id, &wal_encoded).await.unwrap();
         report(
             "wal",
             format.estimate_encoded_size_wal(num_entries, estimated_entries_size),
@@ -593,6 +592,7 @@ mod tests {
             root_path,
             None,
             TableStoreKind::Main,
+            BlockCachePolicy::default(),
         );
         let mut builder = table_store.table_builder();
         builder
@@ -649,6 +649,7 @@ mod tests {
             root_path,
             None,
             TableStoreKind::Main,
+            BlockCachePolicy::default(),
         );
         let mut builder = table_store.table_builder();
         builder
@@ -748,6 +749,7 @@ mod tests {
             root_path,
             None,
             TableStoreKind::Main,
+            BlockCachePolicy::default(),
         );
         let mut builder = table_store.table_builder();
         for k in 1..=8 {
@@ -773,7 +775,7 @@ mod tests {
 
         // write sst and validate that the handle returned has the correct content.
         let sst_handle = table_store
-            .write_sst(&SsTableId::Wal(wal_id), &encoded, false)
+            .write_sst(&SsTableId::Wal(wal_id), &encoded)
             .await
             .unwrap();
         assert_eq!(encoded_info, sst_handle.info);
@@ -833,6 +835,7 @@ mod tests {
             root_path,
             None,
             TableStoreKind::Main,
+            BlockCachePolicy::default(),
         );
         let mut builder = table_store.table_builder();
         builder
@@ -846,7 +849,7 @@ mod tests {
         let encoded = builder.build().await.unwrap();
         let encoded_info = encoded.info.clone();
         table_store
-            .write_sst(&SsTableId::Wal(0), &encoded, false)
+            .write_sst(&SsTableId::Wal(0), &encoded)
             .await
             .unwrap();
         let sst_handle = table_store.open_sst(&SsTableId::Wal(0)).await.unwrap();
@@ -901,6 +904,7 @@ mod tests {
             root_path.clone(),
             None,
             TableStoreKind::Main,
+            BlockCachePolicy::default(),
         );
         let mut builder = table_store.table_builder();
         builder
@@ -914,7 +918,7 @@ mod tests {
         let encoded = builder.build().await.unwrap();
         let encoded_info = encoded.info.clone();
         table_store
-            .write_sst(&SsTableId::Wal(0), &encoded, false)
+            .write_sst(&SsTableId::Wal(0), &encoded)
             .await
             .unwrap();
 
@@ -929,6 +933,7 @@ mod tests {
             root_path,
             None,
             TableStoreKind::Main,
+            BlockCachePolicy::default(),
         );
         let sst_handle = table_store.open_sst(&SsTableId::Wal(0)).await.unwrap();
         let index = table_store.read_index(&sst_handle, true).await.unwrap();
@@ -988,6 +993,7 @@ mod tests {
             root_path,
             None,
             TableStoreKind::Main,
+            BlockCachePolicy::default(),
         );
         let mut builder = table_store.table_builder();
         builder
@@ -1041,6 +1047,7 @@ mod tests {
             root_path,
             None,
             TableStoreKind::Main,
+            BlockCachePolicy::default(),
         );
         let mut builder = table_store.table_builder();
         builder
@@ -1056,7 +1063,7 @@ mod tests {
 
         // write sst and validate that the handle returned has the correct content.
         let sst_handle = table_store
-            .write_sst(&SsTableId::Wal(0), &encoded, false)
+            .write_sst(&SsTableId::Wal(0), &encoded)
             .await
             .unwrap();
         assert_eq!(encoded_info, sst_handle.info);
@@ -1110,6 +1117,7 @@ mod tests {
             root_path,
             None,
             TableStoreKind::Main,
+            BlockCachePolicy::default(),
         );
         let mut builder = table_store.table_builder();
         builder
@@ -1166,6 +1174,7 @@ mod tests {
             root_path,
             None,
             TableStoreKind::Main,
+            BlockCachePolicy::default(),
         ));
         let mut builder = table_store.table_builder();
         for key in 'a'..='z' {
@@ -1175,9 +1184,8 @@ mod tests {
         let encoded = builder.build().await?;
 
         let sst_id = SsTableId::Wal(0);
-        let sst_handle =
-            SsTableView::identity(table_store.write_sst(&sst_id, &encoded, false).await?)
-                .with_visible_range(BytesRange::from_ref("c"..="f"));
+        let sst_handle = SsTableView::identity(table_store.write_sst(&sst_id, &encoded).await?)
+            .with_visible_range(BytesRange::from_ref("c"..="f"));
 
         let expected_entries = vec![
             RowEntry::new_value(b"c", b"value", 0),
@@ -1287,6 +1295,7 @@ mod tests {
             root_path,
             None,
             TableStoreKind::Main,
+            BlockCachePolicy::default(),
         );
         let mut builder = table_store.table_builder();
         builder
@@ -1300,7 +1309,7 @@ mod tests {
         let encoded = builder.build().await.unwrap();
         let encoded_info = encoded.info.clone();
         table_store
-            .write_sst(&SsTableId::Wal(0), &encoded, false)
+            .write_sst(&SsTableId::Wal(0), &encoded)
             .await
             .unwrap();
 
@@ -1343,6 +1352,7 @@ mod tests {
             root_path,
             None,
             TableStoreKind::Main,
+            BlockCachePolicy::default(),
         );
         let mut builder = table_store.table_builder();
         builder
@@ -1355,7 +1365,7 @@ mod tests {
             .unwrap();
         let encoded = builder.build().await.unwrap();
         table_store
-            .write_sst(&SsTableId::Wal(0), &encoded, false)
+            .write_sst(&SsTableId::Wal(0), &encoded)
             .await
             .unwrap();
 
@@ -1431,6 +1441,7 @@ mod tests {
             root_path,
             None,
             TableStoreKind::Main,
+            BlockCachePolicy::default(),
         );
         let mut builder = table_store
             .table_builder()
@@ -1449,7 +1460,7 @@ mod tests {
         }
         let encoded = builder.build().await.unwrap();
         let sst_handle = table_store
-            .write_sst(&SsTableId::Wal(0), &encoded, false)
+            .write_sst(&SsTableId::Wal(0), &encoded)
             .await
             .unwrap();
 
@@ -1498,6 +1509,7 @@ mod tests {
             root_path,
             None,
             TableStoreKind::Main,
+            BlockCachePolicy::default(),
         );
         let mut builder = table_store.table_builder();
         let mut expected = Vec::new();
@@ -1514,7 +1526,7 @@ mod tests {
         }
         let encoded = builder.build().await.unwrap();
         let sst_handle = table_store
-            .write_sst(&SsTableId::Wal(1), &encoded, false)
+            .write_sst(&SsTableId::Wal(1), &encoded)
             .await
             .unwrap();
 
@@ -1562,6 +1574,7 @@ mod tests {
             root_path,
             None,
             TableStoreKind::Main,
+            BlockCachePolicy::default(),
         );
         let mut builder = table_store.table_builder();
 
@@ -1612,7 +1625,7 @@ mod tests {
 
         let encoded = builder.build().await.unwrap();
         let sst_handle = table_store
-            .write_sst(&SsTableId::Wal(0), &encoded, false)
+            .write_sst(&SsTableId::Wal(0), &encoded)
             .await
             .unwrap();
         let stats = table_store
@@ -1670,6 +1683,7 @@ mod tests {
             root_path,
             None,
             TableStoreKind::Main,
+            BlockCachePolicy::default(),
         );
         let mut builder = table_store.table_builder();
         builder
@@ -1682,7 +1696,7 @@ mod tests {
             .unwrap();
         let encoded = builder.build().await.unwrap();
         let sst_handle = table_store
-            .write_sst(&SsTableId::Wal(0), &encoded, false)
+            .write_sst(&SsTableId::Wal(0), &encoded)
             .await
             .unwrap();
         let stats = table_store
@@ -1713,6 +1727,7 @@ mod tests {
             root_path,
             None,
             TableStoreKind::Main,
+            BlockCachePolicy::default(),
         );
         let mut builder = table_store.table_builder();
         builder
@@ -1725,7 +1740,7 @@ mod tests {
             .unwrap();
         let encoded = builder.build().await.unwrap();
         let sst_handle = table_store
-            .write_sst(&SsTableId::Wal(0), &encoded, false)
+            .write_sst(&SsTableId::Wal(0), &encoded)
             .await
             .unwrap();
         let stats = table_store
@@ -1759,6 +1774,7 @@ mod tests {
             root_path,
             None,
             TableStoreKind::Main,
+            BlockCachePolicy::default(),
         );
         let mut builder = table_store.table_builder();
         // Block 0: put
@@ -1791,7 +1807,7 @@ mod tests {
 
         let encoded = builder.build().await.unwrap();
         let sst_handle = table_store
-            .write_sst(&SsTableId::Wal(0), &encoded, false)
+            .write_sst(&SsTableId::Wal(0), &encoded)
             .await
             .unwrap();
         let stats = table_store
@@ -1857,6 +1873,7 @@ mod tests {
             root_path.clone(),
             None,
             TableStoreKind::Main,
+            BlockCachePolicy::default(),
         );
 
         // Write keys whose 3-byte prefix is "key".
@@ -1870,7 +1887,7 @@ mod tests {
         }
         let encoded = builder.build().await.unwrap();
         table_store
-            .write_sst(&SsTableId::Wal(0), &encoded, false)
+            .write_sst(&SsTableId::Wal(0), &encoded)
             .await
             .unwrap();
         let handle = table_store.open_sst(&SsTableId::Wal(0)).await.unwrap();
@@ -1914,6 +1931,7 @@ mod tests {
             root_path,
             None,
             TableStoreKind::Main,
+            BlockCachePolicy::default(),
         );
         let handle_partial = store_partial.open_sst(&SsTableId::Wal(0)).await.unwrap();
         let partial = store_partial

@@ -2123,6 +2123,7 @@ impl DbWalObserver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::block_cache_policy::BlockCachePolicy;
     use crate::config::DurabilityLevel::{Memory, Remote};
     use crate::config::MetricLevel;
     use crate::config::{
@@ -4119,6 +4120,7 @@ mod tests {
             path.clone(),
             None,
             TableStoreKind::Main,
+            BlockCachePolicy::default(),
         ));
         let db = Db::builder(path.clone(), object_store.clone())
             .with_settings(options)
@@ -4220,6 +4222,7 @@ mod tests {
             path,
             None,
             TableStoreKind::Main,
+            BlockCachePolicy::default(),
         ));
 
         // Write data a few times such that each loop results in a memtable flush
@@ -4407,6 +4410,7 @@ mod tests {
             path,
             None,
             TableStoreKind::Main,
+            BlockCachePolicy::default(),
         ));
 
         // Write some data to populate the memtable
@@ -5963,6 +5967,7 @@ mod tests {
             path,
             None,
             TableStoreKind::Main,
+            BlockCachePolicy::default(),
         ));
 
         // Get the next WAL SST ID based on what's currently in the object store
@@ -6272,6 +6277,7 @@ mod tests {
             path,
             None,
             TableStoreKind::Main,
+            BlockCachePolicy::default(),
         ));
         let mut w1_paused = false;
         for _ in 0..600 {
@@ -6368,6 +6374,7 @@ mod tests {
             path,
             None,
             TableStoreKind::Main,
+            BlockCachePolicy::default(),
         );
         wait_for_wal_sst_count(
             &probe_table_store,
@@ -6446,6 +6453,7 @@ mod tests {
             path,
             None,
             TableStoreKind::Main,
+            BlockCachePolicy::default(),
         );
         wait_for_wal_sst_count(
             &probe_table_store,
@@ -7886,6 +7894,7 @@ mod tests {
             path.clone(),
             None,
             TableStoreKind::Main,
+            BlockCachePolicy::default(),
         );
         let compacted_ssts = table_store
             .list_compacted_ssts(..)
