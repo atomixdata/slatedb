@@ -226,24 +226,36 @@ impl CachedObjectStore {
             }
         }
 
-        // Second pass: load the selected files in bounded parallelism and cache them.
+        // Second pass: load the selected files in bounded parallelism and cache
+        // them. For each file we also warm the file-handle cache and populate
+        // the in-memory head cache — done even when the file is already on disk,
+        // so a restart with a warm disk cache still primes both in-memory tiers.
         let degree_of_parallelism = 32;
         let _result = build_concurrent(files_to_load.into_iter(), degree_of_parallelism, |path| {
             let this = self.clone();
             async move {
-                match this
-                    .maybe_prefetch_range(&path, GetOptions::default())
-                    .await
-                {
-                    Ok(_) => Ok(Some(())),
+                // Ensure the object's parts are on disk (a no-op if already cached).
+                if let Err(e) = this.maybe_prefetch_range(&path, GetOptions::default()).await {
+                    warn!(
+                        "Failed to prefetch file into cache [path={}, error={:?}]",
+                        path, e
+                    );
+                    return Ok(None); // best-effort: skip errors
+                }
+
+                // Warm the file-handle cache (head + part files) and the
+                // in-memory head cache from the on-disk head.
+                let entry = this.cache_storage.entry(&path, this.part_size_bytes);
+                match entry.warm().await {
+                    Ok(Some((meta, attributes))) => {
+                        this.head_cache.insert(&path, meta, attributes);
+                    }
+                    Ok(None) => {}
                     Err(e) => {
-                        warn!(
-                            "Failed to prefetch file into cache [path={}, error={:?}]",
-                            path, e
-                        );
-                        Ok(None) // best-effort: skip errors
+                        warn!("Failed to warm caches [path={}, error={:?}]", path, e);
                     }
                 }
+                Ok(Some(()))
             }
         })
         .await;
@@ -409,17 +421,11 @@ impl CachedObjectStore {
         location: &Path,
         mut opts: GetOptions,
     ) -> object_store::Result<PrefetchedHead> {
-        // In-memory head cache: a hit lets the read proceed straight to the
-        // cached parts without an on-disk head read.
-        if let Some(head) = self.head_cache.get(location) {
-            return Ok(PrefetchedHead {
-                meta: head.meta.clone(),
-                attributes: head.attributes.clone(),
-                extensions: Extensions::new(),
-                head_source: ReadResultSource::Disk,
-            });
-        }
-
+        // NOTE: the in-memory head cache is intentionally NOT consulted here.
+        // This path must guarantee the object's parts are prefetched to disk,
+        // and an in-memory head does not imply the parts are present (heads are
+        // recorded for every write, including those whose payload is not disk
+        // cached). HEAD requests get the in-memory fast path via `cached_head`.
         let entry = self.cache_storage.entry(location, self.part_size_bytes);
         match entry.read_head().await {
             Ok(Some((meta, attrs))) => {
@@ -1318,6 +1324,77 @@ mod tests {
         assert!(
             cached_store.head_cache.get(&location).is_none(),
             "delete should evict the in-memory head"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_load_files_to_cache_warms_head_and_handle_caches() {
+        let location = Path::from("warm-sst");
+        // Object spanning multiple parts at a 1024-byte part size.
+        let payload = Bytes::from(vec![3_u8; 4096]);
+        let upstream = Arc::new(object_store::memory::InMemory::new());
+        upstream
+            .put(&location, PutPayload::from_bytes(payload))
+            .await
+            .unwrap();
+
+        let recorder = MetricsRecorderHelper::noop();
+        let stats = Arc::new(CachedObjectStoreStats::new(&recorder));
+        let fs_storage = Arc::new(FsCacheStorage::new(
+            new_test_cache_folder(),
+            None,
+            None,
+            stats.clone(),
+            Arc::new(DefaultSystemClock::new()),
+            Arc::new(DbRand::default()),
+            1000,
+        ));
+        let cached_store = CachedObjectStore::new(
+            upstream,
+            fs_storage.clone(),
+            1024,
+            CachePutConfig::default(),
+            stats,
+        )
+        .unwrap();
+
+        // Nothing warm before the preload.
+        assert!(cached_store.head_cache.get(&location).is_none());
+        assert_eq!(fs_storage.file_handle_cache_population(), 0);
+
+        cached_store
+            .load_files_to_cache(vec![location.clone()], usize::MAX)
+            .await
+            .unwrap();
+
+        // In-memory head cache populated with the correct size.
+        let head = cached_store
+            .head_cache
+            .get(&location)
+            .expect("head cache should be warmed");
+        assert_eq!(head.meta.size, 4096);
+        // File-handle cache warmed: the head file plus 4 part files.
+        assert!(
+            fs_storage.file_handle_cache_population() >= 5,
+            "expected head + 4 parts warmed, got {}",
+            fs_storage.file_handle_cache_population()
+        );
+
+        // Already-on-disk path: drop the in-memory head, preload again, and it
+        // must be re-warmed from the on-disk head without an upstream fetch.
+        cached_store.head_cache.remove(&location);
+        cached_store
+            .load_files_to_cache(vec![location.clone()], usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            cached_store
+                .head_cache
+                .get(&location)
+                .expect("head cache re-warmed from disk")
+                .meta
+                .size,
+            4096
         );
     }
 

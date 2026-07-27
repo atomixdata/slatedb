@@ -515,6 +515,38 @@ impl LocalCacheEntry for FsCacheEntry {
         }
     }
 
+    async fn warm(&self) -> object_store::Result<Option<(ObjectMeta, Attributes)>> {
+        // Reading the head opens and caches the head file handle and returns
+        // the metadata we need. A `None` means the entry is not on disk.
+        let Some((meta, attributes)) = self.read_head().await? else {
+            return Ok(None);
+        };
+
+        // Open (and cache) a handle for each part file. Parts are numbered
+        // 0..ceil(size / part_size); a preloaded object is fetched whole, so all
+        // parts exist. Any part that is missing (partial cache) is skipped.
+        let num_parts = (meta.size as usize).div_ceil(self.part_size);
+        if num_parts > 0 {
+            let root_folder = self.root_folder.clone();
+            let location = self.location.clone();
+            let part_size = self.part_size;
+            let file_handle_cache = self.file_handle_cache.clone();
+            #[allow(clippy::disallowed_methods)]
+            tokio::task::spawn_blocking(move || {
+                for part_number in 0..num_parts {
+                    let part_path =
+                        Self::make_part_path(root_folder.clone(), &location, part_number, part_size);
+                    // Best-effort: ignore missing parts and open errors.
+                    let _ = file_handle_cache.get_or_open(&part_path);
+                }
+            })
+            .await
+            .map_err(wrap_io_err)?;
+        }
+
+        Ok(Some((meta, attributes)))
+    }
+
     async fn delete(&self) {
         let Some(path) = Self::make_head_path(self.root_folder.clone(), &self.location)
             .parent()
