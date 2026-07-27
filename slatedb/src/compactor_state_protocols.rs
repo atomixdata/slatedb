@@ -240,7 +240,7 @@ impl CompactorStateWriter {
 
     /// Persists the updated manifest after a compaction finishes.
     ///
-    /// A checkpoint with a 15-minute lifetime is written first to prevent GC from
+    /// A checkpoint with a 1-minute lifetime is written first to prevent GC from
     /// deleting SSTs that are about to be removed. This is to keep them around for a
     /// while in case any in-flight operations (such as iterator scans) are still using
     /// them.
@@ -252,13 +252,13 @@ impl CompactorStateWriter {
             .write_checkpoint(
                 checkpoint_id,
                 &CheckpointOptions {
-                    // TODO(rohan): for now, just write a checkpoint with 15-minute expiry
+                    // TODO(rohan): for now, just write a checkpoint with 1-minute expiry
                     //              so that it's extremely unlikely for the gc to delete ssts
                     //              out from underneath the writer. In a follow up, we'll write
                     //              a checkpoint with no expiry and with metadata indicating its
                     //              a compactor checkpoint. Then, the gc will delete the checkpoint
                     //              based on a configurable timeout
-                    lifetime: Some(Duration::from_secs(900)),
+                    lifetime: Some(Duration::from_secs(60)),
                     ..CheckpointOptions::default()
                 },
             )
