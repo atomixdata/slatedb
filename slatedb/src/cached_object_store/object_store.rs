@@ -2698,7 +2698,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_compactor_get_bypasses_cache() {
+    async fn test_compactor_get_reads_through_cache() {
         let upstream: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
         let store = policy_test_store(upstream.clone(), CachePutConfig::default());
 
@@ -2709,7 +2709,8 @@ mod tests {
             .await
             .unwrap();
 
-        // A compactor read returns the bytes but caches nothing.
+        // A compactor read returns the bytes and admits them to the cache, so
+        // subsequent reads can be served from disk instead of the object store.
         let got = store
             .get_opts(
                 &location,
@@ -2724,22 +2725,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(got, payload);
-        assert_eq!(cached_part_count(&store, &location).await, 0);
-
-        // A main read of the same object caches it: the bypass is compactor specific.
-        store
-            .get_opts(
-                &location,
-                get_opts_tagged(ObjectStoreCallTag::new(
-                    TableStoreKind::Main,
-                    SstType::Compacted,
-                )),
-            )
-            .await
-            .unwrap()
-            .bytes()
-            .await
-            .unwrap();
         assert_eq!(cached_part_count(&store, &location).await, 2);
     }
 
