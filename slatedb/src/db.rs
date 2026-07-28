@@ -12237,8 +12237,14 @@ mod tests {
 
             t.compact_and_wait().await;
 
+            // Compactor reads go through the cache, so the L0 inputs read during
+            // compaction are admitted to the disk cache too (not just the output).
             for id in &l0_ids {
-                t.assert_cached(&t.compacted_sst_path(id), 0);
+                let path = t.compacted_sst_path(id);
+                assert!(
+                    t.cached_part_count(&path) > 0,
+                    "expected compaction input {path} to be cached via read-through"
+                );
             }
 
             let output_ids = t.compaction_output_ids(&l0_ids);

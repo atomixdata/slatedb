@@ -21,13 +21,12 @@ impl GetPolicy for DefaultGetPolicy {
             return GetAction::Bypass;
         };
 
-        // Compactor reads are one shot large scans that are not worth caching
-        // and GC doesn't issue any reads that would benefit from caching.
-        // Both bypass the cache. WAL reads are mainly during startup so they
-        // bypass the cache.
-        if matches!(tag.kind, TableStoreKind::Compactor | TableStoreKind::GC)
-            || tag.sst_type == SstType::Wal
-        {
+        // GC doesn't issue any reads that would benefit from caching, and WAL
+        // reads are mainly during startup, so both bypass the cache. Compactor
+        // reads go through the cache: when the input SSTs are already cached on
+        // disk (e.g. cached on flush or warmed at startup) compaction serves
+        // them locally instead of hitting the object store.
+        if tag.kind == TableStoreKind::GC || tag.sst_type == SstType::Wal {
             GetAction::Bypass
         } else if tag.retry.is_some() {
             // A reissued, non-bypassed read refetches.
@@ -157,10 +156,11 @@ mod tests {
     }
 
     #[rstest]
-    // Compactor and GC reads bypass regardless of sst type or retry.
+    // Compactor reads go through the cache so they can be served from disk;
+    // a reissued compactor read refetches like any other non-bypassed read.
     #[case(
         Some(tag(TableStoreKind::Compactor, SstType::Compacted, None)),
-        GetAction::Bypass
+        GetAction::ReadThrough
     )]
     #[case(
         Some(tag(
@@ -168,8 +168,14 @@ mod tests {
             SstType::Compacted,
             Some(RetryReason::CrcMismatch)
         )),
+        GetAction::Refetch
+    )]
+    // Compactor WAL reads still bypass (WAL is never cached).
+    #[case(
+        Some(tag(TableStoreKind::Compactor, SstType::Wal, None)),
         GetAction::Bypass
     )]
+    // GC reads bypass regardless of sst type or retry.
     #[case(
         Some(tag(TableStoreKind::GC, SstType::Compacted, None)),
         GetAction::Bypass
