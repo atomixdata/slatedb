@@ -35,21 +35,31 @@ impl CachedFileHandle {
     }
 }
 
-/// A cache of open file descriptors, keyed by filesystem path.
+/// A bounded LRU cache of open file descriptors, keyed by filesystem path.
 ///
-/// Uses a `Mutex` protecting an `LruCache` for O(1) lookup, promotion, and
-/// eviction. Individual file reads use positional I/O (`pread` /
-/// `read_exact_at`) which does not touch the file cursor, so multiple threads
-/// can read from the same `Arc<CachedFileHandle>` concurrently without any
-/// per-file locking.
+/// Backed by an `LruCache` under a `parking_lot::Mutex`. The mutex is held only
+/// long enough to bump the recency entry / evict / insert — **never across the
+/// `fstat` validity check or the `open` syscall**. `get_or_open` is called once
+/// per block read from inside `spawn_blocking`, so holding the lock across a
+/// kernel call serializes the entire blocking pool on one mutex and burns CPU
+/// in park/unpark churn.
+///
+/// Individual file reads use positional I/O (`pread` / `read_exact_at`) which
+/// does not touch the file cursor, so multiple threads can read from the same
+/// `Arc<CachedFileHandle>` concurrently without any per-file locking.
+///
+/// The cap is the hard ceiling on simultaneously held fds (tune via
+/// [`ObjectStoreCacheOptions::max_open_file_handles`](crate::config::ObjectStoreCacheOptions)).
+/// Sizing it well below the working set makes nearly every read take the
+/// `open` miss path, so raise it toward `RLIMIT_NOFILE` for large datasets.
 #[derive(Clone)]
 pub(crate) struct FileHandleCache {
-    inner: Arc<std::sync::Mutex<LruCache<std::path::PathBuf, Arc<CachedFileHandle>>>>,
+    inner: Arc<parking_lot::Mutex<LruCache<std::path::PathBuf, Arc<CachedFileHandle>>>>,
 }
 
 impl std::fmt::Debug for FileHandleCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let inner = self.inner.lock().expect("lock should not be poisoned");
+        let inner = self.inner.lock();
         f.debug_struct("FileHandleCache")
             .field("len", &inner.len())
             .field("cap", &inner.cap())
@@ -60,7 +70,7 @@ impl std::fmt::Debug for FileHandleCache {
 impl FileHandleCache {
     fn new(max_handles: usize) -> Self {
         Self {
-            inner: Arc::new(std::sync::Mutex::new(LruCache::new(
+            inner: Arc::new(parking_lot::Mutex::new(LruCache::new(
                 NonZeroUsize::new(max_handles).expect("max_handles must be > 0"),
             ))),
         }
@@ -72,26 +82,69 @@ impl FileHandleCache {
         &self,
         path: &std::path::Path,
     ) -> Result<Option<Arc<CachedFileHandle>>, std::io::Error> {
-        let mut cache = self.inner.lock().expect("lock should not be poisoned");
-        if let Some(handle) = cache.get(path) {
-            if Self::is_valid(handle, path) {
-                return Ok(Some(handle.clone()));
+        // Hot path: bump LRU recency, clone the Arc, and drop the lock before
+        // doing any I/O on the returned handle.
+        {
+            let mut guard = self.inner.lock();
+            if let Some(entry) = guard.get(path) {
+                let entry = entry.clone();
+                drop(guard);
+                if Self::is_valid(&entry, path) {
+                    return Ok(Some(entry));
+                }
+                // Stale (file replaced or unlinked). Remove and fall through
+                // to reopen.
+                self.inner.lock().pop(path);
             }
-            // Stale entry — remove it so we reopen below.
-            cache.pop(path);
         }
 
+        // Open with no lock held: this can block on disk.
         let file = match std::fs::File::open(path) {
             Ok(f) => f,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(err) => return Err(err),
         };
+        Self::set_random_advise(&file);
 
         let handle = Arc::new(CachedFileHandle { file });
 
-        cache.push(path.to_path_buf(), handle.clone());
+        // Race-tolerant insert: if another thread opened the same path while we
+        // were outside the lock, use theirs and drop our freshly opened fd, so
+        // concurrent readers all share one Arc instead of duplicating fds.
+        let mut guard = self.inner.lock();
+        if let Some(existing) = guard.get(path) {
+            return Ok(Some(existing.clone()));
+        }
+        guard.push(path.to_path_buf(), handle.clone());
         Ok(Some(handle))
     }
+
+    /// Hint the kernel that we will read randomly inside this file. SST reads
+    /// pull small block ranges out of large part files, so the default
+    /// readahead window wastes I/O fetching adjacent blocks we never use (and
+    /// churns the page cache). Best-effort: failures are ignored silently.
+    #[cfg(target_os = "linux")]
+    fn set_random_advise(file: &std::fs::File) {
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: posix_fadvise only inspects the fd; it does not transfer
+        // ownership and is safe to call on any open file.
+        unsafe {
+            libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_RANDOM);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn set_random_advise(file: &std::fs::File) {
+        use std::os::unix::io::AsRawFd;
+        // F_RDAHEAD with arg 0 disables sequential prefetching for the file.
+        // SAFETY: fcntl with F_RDAHEAD only sets a per-fd flag.
+        unsafe {
+            libc::fcntl(file.as_raw_fd(), libc::F_RDAHEAD, 0);
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    fn set_random_advise(_file: &std::fs::File) {}
 
     /// Check whether a cached file descriptor still refers to a live file.
     ///
@@ -116,8 +169,7 @@ impl FileHandleCache {
     /// Remove a cached handle, e.g. after eviction or after a write replaces
     /// the file (since the cached fd would still reference the old inode).
     fn invalidate(&self, path: &std::path::Path) {
-        let mut cache = self.inner.lock().expect("lock should not be poisoned");
-        cache.pop(path);
+        self.inner.lock().pop(path);
     }
 }
 
@@ -188,7 +240,7 @@ impl FsCacheStorage {
 
     #[cfg(test)]
     pub(crate) fn file_handle_cache_population(&self) -> usize {
-        self.file_handle_cache.inner.lock().unwrap().len()
+        self.file_handle_cache.inner.lock().len()
     }
 }
 
@@ -1221,6 +1273,67 @@ mod tests {
         let mut file = std::fs::File::create(&file_path).unwrap();
         file.write_all(&bytes).unwrap();
         file_path
+    }
+
+    #[test]
+    fn test_file_handle_cache_reuses_and_invalidates() {
+        let temp_dir = tempfile::Builder::new()
+            .prefix("fh_cache_reuse_")
+            .tempdir()
+            .unwrap();
+        let path = gen_rand_file(temp_dir.path(), "file0", 1024);
+        let cache = FileHandleCache::new(10);
+
+        // A cache hit hands back the very same fd, not a reopened one.
+        let h1 = cache.get_or_open(&path).unwrap().unwrap();
+        let h2 = cache.get_or_open(&path).unwrap().unwrap();
+        assert!(Arc::ptr_eq(&h1, &h2));
+
+        // After invalidation the next lookup reopens.
+        cache.invalidate(&path);
+        let h3 = cache.get_or_open(&path).unwrap().unwrap();
+        assert!(!Arc::ptr_eq(&h1, &h3));
+
+        // A missing file is Ok(None), not an error.
+        let missing = temp_dir.path().join("does_not_exist");
+        assert!(cache.get_or_open(&missing).unwrap().is_none());
+    }
+
+    /// Concurrent misses on the same path must converge on a single fd. The
+    /// open happens outside the lock, so several threads can open the same file
+    /// at once; the race-tolerant insert keeps the first winner and drops the
+    /// losers' fds rather than leaking a descriptor per racing reader.
+    #[test]
+    fn test_file_handle_cache_concurrent_miss_shares_one_handle() {
+        let temp_dir = tempfile::Builder::new()
+            .prefix("fh_cache_race_")
+            .tempdir()
+            .unwrap();
+        let path = gen_rand_file(temp_dir.path(), "file0", 1024);
+        let cache = FileHandleCache::new(10);
+
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let cache = cache.clone();
+                let path = path.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    cache.get_or_open(&path).unwrap().unwrap()
+                })
+            })
+            .collect();
+
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let first = &results[0];
+        for other in &results[1..] {
+            assert!(
+                Arc::ptr_eq(first, other),
+                "concurrent get_or_open returned distinct fds"
+            );
+        }
+        assert_eq!(cache.inner.lock().len(), 1);
     }
 
     #[tokio::test]

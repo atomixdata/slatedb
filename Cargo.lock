@@ -3236,6 +3236,7 @@ dependencies = [
  "foyer",
  "futures",
  "insta",
+ "libc",
  "log",
  "lru",
  "lz4_flex",
