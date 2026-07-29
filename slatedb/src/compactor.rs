@@ -1818,7 +1818,7 @@ mod tests {
             .tree
             .compacted
             .iter()
-            .flat_map(|sr| &sr.sst_views)
+            .flat_map(|sr| sr.sst_views.iter())
             .collect();
         assert_eq!(output_ssts.len(), 1);
         let view = output_ssts[0];
@@ -3878,7 +3878,7 @@ mod tests {
         ));
         let segment_sr = SortedRun {
             id: 7,
-            sst_views: vec![segment_sr_view.clone()],
+            sst_views: vec![segment_sr_view.clone()].into(),
         };
 
         let mut core = ManifestCore::new();
@@ -4166,7 +4166,7 @@ mod tests {
                     SsTableId::Compacted(Ulid::new()),
                     SST_FORMAT_VERSION_LATEST,
                     sr_info.clone(),
-                ))],
+                ))].into(),
             },
             SortedRun {
                 id: 1,
@@ -4174,7 +4174,7 @@ mod tests {
                     SsTableId::Compacted(Ulid::new()),
                     SST_FORMAT_VERSION_LATEST,
                     sr_info.clone(),
-                ))],
+                ))].into(),
             },
         ];
         stored_manifest.update(dirty).await.unwrap();
@@ -4269,7 +4269,7 @@ mod tests {
                     SsTableId::Compacted(Ulid::from_parts(10, 0)),
                     SST_FORMAT_VERSION_LATEST,
                     sr_info.clone(),
-                ))],
+                ))].into(),
             },
             SortedRun {
                 id: 2,
@@ -4277,7 +4277,7 @@ mod tests {
                     SsTableId::Compacted(Ulid::from_parts(11, 0)),
                     SST_FORMAT_VERSION_LATEST,
                     sr_info,
-                ))],
+                ))].into(),
             },
         ];
         let state = CompactorStateView {
@@ -4366,7 +4366,7 @@ mod tests {
                             SsTableId::Compacted(Ulid::from_parts(70, 0)),
                             SST_FORMAT_VERSION_LATEST,
                             sr_info.clone(),
-                        ))],
+                        ))].into(),
                     },
                     SortedRun {
                         id: 3,
@@ -4374,7 +4374,7 @@ mod tests {
                             SsTableId::Compacted(Ulid::from_parts(30, 0)),
                             SST_FORMAT_VERSION_LATEST,
                             sr_info,
-                        ))],
+                        ))].into(),
                     },
                 ],
             }),
@@ -4421,7 +4421,7 @@ mod tests {
                 SsTableId::Compacted(Ulid::from_parts(90, 0)),
                 SST_FORMAT_VERSION_LATEST,
                 sr_info,
-            ))],
+            ))].into(),
         }];
         let state = CompactorStateView {
             compactions: None,
@@ -4457,7 +4457,7 @@ mod tests {
                 SsTableId::Compacted(Ulid::from_parts(40, 0)),
                 SST_FORMAT_VERSION_LATEST,
                 sr_info,
-            ))],
+            ))].into(),
         }];
         let state = CompactorStateView {
             compactions: None,
@@ -4496,7 +4496,7 @@ mod tests {
                     SsTableId::Compacted(Ulid::from_parts(80, 0)),
                     SST_FORMAT_VERSION_LATEST,
                     info.clone(),
-                ))],
+                ))].into(),
             },
             SortedRun {
                 id: 4,
@@ -4504,7 +4504,7 @@ mod tests {
                     SsTableId::Compacted(Ulid::from_parts(40, 0)),
                     SST_FORMAT_VERSION_LATEST,
                     info.clone(),
-                ))],
+                ))].into(),
             },
         ];
         core.segment_extractor_name = Some("test".into());
@@ -4521,7 +4521,7 @@ mod tests {
                             SsTableId::Compacted(Ulid::from_parts(30, 0)),
                             SST_FORMAT_VERSION_LATEST,
                             info.clone(),
-                        ))],
+                        ))].into(),
                     }],
                 }),
             },
@@ -4538,7 +4538,7 @@ mod tests {
                                 SsTableId::Compacted(Ulid::from_parts(90, 0)),
                                 SST_FORMAT_VERSION_LATEST,
                                 info.clone(),
-                            ))],
+                            ))].into(),
                         },
                         SortedRun {
                             id: 6,
@@ -4546,7 +4546,7 @@ mod tests {
                                 SsTableId::Compacted(Ulid::from_parts(60, 0)),
                                 SST_FORMAT_VERSION_LATEST,
                                 info,
-                            ))],
+                            ))].into(),
                         },
                     ],
                 }),
@@ -4597,7 +4597,7 @@ mod tests {
                 SsTableId::Compacted(Ulid::from_parts(50, 0)),
                 SST_FORMAT_VERSION_LATEST,
                 info.clone(),
-            ))],
+            ))].into(),
         }];
         core.segment_extractor_name = Some("test".into());
         core.segments = vec![
@@ -5596,7 +5596,7 @@ mod tests {
         // but below the global max.
         Arc::make_mut(&mut core.tree).compacted = vec![SortedRun {
             id: 7,
-            sst_views: Vec::new(),
+            sst_views: Vec::new().into(),
         }];
         core.segments = vec![Segment {
             prefix: prefix.clone(),
@@ -5641,7 +5641,7 @@ mod tests {
             .core;
         Arc::make_mut(&mut core.tree).compacted = vec![SortedRun {
             id: 7,
-            sst_views: Vec::new(),
+            sst_views: Vec::new().into(),
         }];
         core.segments = vec![Segment {
             prefix: prefix.clone(),
@@ -5694,7 +5694,7 @@ mod tests {
                 l0: VecDeque::from(vec![make_view(l0_view)]),
                 compacted: vec![SortedRun {
                     id: 7,
-                    sst_views: Vec::new(),
+                    sst_views: Vec::new().into(),
                 }],
             }),
         }];
@@ -5881,7 +5881,7 @@ mod tests {
             .core;
         Arc::make_mut(&mut core.tree).compacted = vec![SortedRun {
             id: 99,
-            sst_views: Vec::new(),
+            sst_views: Vec::new().into(),
         }];
         let prefix = Bytes::from_static(b"seg/");
         core.segments = vec![Segment {
@@ -5924,7 +5924,7 @@ mod tests {
         // its destination but does not list it among its sources.
         Arc::make_mut(&mut core.tree).compacted = vec![SortedRun {
             id: 7,
-            sst_views: Vec::new(),
+            sst_views: Vec::new().into(),
         }];
         // Seed SR(99) into the segment so the source-existence check passes and
         // destination-overwrite is the rejection reason.
@@ -5937,7 +5937,7 @@ mod tests {
                 l0: VecDeque::new(),
                 compacted: vec![SortedRun {
                     id: 99,
-                    sst_views: Vec::new(),
+                    sst_views: Vec::new().into(),
                 }],
             }),
         }];
