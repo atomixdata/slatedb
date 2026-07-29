@@ -147,6 +147,24 @@ impl<'a> SortedRunIterator<'a> {
         Ok(iter)
     }
 
+    /// Build an initialized iterator from tables already narrowed to the
+    /// covering range. Callers that only hold a borrowed run use
+    /// [`SortedRun::tables_covering_range`] to select and clone just the
+    /// covering views, avoiding a clone of the entire run.
+    pub(crate) async fn new_from_tables_initialized_with_stats(
+        range: BytesRange,
+        tables: VecDeque<SsTableView>,
+        table_store: Arc<TableStore>,
+        sst_iter_options: SstIteratorOptions,
+        db_stats: Option<DbStats>,
+    ) -> Result<Self, SlateDBError> {
+        let view = SortedRunView::Owned(tables, range);
+        let mut iter =
+            SortedRunIterator::new(view, table_store, sst_iter_options, db_stats).await?;
+        iter.init().await?;
+        Ok(iter)
+    }
+
     pub(crate) async fn new_borrowed<T: RangeBounds<&'a [u8]>>(
         range: T,
         sorted_run: &'a SortedRun,

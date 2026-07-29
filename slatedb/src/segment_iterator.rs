@@ -385,23 +385,33 @@ async fn build_sr_range_iters(
     ctx: &SegmentScanContext,
 ) -> Result<VecDeque<Box<dyn RowEntryIterator>>, SlateDBError> {
     let range = ctx.range.clone();
-    let overlapping: Vec<_> = compacted
+    // Narrow each overlapping run to just the views covering the scan range on
+    // the borrowed run, cloning only those. Cloning the whole run per scan
+    // deep-clones every view's key `Bytes`, which dominates read CPU when a run
+    // holds many SSTs but the range touches only a few.
+    let overlapping: Vec<VecDeque<SsTableView>> = compacted
         .iter()
         .filter(|sr| sr.overlaps_range(&range))
-        .cloned()
+        .map(|sr| {
+            sr.tables_covering_range(range.clone())
+                .into_iter()
+                .cloned()
+                .collect()
+        })
+        .filter(|tables: &VecDeque<SsTableView>| !tables.is_empty())
         .collect();
     let table_store = ctx.table_store.clone();
     let opts = ctx.sst_iter_options.clone();
     let stats = ctx.db_stats.clone();
-    build_concurrent(overlapping.into_iter(), ctx.max_parallel, move |sr| {
+    build_concurrent(overlapping.into_iter(), ctx.max_parallel, move |tables| {
         let table_store = table_store.clone();
         let range = range.clone();
         let opts = opts.clone();
         let stats = stats.clone();
         async move {
-            SortedRunIterator::new_owned_initialized_with_stats(
+            SortedRunIterator::new_from_tables_initialized_with_stats(
                 range,
-                sr,
+                tables,
                 table_store,
                 opts,
                 Some(stats),
