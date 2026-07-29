@@ -411,11 +411,23 @@ impl Reader {
                 .compacted
                 .iter()
                 .filter(|sr| sr.overlaps_range(&range))
-                .cloned()
             {
-                let iter = SortedRunIterator::new_owned(
+                // Narrow to the covering views on the borrowed run and clone
+                // only those, rather than cloning the whole run per scan. A
+                // run may hold many SSTs while the range touches only a few;
+                // deep-cloning every view's key `Bytes` otherwise dominates
+                // read CPU.
+                let tables = sr
+                    .tables_covering_range(range.clone())
+                    .into_iter()
+                    .cloned()
+                    .collect::<VecDeque<_>>();
+                if tables.is_empty() {
+                    continue;
+                }
+                let iter = SortedRunIterator::new_from_tables_with_stats(
                     range.clone(),
-                    sr,
+                    tables,
                     self.table_store.clone(),
                     sst_iter_options.clone(),
                     Some(self.db_stats.clone()),
