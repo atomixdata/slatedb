@@ -14,12 +14,13 @@ pub(crate) struct CachedHead {
 /// An in-memory cache of object heads (HEAD metadata) that sits in front of the
 /// on-disk head cache in [`super::CachedObjectStore`].
 ///
-/// It is populated only on write paths (`cached_put_opts` after the on-disk
-/// `save_head` succeeds, and the multipart commit). Reads never fill it: that
-/// keeps the map coherent with the authoritative on-disk head files without any
-/// invalidation protocol, and avoids amplifying read-side memory pressure when
-/// reads stream over many short-lived objects. A hit here skips both the on-disk
-/// head read and the upstream HEAD round trip.
+/// It is populated on write paths (`cached_put_opts` after the on-disk
+/// `save_head` succeeds, and the multipart commit), by the startup preload
+/// (`warm()`), and by reads that fall through to a successful on-disk head read.
+/// Filling from the on-disk head stays coherent because that head is
+/// authoritative and entries are removed/overwritten on delete and
+/// rename/copy. A hit here skips both the on-disk head read (spawn_blocking +
+/// file-handle lock + JSON parse) and the upstream HEAD round trip.
 ///
 /// Entries are removed when the underlying object is deleted (or overwritten via
 /// rename/copy) so a later reader never sees stale metadata. There is no size

@@ -421,20 +421,35 @@ impl CachedObjectStore {
         location: &Path,
         mut opts: GetOptions,
     ) -> object_store::Result<PrefetchedHead> {
-        // NOTE: the in-memory head cache is intentionally NOT consulted here.
-        // This path must guarantee the object's parts are prefetched to disk,
-        // and an in-memory head does not imply the parts are present (heads are
-        // recorded for every write, including those whose payload is not disk
-        // cached). HEAD requests get the in-memory fast path via `cached_head`.
+        // Fast path: an in-memory head (populated by preload's `warm()` and by
+        // writes) lets a read skip the on-disk head entirely - no
+        // spawn_blocking, no file-handle lock, no JSON parse. An in-memory head
+        // does not by itself prove every part is on disk, but `read_part` falls
+        // back to the object store for any absent part, so trusting it here
+        // stays correct while avoiding the per-read head read that otherwise
+        // dominates the miss path once head files fall out of the OS page cache.
+        if let Some(head) = self.head_cache.get(location) {
+            return Ok(PrefetchedHead {
+                meta: head.meta.clone(),
+                attributes: head.attributes.clone(),
+                extensions: Extensions::new(),
+                head_source: ReadResultSource::Disk,
+            });
+        }
+
         let entry = self.cache_storage.entry(location, self.part_size_bytes);
         match entry.read_head().await {
             Ok(Some((meta, attrs))) => {
+                // Prime the in-memory head so later reads take the fast path
+                // above instead of re-reading and re-parsing the on-disk head.
+                self.head_cache
+                    .insert(location, meta.clone(), attrs.clone());
                 return Ok(PrefetchedHead {
                     meta,
                     attributes: attrs,
                     extensions: Extensions::new(),
                     head_source: ReadResultSource::Disk,
-                })
+                });
             }
             Ok(None) => {}
             Err(e) => {
