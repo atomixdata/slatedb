@@ -644,23 +644,24 @@ impl TableStore {
         }
         let cache_key: CachedKey = (handle.id, handle.info.filter_offset).into();
         if let Some(cache) = self.cache_for_reads() {
-            // cache_blocks=true: dedup-aware fetch; concurrent callers collapse onto
-            // one loader. cache_blocks=false: read-only lookup that won't pollute the
-            // cache on miss. Cache errors fall through to a best-effort direct load;
-            // we intentionally don't re-insert there — `fetch_X` errors are almost
-            // always the smuggled loader error (so the direct retry will also fail),
-            // and on the rare foyer-machinery error an insert would likely fail too.
-            let entry = if cache_blocks {
-                cache
+            // Warm filters are resident (warmed at startup, never evicted in
+            // practice), so a plain `get` serves virtually every probe without the
+            // `get_or_fetch` load-dedup machinery - a `RawFetch` future plus a
+            // freshly boxed loader closure - that otherwise dominates CPU when a
+            // point read probes ~8-9 SSTs. Fall back to the dedup-aware `fetch`
+            // (which also populates the cache) only on an actual miss, and only
+            // when caching is enabled. On the rare cache error we drop through to
+            // a best-effort direct load without re-inserting.
+            let mut entry = cache.get_filter(&cache_key).await.unwrap_or(None);
+            if entry.is_none() && cache_blocks {
+                entry = cache
                     .fetch_filter(
                         cache_key.clone(),
                         self.read_loader(handle, CacheTarget::Filters),
                     )
                     .await
-                    .ok()
-            } else {
-                cache.get_filter(&cache_key).await.unwrap_or(None)
-            };
+                    .ok();
+            }
             if let Some(entry) = entry {
                 // Already decoded.
                 if let Some(filters) = entry.filters() {
@@ -726,15 +727,15 @@ impl TableStore {
     ) -> Result<Arc<SsTableIndexOwned>, SlateDBError> {
         let cache_key = (handle.id, handle.info.index_offset).into();
         if let Some(cache) = self.cache_for_reads() {
-            // See `read_filters` for the rationale on the fall-through path.
-            let entry = if cache_blocks {
-                cache
+            // Get-first, fetch-on-miss: warm indexes are resident, so skip the
+            // `get_or_fetch` machinery on the hot path. See `read_filters`.
+            let mut entry = cache.get_index(&cache_key).await.unwrap_or(None);
+            if entry.is_none() && cache_blocks {
+                entry = cache
                     .fetch_index(cache_key, self.read_loader(handle, CacheTarget::Index))
                     .await
-                    .ok()
-            } else {
-                cache.get_index(&cache_key).await.unwrap_or(None)
-            };
+                    .ok();
+            }
             if let Some(index) = entry.and_then(|e| e.sst_index()) {
                 return Ok(index);
             }
