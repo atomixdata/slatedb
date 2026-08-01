@@ -119,6 +119,23 @@ impl FileHandleCache {
         Ok(Some(handle))
     }
 
+    /// Look up a cached, still-valid file handle **without** opening the file.
+    /// Returns `None` if the path isn't cached or the handle is stale, letting
+    /// the inline read fast path avoid the blocking `open` syscall and defer to
+    /// `get_or_open` (on the blocking pool) instead.
+    fn get(&self, path: &std::path::Path) -> Option<Arc<CachedFileHandle>> {
+        let entry = {
+            let mut guard = self.inner.lock();
+            guard.get(path)?.clone()
+        };
+        if Self::is_valid(&entry, path) {
+            Some(entry)
+        } else {
+            self.inner.lock().pop(path);
+            None
+        }
+    }
+
     /// Hint the kernel that we will read randomly inside this file. SST reads
     /// pull small block ranges out of large part files, so the default
     /// readahead window wastes I/O fetching adjacent blocks we never use (and
@@ -197,6 +214,51 @@ fn read_exact_at_offset(file: &std::fs::File, buf: &mut [u8], offset: u64) -> st
         }
         Ok(())
     }
+}
+
+/// Whether to attempt an inline (non-blocking) read for data already resident
+/// in the OS page cache before falling back to `spawn_blocking`. Enabled by
+/// default; set `SLATEDB_INLINE_CACHE_READS=0` to force every read through the
+/// blocking pool (useful for A/B measuring the optimization).
+static INLINE_CACHE_READS: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    std::env::var("SLATEDB_INLINE_CACHE_READS")
+        .map(|v| v != "0")
+        .unwrap_or(true)
+});
+
+/// Try to read the whole buffer from `offset` without ever blocking on disk.
+///
+/// Uses `preadv2(RWF_NOWAIT)`: the kernel copies the bytes only if they are
+/// already resident in the page cache, otherwise it returns immediately rather
+/// than waiting on the backing device. Returns `true` iff the entire range was
+/// served inline, letting the caller skip the `spawn_blocking` hop. On a
+/// partial/would-block result, or a platform/filesystem without support, it
+/// returns `false` and the caller falls back to a blocking read.
+#[cfg(target_os = "linux")]
+fn try_read_full_at_nowait(file: &std::fs::File, buf: &mut [u8], offset: u64) -> bool {
+    use std::os::unix::io::AsRawFd;
+    let iov = libc::iovec {
+        iov_base: buf.as_mut_ptr().cast::<libc::c_void>(),
+        iov_len: buf.len(),
+    };
+    // SAFETY: `iov` describes `buf` for exactly `buf.len()` bytes; preadv2
+    // writes at most that many and does not retain the pointer past the call.
+    // RWF_NOWAIT guarantees the call returns rather than blocking on disk.
+    let ret = unsafe {
+        libc::preadv2(
+            file.as_raw_fd(),
+            &iov as *const libc::iovec,
+            1,
+            offset as libc::off_t,
+            libc::RWF_NOWAIT,
+        )
+    };
+    ret == buf.len() as isize
+}
+
+#[cfg(not(target_os = "linux"))]
+fn try_read_full_at_nowait(_file: &std::fs::File, _buf: &mut [u8], _offset: u64) -> bool {
+    false
 }
 
 #[derive(Debug)]
@@ -401,6 +463,28 @@ impl LocalCacheEntry for FsCacheEntry {
             part_number,
             self.part_size,
         );
+
+        // Fast path: if the file handle is already cached and the block is
+        // resident in the OS page cache, read it inline on the worker instead
+        // of hopping to the blocking pool. `RWF_NOWAIT` guarantees this never
+        // blocks on disk; any miss (or cold handle) falls through to the
+        // blocking path below. This avoids the blocking-pool thread hop for the
+        // common warm-cache case, where it otherwise oversubscribes the CPU
+        // against the async workers.
+        if *INLINE_CACHE_READS {
+            if let Some(handle) = self.file_handle_cache.get(&part_path) {
+                let mut buffer = vec![0; range_in_part.len()];
+                if try_read_full_at_nowait(handle.file(), &mut buffer, range_in_part.start as u64)
+                {
+                    if let Some(evictor) = &self.evictor {
+                        evictor
+                            .track_entry_accessed(part_path, EntryAccess::Read(self.part_size))
+                            .await;
+                    }
+                    return Ok(Some(Bytes::from(buffer)));
+                }
+            }
+        }
 
         // Spawn a blocking task and do synchronous I/O rather than use the tokio async apis.
         // Under the hood, on linux systems , tokio itself spawns a blocking task for each call to
