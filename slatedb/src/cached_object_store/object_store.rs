@@ -268,9 +268,11 @@ impl CachedObjectStore {
         location: &Path,
         admit_on_miss: bool,
     ) -> object_store::Result<GetResult> {
+        self.stats.object_store_cache_head_access.increment(1);
         // In-memory head cache: skips both the on-disk head read and the
         // upstream HEAD round trip.
         if let Some(head) = self.head_cache.get(location) {
+            self.stats.object_store_cache_head_hits.increment(1);
             return Ok(head_only_get_result(
                 head.meta.clone(),
                 head.attributes.clone(),
@@ -428,7 +430,9 @@ impl CachedObjectStore {
         // back to the object store for any absent part, so trusting it here
         // stays correct while avoiding the per-read head read that otherwise
         // dominates the miss path once head files fall out of the OS page cache.
+        self.stats.object_store_cache_head_access.increment(1);
         if let Some(head) = self.head_cache.get(location) {
+            self.stats.object_store_cache_head_hits.increment(1);
             return Ok(PrefetchedHead {
                 meta: head.meta.clone(),
                 attributes: head.attributes.clone(),
