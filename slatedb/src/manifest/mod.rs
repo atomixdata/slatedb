@@ -3289,7 +3289,8 @@ mod tests {
                     },
                 ),
                 Some(visible_range),
-            )].into(),
+            )]
+            .into(),
         });
         Manifest::initial(core)
     }
@@ -3988,7 +3989,8 @@ mod tests {
                             },
                         ),
                         Some(visible_range),
-                    )].into(),
+                    )]
+                    .into(),
                 }],
             }),
         }];
@@ -4265,7 +4267,8 @@ mod tests {
                                 },
                             ),
                             Some(range),
-                        )].into(),
+                        )]
+                        .into(),
                     }],
                 }),
             }
@@ -4706,7 +4709,8 @@ mod tests {
                                 },
                             ),
                             Some(BytesRange::from_ref("a".."m")),
-                        )].into(),
+                        )]
+                        .into(),
                     }],
                 }),
             },
@@ -4729,7 +4733,8 @@ mod tests {
                                 },
                             ),
                             Some(BytesRange::from_ref("n".."z")),
-                        )].into(),
+                        )]
+                        .into(),
                     }],
                 }),
             },
@@ -4779,7 +4784,8 @@ mod tests {
             sst_views: vec![
                 make(sst1, b"a", b"c", BytesRange::from_ref("a".."d")),
                 make(sst2, b"m", b"p", BytesRange::from_ref("m".."q")),
-            ].into(),
+            ]
+            .into(),
         });
         Manifest::initial(core)
     }

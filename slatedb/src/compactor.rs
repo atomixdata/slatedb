@@ -4166,7 +4166,8 @@ mod tests {
                     SsTableId::Compacted(Ulid::new()),
                     SST_FORMAT_VERSION_LATEST,
                     sr_info.clone(),
-                ))].into(),
+                ))]
+                .into(),
             },
             SortedRun {
                 id: 1,
@@ -4174,7 +4175,8 @@ mod tests {
                     SsTableId::Compacted(Ulid::new()),
                     SST_FORMAT_VERSION_LATEST,
                     sr_info.clone(),
-                ))].into(),
+                ))]
+                .into(),
             },
         ];
         stored_manifest.update(dirty).await.unwrap();
@@ -4269,7 +4271,8 @@ mod tests {
                     SsTableId::Compacted(Ulid::from_parts(10, 0)),
                     SST_FORMAT_VERSION_LATEST,
                     sr_info.clone(),
-                ))].into(),
+                ))]
+                .into(),
             },
             SortedRun {
                 id: 2,
@@ -4277,7 +4280,8 @@ mod tests {
                     SsTableId::Compacted(Ulid::from_parts(11, 0)),
                     SST_FORMAT_VERSION_LATEST,
                     sr_info,
-                ))].into(),
+                ))]
+                .into(),
             },
         ];
         let state = CompactorStateView {
@@ -4366,7 +4370,8 @@ mod tests {
                             SsTableId::Compacted(Ulid::from_parts(70, 0)),
                             SST_FORMAT_VERSION_LATEST,
                             sr_info.clone(),
-                        ))].into(),
+                        ))]
+                        .into(),
                     },
                     SortedRun {
                         id: 3,
@@ -4374,7 +4379,8 @@ mod tests {
                             SsTableId::Compacted(Ulid::from_parts(30, 0)),
                             SST_FORMAT_VERSION_LATEST,
                             sr_info,
-                        ))].into(),
+                        ))]
+                        .into(),
                     },
                 ],
             }),
@@ -4421,7 +4427,8 @@ mod tests {
                 SsTableId::Compacted(Ulid::from_parts(90, 0)),
                 SST_FORMAT_VERSION_LATEST,
                 sr_info,
-            ))].into(),
+            ))]
+            .into(),
         }];
         let state = CompactorStateView {
             compactions: None,
@@ -4457,7 +4464,8 @@ mod tests {
                 SsTableId::Compacted(Ulid::from_parts(40, 0)),
                 SST_FORMAT_VERSION_LATEST,
                 sr_info,
-            ))].into(),
+            ))]
+            .into(),
         }];
         let state = CompactorStateView {
             compactions: None,
@@ -4496,7 +4504,8 @@ mod tests {
                     SsTableId::Compacted(Ulid::from_parts(80, 0)),
                     SST_FORMAT_VERSION_LATEST,
                     info.clone(),
-                ))].into(),
+                ))]
+                .into(),
             },
             SortedRun {
                 id: 4,
@@ -4504,7 +4513,8 @@ mod tests {
                     SsTableId::Compacted(Ulid::from_parts(40, 0)),
                     SST_FORMAT_VERSION_LATEST,
                     info.clone(),
-                ))].into(),
+                ))]
+                .into(),
             },
         ];
         core.segment_extractor_name = Some("test".into());
@@ -4521,7 +4531,8 @@ mod tests {
                             SsTableId::Compacted(Ulid::from_parts(30, 0)),
                             SST_FORMAT_VERSION_LATEST,
                             info.clone(),
-                        ))].into(),
+                        ))]
+                        .into(),
                     }],
                 }),
             },
@@ -4538,7 +4549,8 @@ mod tests {
                                 SsTableId::Compacted(Ulid::from_parts(90, 0)),
                                 SST_FORMAT_VERSION_LATEST,
                                 info.clone(),
-                            ))].into(),
+                            ))]
+                            .into(),
                         },
                         SortedRun {
                             id: 6,
@@ -4546,7 +4558,8 @@ mod tests {
                                 SsTableId::Compacted(Ulid::from_parts(60, 0)),
                                 SST_FORMAT_VERSION_LATEST,
                                 info,
-                            ))].into(),
+                            ))]
+                            .into(),
                         },
                     ],
                 }),
@@ -4597,7 +4610,8 @@ mod tests {
                 SsTableId::Compacted(Ulid::from_parts(50, 0)),
                 SST_FORMAT_VERSION_LATEST,
                 info.clone(),
-            ))].into(),
+            ))]
+            .into(),
         }];
         core.segment_extractor_name = Some("test".into());
         core.segments = vec![

@@ -1455,7 +1455,8 @@ mod tests {
             sst_views: vec![
                 SsTableView::identity(active_sst_handle.clone()),
                 SsTableView::identity(active_expired_sst_handle.clone()),
-            ].into(),
+            ]
+            .into(),
         });
         StoredManifest::create_new_db(
             manifest_store.clone(),

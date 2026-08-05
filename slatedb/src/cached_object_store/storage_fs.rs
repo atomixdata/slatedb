@@ -586,8 +586,12 @@ impl LocalCacheEntry for FsCacheEntry {
             #[allow(clippy::disallowed_methods)]
             tokio::task::spawn_blocking(move || {
                 for part_number in 0..num_parts {
-                    let part_path =
-                        Self::make_part_path(root_folder.clone(), &location, part_number, part_size);
+                    let part_path = Self::make_part_path(
+                        root_folder.clone(),
+                        &location,
+                        part_number,
+                        part_size,
+                    );
                     // Best-effort: ignore missing parts and open errors.
                     let _ = file_handle_cache.get_or_open(&part_path);
                 }
