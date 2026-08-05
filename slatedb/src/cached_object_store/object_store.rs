@@ -1,8 +1,8 @@
+use crate::cached_object_store::head_cache::HeadCache;
 use crate::cached_object_store::policy::{
     CachePutConfig, DefaultGetPolicy, DefaultPutPolicy, GetAction, GetPolicy, HeadAction,
     PutAction, PutPolicy,
 };
-use crate::cached_object_store::head_cache::HeadCache;
 use crate::cached_object_store::stats::CachedObjectStoreStats;
 use crate::cached_object_store::storage_fs::FsCacheStorage;
 use crate::cached_object_store::LocalCacheEntry;
@@ -207,6 +207,9 @@ impl CachedObjectStore {
         // First pass: sequentially get metadata and select files that fit
         // This is done sequentially because the head calls should be very quick compared to files loading
         for path in file_paths {
+            self.stats
+                .object_store_cache_upstream_get_requests
+                .increment(1);
             match self.object_store.head(&path).await {
                 Ok(meta) => {
                     let file_size = meta.size as usize;
@@ -234,8 +237,21 @@ impl CachedObjectStore {
         let _result = build_concurrent(files_to_load.into_iter(), degree_of_parallelism, |path| {
             let this = self.clone();
             async move {
+                // An in-memory head recorded by an uncached write would make
+                // maybe_prefetch_range take its fast path and skip fetching,
+                // leaving no parts on disk. Preload's job is to materialize
+                // the parts, so drop the in-memory head when the disk entry
+                // is missing.
+                let entry = this.cache_storage.entry(&path, this.part_size_bytes);
+                if !matches!(entry.read_head().await, Ok(Some(_))) {
+                    this.head_cache.remove(&path);
+                }
+
                 // Ensure the object's parts are on disk (a no-op if already cached).
-                if let Err(e) = this.maybe_prefetch_range(&path, GetOptions::default()).await {
+                if let Err(e) = this
+                    .maybe_prefetch_range(&path, GetOptions::default())
+                    .await
+                {
                     warn!(
                         "Failed to prefetch file into cache [path={}, error={:?}]",
                         path, e
@@ -245,7 +261,6 @@ impl CachedObjectStore {
 
                 // Warm the file-handle cache (head + part files) and the
                 // in-memory head cache from the on-disk head.
-                let entry = this.cache_storage.entry(&path, this.part_size_bytes);
                 match entry.warm().await {
                     Ok(Some((meta, attributes))) => {
                         this.head_cache.insert(&path, meta, attributes);
@@ -289,6 +304,9 @@ impl CachedObjectStore {
         let (meta, attributes, extensions) = self
             .head_flights
             .call(location.clone(), || async {
+                self.stats
+                    .object_store_cache_upstream_get_requests
+                    .increment(1);
                 let result = self
                     .object_store
                     .get_opts(
@@ -379,6 +397,12 @@ impl CachedObjectStore {
         // go into the head we record below.
         let payload_size = payload.content_length() as u64;
         let attributes = opts.attributes.clone();
+        self.stats
+            .object_store_cache_upstream_put_requests
+            .increment(1);
+        self.stats
+            .object_store_cache_upstream_put_bytes
+            .increment(payload_size);
 
         if !cache_payload {
             // Write directly to upstream without caching the payload, but still
@@ -476,7 +500,13 @@ impl CachedObjectStore {
             .call(
                 (location.clone(), opts.range.clone().map(Into::into)),
                 || async {
+                    self.stats
+                        .object_store_cache_upstream_get_requests
+                        .increment(1);
                     let get_result = self.object_store.get_opts(location, opts).await?;
+                    self.stats
+                        .object_store_cache_upstream_get_bytes
+                        .increment(get_result.range.end - get_result.range.start);
                     let result_meta = get_result.meta.clone();
                     let result_attrs = get_result.attributes.clone();
                     let result_extensions = get_result.extensions.clone();
@@ -635,6 +665,9 @@ impl CachedObjectStore {
                         start: (part_id * this.part_size_bytes) as u64,
                         end: ((part_id + 1) * this.part_size_bytes) as u64,
                     };
+                    this.stats
+                        .object_store_cache_upstream_get_requests
+                        .increment(1);
                     let get_result = this
                         .object_store
                         .get_opts(
@@ -645,6 +678,9 @@ impl CachedObjectStore {
                             },
                         )
                         .await?;
+                    this.stats
+                        .object_store_cache_upstream_get_bytes
+                        .increment(get_result.range.end - get_result.range.start);
 
                     let meta = get_result.meta.clone();
                     let attrs = get_result.attributes.clone();
@@ -928,13 +964,27 @@ impl ObjectStore for CachedObjectStore {
 
         if options.head {
             return match self.get_policy.head_action(tag.as_ref()) {
-                HeadAction::Bypass => self.object_store.get_opts(location, options).await,
+                HeadAction::Bypass => {
+                    self.stats
+                        .object_store_cache_upstream_get_requests
+                        .increment(1);
+                    self.object_store.get_opts(location, options).await
+                }
                 HeadAction::Probe => self.cached_head(location, false).await,
                 HeadAction::ReadThrough => self.cached_head(location, true).await,
             };
         }
         match self.get_policy.get_action(tag.as_ref()) {
-            GetAction::Bypass => self.object_store.get_opts(location, options).await,
+            GetAction::Bypass => {
+                self.stats
+                    .object_store_cache_upstream_get_requests
+                    .increment(1);
+                let result = self.object_store.get_opts(location, options).await?;
+                self.stats
+                    .object_store_cache_upstream_get_bytes
+                    .increment(result.range.end - result.range.start);
+                Ok(result)
+            }
             GetAction::Refetch => self.cached_get_opts(location, options, true).await,
             GetAction::ReadThrough => self.cached_get_opts(location, options, false).await,
         }
@@ -959,10 +1009,9 @@ impl ObjectStore for CachedObjectStore {
 
         let inner = self.object_store.put_multipart_opts(location, opts).await?;
 
-        // Wrap the upload to mirror its parts into the cache, unless skipped.
-        if self.put_policy.put_action(tag.as_ref()) == PutAction::Skip {
-            return Ok(inner);
-        }
+        // Wrap the upload to count upstream traffic, and mirror its parts
+        // into the cache unless the policy skips caching.
+        let mirror = self.put_policy.put_action(tag.as_ref()) != PutAction::Skip;
         Ok(Box::new(CachingMultipartUpload::new(
             inner,
             Arc::clone(&self.cache_storage),
@@ -970,6 +1019,8 @@ impl ObjectStore for CachedObjectStore {
             self.part_size_bytes,
             attributes,
             Arc::clone(&self.head_cache),
+            Arc::clone(&self.stats),
+            mirror,
         )))
     }
 
@@ -1091,6 +1142,11 @@ struct CachingMultipartUpload {
     /// In-memory head cache to populate on commit, shared with the owning
     /// [`CachedObjectStore`].
     head_cache: Arc<HeadCache>,
+    /// Owning store's stats; `put_part` counts upstream requests and bytes.
+    stats: Arc<CachedObjectStoreStats>,
+    /// Whether to tee parts into the cache. When false the upload is only
+    /// counted, not cached.
+    mirror: bool,
 }
 
 impl CachingMultipartUpload {
@@ -1101,6 +1157,8 @@ impl CachingMultipartUpload {
         part_size: usize,
         attributes: Attributes,
         head_cache: Arc<HeadCache>,
+        stats: Arc<CachedObjectStoreStats>,
+        mirror: bool,
     ) -> Self {
         Self {
             inner,
@@ -1112,6 +1170,8 @@ impl CachingMultipartUpload {
             total_len: 0,
             attributes,
             head_cache,
+            stats,
+            mirror,
         }
     }
 }
@@ -1127,6 +1187,15 @@ impl std::fmt::Debug for CachingMultipartUpload {
 #[async_trait::async_trait]
 impl MultipartUpload for CachingMultipartUpload {
     fn put_part(&mut self, data: PutPayload) -> object_store::UploadPart {
+        self.stats
+            .object_store_cache_upstream_put_requests
+            .increment(1);
+        self.stats
+            .object_store_cache_upstream_put_bytes
+            .increment(data.content_length() as u64);
+        if !self.mirror {
+            return self.inner.put_part(data);
+        }
         // Write the payload bytes into the cache buffer, then forward the
         // original payload upstream.
         self.total_len += data.content_length() as u64;
@@ -1166,6 +1235,9 @@ impl MultipartUpload for CachingMultipartUpload {
 
     async fn complete(&mut self) -> object_store::Result<PutResult> {
         let result = self.inner.complete().await?;
+        if !self.mirror {
+            return Ok(result);
+        }
         let entry = self
             .cache_storage
             .entry(&self.cache_location, self.part_size);
@@ -1190,6 +1262,9 @@ impl MultipartUpload for CachingMultipartUpload {
 
     async fn abort(&mut self) -> object_store::Result<()> {
         let result = self.inner.abort().await;
+        if !self.mirror {
+            return result;
+        }
         // The object will never exist upstream, so drop any cached parts.
         self.cache_storage
             .entry(&self.cache_location, self.part_size)
@@ -1260,7 +1335,7 @@ mod tests {
 
     use super::{CachedObjectStore, ReadResultSource};
     use crate::cached_object_store::policy::CachePutConfig;
-    use crate::cached_object_store::stats::CachedObjectStoreStats;
+    use crate::cached_object_store::stats::{self, CachedObjectStoreStats};
     use crate::cached_object_store::storage::{LocalCacheStorage, PartID};
     use crate::cached_object_store::storage_fs::FsCacheEntry;
     use crate::cached_object_store::storage_fs::FsCacheStorage;
@@ -1273,7 +1348,7 @@ mod tests {
         gen_rand_bytes, ExtensionMarker, ExtensionObjectStore, FlakyObjectStore, GatedObjectStore,
     };
     use slatedb_common::clock::DefaultSystemClock;
-    use slatedb_common::metrics::MetricsRecorderHelper;
+    use slatedb_common::metrics::{DefaultMetricsRecorder, MetricValue, MetricsRecorderHelper};
     use slatedb_common::DbRand;
 
     fn new_test_cache_folder() -> std::path::PathBuf {
@@ -1344,6 +1419,116 @@ mod tests {
             cached_store.head_cache.get(&location).is_none(),
             "delete should evict the in-memory head"
         );
+    }
+
+    #[tokio::test]
+    async fn test_upstream_request_counters() {
+        let recorder = Arc::new(DefaultMetricsRecorder::new());
+        let helper = MetricsRecorderHelper::new(recorder.clone(), Default::default());
+        let cache_stats = Arc::new(CachedObjectStoreStats::new(&helper));
+        let cache_storage = Arc::new(FsCacheStorage::new(
+            new_test_cache_folder(),
+            None,
+            None,
+            cache_stats.clone(),
+            Arc::new(DefaultSystemClock::new()),
+            Arc::new(DbRand::default()),
+            1000,
+        ));
+        let object_store = Arc::new(object_store::memory::InMemory::new());
+        // Seed an object directly upstream so the first cached read misses.
+        let cold = Path::from("upstream-cold");
+        object_store
+            .put(&cold, PutPayload::from_bytes(Bytes::from(vec![7_u8; 4096])))
+            .await
+            .unwrap();
+        let cached_store = CachedObjectStore::new(
+            object_store,
+            cache_storage,
+            1024,
+            CachePutConfig::default(),
+            cache_stats,
+        )
+        .unwrap();
+
+        let counter = |name: &str| -> u64 {
+            recorder
+                .snapshot()
+                .by_name(name)
+                .first()
+                .and_then(|m| match m.value {
+                    MetricValue::Counter(v) => Some(v),
+                    _ => None,
+                })
+                .unwrap_or(0)
+        };
+
+        let sst_tag = || ObjectStoreCallTag {
+            kind: TableStoreKind::Main,
+            sst_type: SstType::Compacted,
+            retry: None,
+        };
+
+        // A cold read fetches the whole object from upstream.
+        let data = cached_store
+            .get_opts(&cold, get_opts_tagged(sst_tag()))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(data.len(), 4096);
+        assert_eq!(counter(stats::UPSTREAM_GET_REQUESTS), 1);
+        assert_eq!(counter(stats::UPSTREAM_GET_BYTES), 4096);
+
+        // A warm read is served from the cache: no new upstream traffic.
+        cached_store
+            .get_opts(&cold, get_opts_tagged(sst_tag()))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(counter(stats::UPSTREAM_GET_REQUESTS), 1);
+        assert_eq!(counter(stats::UPSTREAM_GET_BYTES), 4096);
+
+        // Untagged reads bypass the cache but still count as upstream traffic.
+        cached_store
+            .get(&cold)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(counter(stats::UPSTREAM_GET_REQUESTS), 2);
+        assert_eq!(counter(stats::UPSTREAM_GET_BYTES), 8192);
+
+        // A put counts one upstream request with its payload size.
+        let put_loc = Path::from("upstream-put");
+        cached_store
+            .put(
+                &put_loc,
+                PutPayload::from_bytes(Bytes::from(vec![1_u8; 2048])),
+            )
+            .await
+            .unwrap();
+        assert_eq!(counter(stats::UPSTREAM_PUT_REQUESTS), 1);
+        assert_eq!(counter(stats::UPSTREAM_PUT_BYTES), 2048);
+
+        // Multipart parts are counted as they are uploaded.
+        let mp_loc = Path::from("upstream-multipart");
+        let mut upload = cached_store.put_multipart(&mp_loc).await.unwrap();
+        upload
+            .put_part(PutPayload::from_bytes(Bytes::from(vec![2_u8; 3000])))
+            .await
+            .unwrap();
+        upload
+            .put_part(PutPayload::from_bytes(Bytes::from(vec![3_u8; 1000])))
+            .await
+            .unwrap();
+        upload.complete().await.unwrap();
+        assert_eq!(counter(stats::UPSTREAM_PUT_REQUESTS), 3);
+        assert_eq!(counter(stats::UPSTREAM_PUT_BYTES), 2048 + 4000);
     }
 
     #[tokio::test]

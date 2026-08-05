@@ -52,7 +52,9 @@ impl HeadCache {
     /// Returns the cached head for `location`, or `None` on a miss. Lock-free:
     /// clones an `Arc` out of the map guard.
     pub(crate) fn get(&self, location: &Path) -> Option<Arc<CachedHead>> {
-        self.entries.get(location).map(|entry| entry.value().clone())
+        self.entries
+            .get(location)
+            .map(|entry| entry.value().clone())
     }
 
     /// Inserts (or overwrites) the head for `location`. Called from write paths

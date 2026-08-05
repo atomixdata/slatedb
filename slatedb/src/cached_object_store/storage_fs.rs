@@ -474,8 +474,7 @@ impl LocalCacheEntry for FsCacheEntry {
         if *INLINE_CACHE_READS {
             if let Some(handle) = self.file_handle_cache.get(&part_path) {
                 let mut buffer = vec![0; range_in_part.len()];
-                if try_read_full_at_nowait(handle.file(), &mut buffer, range_in_part.start as u64)
-                {
+                if try_read_full_at_nowait(handle.file(), &mut buffer, range_in_part.start as u64) {
                     if let Some(evictor) = &self.evictor {
                         evictor
                             .track_entry_accessed(part_path, EntryAccess::Read(self.part_size))
@@ -670,8 +669,12 @@ impl LocalCacheEntry for FsCacheEntry {
             #[allow(clippy::disallowed_methods)]
             tokio::task::spawn_blocking(move || {
                 for part_number in 0..num_parts {
-                    let part_path =
-                        Self::make_part_path(root_folder.clone(), &location, part_number, part_size);
+                    let part_path = Self::make_part_path(
+                        root_folder.clone(),
+                        &location,
+                        part_number,
+                        part_size,
+                    );
                     // Best-effort: ignore missing parts and open errors.
                     let _ = file_handle_cache.get_or_open(&part_path);
                 }

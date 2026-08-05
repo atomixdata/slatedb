@@ -368,7 +368,8 @@ mod tests {
             sst_views: vec![
                 SsTableView::identity(handle1),
                 SsTableView::identity(handle2),
-            ].into(),
+            ]
+            .into(),
         };
 
         let mut iter = SortedRunIterator::new_owned_initialized(
@@ -448,7 +449,8 @@ mod tests {
                     handle2,
                     Some(BytesRange::from_ref("key5".."key7")),
                 ),
-            ].into(),
+            ]
+            .into(),
         };
 
         // when: iterating the full range, then: only visible keys appear
@@ -789,7 +791,8 @@ mod tests {
                     SsTableView::identity(sst2_v2),
                     SsTableView::identity(sst3_v1),
                     SsTableView::identity(sst4_v2),
-                ].into(),
+                ]
+                .into(),
             };
 
             // when: iterating over the sorted run
@@ -862,7 +865,8 @@ mod tests {
                     SsTableView::identity(sst2_v2),
                     SsTableView::identity(sst3_v1),
                     SsTableView::identity(sst4_v2),
-                ].into(),
+                ]
+                .into(),
             };
 
             let mut iter = SortedRunIterator::new_owned_initialized(

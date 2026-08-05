@@ -12,6 +12,10 @@ pub const PART_HIT_COUNT: &str = oscache_stat_name!("part_hit_count");
 pub const PART_ACCESS_COUNT: &str = oscache_stat_name!("part_access_count");
 pub const HEAD_HIT_COUNT: &str = oscache_stat_name!("head_hit_count");
 pub const HEAD_ACCESS_COUNT: &str = oscache_stat_name!("head_access_count");
+pub const UPSTREAM_GET_REQUESTS: &str = oscache_stat_name!("upstream_get_requests");
+pub const UPSTREAM_GET_BYTES: &str = oscache_stat_name!("upstream_get_bytes");
+pub const UPSTREAM_PUT_REQUESTS: &str = oscache_stat_name!("upstream_put_requests");
+pub const UPSTREAM_PUT_BYTES: &str = oscache_stat_name!("upstream_put_bytes");
 pub const CACHE_KEYS: &str = oscache_stat_name!("cache_keys");
 pub const CACHE_BYTES: &str = oscache_stat_name!("cache_bytes");
 pub const EVICTED_KEYS: &str = oscache_stat_name!("evicted_keys");
@@ -25,6 +29,13 @@ pub struct CachedObjectStoreStats {
     /// through to the on-disk head or upstream still count as accesses.
     pub(super) object_store_cache_head_hits: Arc<dyn CounterFn>,
     pub(super) object_store_cache_head_access: Arc<dyn CounterFn>,
+    /// Requests and bytes that actually reached the upstream object store
+    /// (cache misses, prefetches, and uploads). Counted at the cache's
+    /// upstream boundary, so disk-cache hits never increment these.
+    pub(super) object_store_cache_upstream_get_requests: Arc<dyn CounterFn>,
+    pub(super) object_store_cache_upstream_get_bytes: Arc<dyn CounterFn>,
+    pub(super) object_store_cache_upstream_put_requests: Arc<dyn CounterFn>,
+    pub(super) object_store_cache_upstream_put_bytes: Arc<dyn CounterFn>,
     pub(super) object_store_cache_keys: Arc<dyn GaugeFn>,
     pub(super) object_store_cache_bytes: Arc<dyn GaugeFn>,
     pub(super) object_store_cache_evicted_keys: Arc<dyn CounterFn>,
@@ -38,6 +49,10 @@ impl Debug for CachedObjectStoreStats {
             .field("object_store_cache_part_access", &"<counter>")
             .field("object_store_cache_head_hits", &"<counter>")
             .field("object_store_cache_head_access", &"<counter>")
+            .field("object_store_cache_upstream_get_requests", &"<counter>")
+            .field("object_store_cache_upstream_get_bytes", &"<counter>")
+            .field("object_store_cache_upstream_put_requests", &"<counter>")
+            .field("object_store_cache_upstream_put_bytes", &"<counter>")
             .field("object_store_cache_keys", &"<gauge>")
             .field("object_store_cache_bytes", &"<gauge>")
             .field("object_store_cache_evicted_keys", &"<counter>")
@@ -53,6 +68,14 @@ impl CachedObjectStoreStats {
             object_store_cache_part_access: recorder.counter(PART_ACCESS_COUNT).register(),
             object_store_cache_head_hits: recorder.counter(HEAD_HIT_COUNT).register(),
             object_store_cache_head_access: recorder.counter(HEAD_ACCESS_COUNT).register(),
+            object_store_cache_upstream_get_requests: recorder
+                .counter(UPSTREAM_GET_REQUESTS)
+                .register(),
+            object_store_cache_upstream_get_bytes: recorder.counter(UPSTREAM_GET_BYTES).register(),
+            object_store_cache_upstream_put_requests: recorder
+                .counter(UPSTREAM_PUT_REQUESTS)
+                .register(),
+            object_store_cache_upstream_put_bytes: recorder.counter(UPSTREAM_PUT_BYTES).register(),
             object_store_cache_keys: recorder.gauge(CACHE_KEYS).register(),
             object_store_cache_bytes: recorder.gauge(CACHE_BYTES).register(),
             object_store_cache_evicted_keys: recorder.counter(EVICTED_KEYS).register(),

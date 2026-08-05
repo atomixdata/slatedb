@@ -651,10 +651,7 @@ impl SortedRun {
         &self.sst_views[matching_range]
     }
 
-    pub(crate) fn into_tables_covering_range(
-        self,
-        range: &BytesRange,
-    ) -> VecDeque<SsTableView> {
+    pub(crate) fn into_tables_covering_range(self, range: &BytesRange) -> VecDeque<SsTableView> {
         let matching_range = self.table_idx_covering_range(range);
         // `sst_views` is shared behind an `Arc`, so we clone only the few
         // covering views rather than draining the whole run. The full slice
@@ -1189,7 +1186,8 @@ mod tests {
                 create_compacted_sst_view_with_bounds(b"k", Some(b"k")),
                 create_compacted_sst_view_with_bounds(b"k", Some(b"m")),
                 create_compacted_sst_view_with_bounds(b"z", Some(b"z")),
-            ].into(),
+            ]
+            .into(),
         };
 
         let covering_tables = sorted_run.tables_covering_point_key(b"k");

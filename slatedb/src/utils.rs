@@ -1334,7 +1334,8 @@ mod tests {
                 make_sst_view("a", 10),
                 make_sst_view("k", 20), // k < m < z, so only "a" counts
                 make_sst_view("z", 30),
-            ].into(),
+            ]
+            .into(),
         };
         let run2 = SortedRun {
             id: 2,

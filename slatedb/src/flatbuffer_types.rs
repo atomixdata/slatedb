@@ -1681,7 +1681,8 @@ mod tests {
                 sst_views: vec![
                     new_sst_handle(b"a", None),
                     new_sst_handle(b"d", Some(BytesRange::from_ref("e".."f"))),
-                ].into(),
+                ]
+                .into(),
             },
             SortedRun {
                 id: 0,
@@ -1689,7 +1690,8 @@ mod tests {
                     new_sst_handle(b"a", None),
                     new_sst_handle(b"c", Some(BytesRange::from_ref("c"..))),
                     new_sst_handle(b"d", Some(BytesRange::from_ref("e".."f"))),
-                ].into(),
+                ]
+                .into(),
             },
         ];
 
@@ -2332,7 +2334,8 @@ mod tests {
                     first_entry: Some(Bytes::from_static(b"srkey")),
                     ..Default::default()
                 },
-            ))].into(),
+            ))]
+            .into(),
         }];
         let codec = FlatBufferManifestCodec {};
 
@@ -2779,14 +2782,16 @@ mod tests {
                 sst_views: vec![
                     new_view(b"e", None),
                     new_view(b"f", Some(BytesRange::from_ref("g".."h"))),
-                ].into(),
+                ]
+                .into(),
             },
             SortedRun {
                 id: 2,
                 sst_views: vec![
                     new_view(b"i", None),
                     new_view(b"j", Some(BytesRange::from_ref("k"..))),
-                ].into(),
+                ]
+                .into(),
             },
         ];
         Arc::make_mut(&mut manifest.core.tree).last_compacted_l0_sst_view_id =
@@ -2857,7 +2862,8 @@ mod tests {
                     first_entry: Some(Bytes::from_static(b"srkey")),
                     ..Default::default()
                 },
-            ))].into(),
+            ))]
+            .into(),
         }];
         manifest.writer_epoch = 5;
         manifest.compactor_epoch = 3;
