@@ -868,6 +868,7 @@ mod tests {
                 cache_on_compaction: false,
             },
             cache_stats,
+            Arc::new(DefaultSystemClock::new()),
         )
         .unwrap();
 
