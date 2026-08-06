@@ -1,4 +1,4 @@
-use slatedb_common::metrics::{CounterFn, GaugeFn, MetricsRecorderHelper};
+use slatedb_common::metrics::{CounterFn, GaugeFn, HistogramFn, MetricsRecorderHelper};
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
@@ -16,6 +16,13 @@ pub const UPSTREAM_GET_REQUESTS: &str = oscache_stat_name!("upstream_get_request
 pub const UPSTREAM_GET_BYTES: &str = oscache_stat_name!("upstream_get_bytes");
 pub const UPSTREAM_PUT_REQUESTS: &str = oscache_stat_name!("upstream_put_requests");
 pub const UPSTREAM_PUT_BYTES: &str = oscache_stat_name!("upstream_put_bytes");
+pub const UPSTREAM_MULTIPART_BYTES: &str = oscache_stat_name!("upstream_multipart_bytes");
+pub const UPSTREAM_PUT_RATE: &str = oscache_stat_name!("upstream_put_rate_bytes_per_second");
+
+/// Per-part upload rate buckets, 1 MB/s to 3.2 GB/s. Wide because a
+/// part that transmits at line rate is the interesting case: it is what
+/// bursts past switch buffers and drops other traffic.
+const PUT_RATE_BOUNDARIES: &[f64] = &[1e6, 1e7, 2.5e7, 5e7, 1e8, 2e8, 4e8, 8e8, 1.6e9, 3.2e9];
 pub const CACHE_KEYS: &str = oscache_stat_name!("cache_keys");
 pub const CACHE_BYTES: &str = oscache_stat_name!("cache_bytes");
 pub const EVICTED_KEYS: &str = oscache_stat_name!("evicted_keys");
@@ -36,6 +43,13 @@ pub struct CachedObjectStoreStats {
     pub(super) object_store_cache_upstream_get_bytes: Arc<dyn CounterFn>,
     pub(super) object_store_cache_upstream_put_requests: Arc<dyn CounterFn>,
     pub(super) object_store_cache_upstream_put_bytes: Arc<dyn CounterFn>,
+    /// Subset of `upstream_put_bytes` uploaded as multipart parts.
+    /// Paired with the multipart_part latency histogram it gives the
+    /// per-stream upload rate.
+    pub(super) object_store_cache_upstream_multipart_bytes: Arc<dyn CounterFn>,
+    /// Upload rate of each individual multipart part, in bytes per
+    /// second, measured across the upstream call alone.
+    pub(super) object_store_cache_upstream_put_rate: Arc<dyn HistogramFn>,
     pub(super) object_store_cache_keys: Arc<dyn GaugeFn>,
     pub(super) object_store_cache_bytes: Arc<dyn GaugeFn>,
     pub(super) object_store_cache_evicted_keys: Arc<dyn CounterFn>,
@@ -53,6 +67,8 @@ impl Debug for CachedObjectStoreStats {
             .field("object_store_cache_upstream_get_bytes", &"<counter>")
             .field("object_store_cache_upstream_put_requests", &"<counter>")
             .field("object_store_cache_upstream_put_bytes", &"<counter>")
+            .field("object_store_cache_upstream_multipart_bytes", &"<counter>")
+            .field("object_store_cache_upstream_put_rate", &"<histogram>")
             .field("object_store_cache_keys", &"<gauge>")
             .field("object_store_cache_bytes", &"<gauge>")
             .field("object_store_cache_evicted_keys", &"<counter>")
@@ -76,6 +92,13 @@ impl CachedObjectStoreStats {
                 .counter(UPSTREAM_PUT_REQUESTS)
                 .register(),
             object_store_cache_upstream_put_bytes: recorder.counter(UPSTREAM_PUT_BYTES).register(),
+            object_store_cache_upstream_multipart_bytes: recorder
+                .counter(UPSTREAM_MULTIPART_BYTES)
+                .register(),
+            object_store_cache_upstream_put_rate: recorder
+                .histogram(UPSTREAM_PUT_RATE, PUT_RATE_BOUNDARIES)
+                .description("Upload rate of each multipart part in bytes per second")
+                .register(),
             object_store_cache_keys: recorder.gauge(CACHE_KEYS).register(),
             object_store_cache_bytes: recorder.gauge(CACHE_BYTES).register(),
             object_store_cache_evicted_keys: recorder.counter(EVICTED_KEYS).register(),

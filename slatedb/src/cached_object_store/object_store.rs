@@ -1209,6 +1209,11 @@ impl std::fmt::Debug for CachingMultipartUpload {
 
 #[async_trait::async_trait]
 impl MultipartUpload for CachingMultipartUpload {
+    // `std::time::Instant` is used for monotonic elapsed-time
+    // measurement of the upload itself. SlateDB's clock abstraction is
+    // for wall-clock timestamps, not request timing (the same exception
+    // `instrumented_object_store` makes).
+    #[allow(clippy::disallowed_methods, clippy::disallowed_types)]
     fn put_part(&mut self, data: PutPayload) -> object_store::UploadPart {
         self.stats
             .object_store_cache_upstream_put_requests
@@ -1217,16 +1222,32 @@ impl MultipartUpload for CachingMultipartUpload {
         self.stats
             .object_store_cache_upstream_put_bytes
             .increment(nbytes);
+        self.stats
+            .object_store_cache_upstream_multipart_bytes
+            .increment(nbytes);
         // The inner future is lazy, so pacing before its first poll
-        // delays the actual upload.
+        // delays the actual upload. Timing starts after pacing so the
+        // recorded rate reflects the transfer, not the wait.
         let limiter = self.upload_limiter.clone();
+        let stats = Arc::clone(&self.stats);
+        let record_rate = move |elapsed: std::time::Duration| {
+            let secs = elapsed.as_secs_f64();
+            if secs > 0.0 {
+                stats
+                    .object_store_cache_upstream_put_rate
+                    .record(nbytes as f64 / secs);
+            }
+        };
         if !self.mirror {
             let inner_fut = self.inner.put_part(data);
             return Box::pin(async move {
                 if let Some(l) = &limiter {
                     l.acquire(nbytes).await;
                 }
-                inner_fut.await
+                let start = std::time::Instant::now();
+                let result = inner_fut.await;
+                record_rate(start.elapsed());
+                result
             });
         }
         // Write the payload bytes into the cache buffer, then forward the
@@ -1251,6 +1272,14 @@ impl MultipartUpload for CachingMultipartUpload {
             if let Some(l) = &limiter {
                 l.acquire(nbytes).await;
             }
+            // Time the upstream upload alone: the cache write runs
+            // concurrently and must not count against the upload rate.
+            let timed_upload = async move {
+                let start = std::time::Instant::now();
+                let result = inner_fut.await;
+                record_rate(start.elapsed());
+                result
+            };
             // Overlap the cache disk writes with the upstream upload.
             let cache_fut = async {
                 let entry = cache_storage.entry(&cache_location, part_size);
@@ -1261,7 +1290,7 @@ impl MultipartUpload for CachingMultipartUpload {
                     entry.save_part(part_number, chunk).await.ok();
                 }
             };
-            let (result, ()) = futures::future::join(inner_fut, cache_fut).await;
+            let (result, ()) = futures::future::join(timed_upload, cache_fut).await;
             result
         })
     }
@@ -1550,7 +1579,8 @@ mod tests {
         assert_eq!(counter(stats::UPSTREAM_PUT_REQUESTS), 1);
         assert_eq!(counter(stats::UPSTREAM_PUT_BYTES), 2048);
 
-        // Multipart parts are counted as they are uploaded.
+        // Multipart bytes are also tracked separately, and each part's
+        // upload rate is recorded.
         let mp_loc = Path::from("upstream-multipart");
         let mut upload = cached_store.put_multipart(&mp_loc).await.unwrap();
         upload
@@ -1564,6 +1594,19 @@ mod tests {
         upload.complete().await.unwrap();
         assert_eq!(counter(stats::UPSTREAM_PUT_REQUESTS), 3);
         assert_eq!(counter(stats::UPSTREAM_PUT_BYTES), 2048 + 4000);
+        // The single-shot put above is excluded from the multipart total.
+        assert_eq!(counter(stats::UPSTREAM_MULTIPART_BYTES), 4000);
+        let rate = recorder
+            .snapshot()
+            .by_name(stats::UPSTREAM_PUT_RATE)
+            .first()
+            .and_then(|m| match &m.value {
+                MetricValue::Histogram { count, sum, .. } => Some((*count, *sum)),
+                _ => None,
+            })
+            .expect("upload rate histogram should be registered");
+        assert_eq!(rate.0, 2, "one observation per uploaded part");
+        assert!(rate.1 > 0.0, "recorded rate should be positive");
     }
 
     #[tokio::test]
