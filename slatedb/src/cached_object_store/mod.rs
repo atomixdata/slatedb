@@ -8,5 +8,6 @@ pub mod stats;
 mod head_cache;
 mod object_store;
 pub(crate) mod policy;
+mod rate_limit;
 mod storage;
 mod storage_fs;

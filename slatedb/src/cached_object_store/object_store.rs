@@ -3,10 +3,12 @@ use crate::cached_object_store::policy::{
     CachePutConfig, DefaultGetPolicy, DefaultPutPolicy, GetAction, GetPolicy, HeadAction,
     PutAction, PutPolicy,
 };
+use crate::cached_object_store::rate_limit::UploadRateLimiter;
 use crate::cached_object_store::stats::CachedObjectStoreStats;
 use crate::cached_object_store::storage_fs::FsCacheStorage;
 use crate::cached_object_store::LocalCacheEntry;
 use crate::config::ObjectStoreCacheOptions;
+use crate::db_state::SstType;
 use crate::object_store_tag::ObjectStoreCallTag;
 use bytes::{Bytes, BytesMut};
 use futures::{future::BoxFuture, stream, stream::BoxStream, StreamExt};
@@ -62,6 +64,9 @@ pub struct CachedObjectStore {
     get_policy: Arc<dyn GetPolicy>,
     put_policy: Arc<dyn PutPolicy>,
     stats: Arc<CachedObjectStoreStats>,
+    /// Global pacing of SST uploads (flush, compaction, multipart parts),
+    /// shared by every writer. None when unlimited.
+    upload_limiter: Option<Arc<UploadRateLimiter>>,
     // Deduplicates concurrent HEAD requests for the same path after a cache miss.
     head_flights: SingleFlight<Path, (ObjectMeta, Attributes, Extensions)>,
     // Deduplicates concurrent prefetch/GET requests for the same path after a cache miss.
@@ -82,6 +87,7 @@ impl CachedObjectStore {
         part_size_bytes: usize,
         cache_put_config: CachePutConfig,
         stats: Arc<CachedObjectStoreStats>,
+        clock: Arc<dyn SystemClock>,
     ) -> Result<Arc<Self>, SlateDBError> {
         Self::new_with_policies(
             object_store,
@@ -92,6 +98,7 @@ impl CachedObjectStore {
             Arc::new(DefaultPutPolicy {
                 put: cache_put_config,
             }),
+            clock,
         )
     }
 
@@ -105,6 +112,7 @@ impl CachedObjectStore {
         stats: Arc<CachedObjectStoreStats>,
         get_policy: Arc<dyn GetPolicy>,
         put_policy: Arc<dyn PutPolicy>,
+        clock: Arc<dyn SystemClock>,
     ) -> Result<Arc<Self>, SlateDBError> {
         if part_size_bytes == 0 || !part_size_bytes.is_multiple_of(1024) {
             return Err(SlateDBError::InvalidCachePartSize);
@@ -117,6 +125,7 @@ impl CachedObjectStore {
             get_policy,
             put_policy,
             stats,
+            upload_limiter: UploadRateLimiter::from_env(clock),
             head_flights: SingleFlight::new(),
             prefetch_flights: SingleFlight::new(),
             part_flights: SingleFlight::new(),
@@ -148,7 +157,7 @@ impl CachedObjectStore {
             options.max_cache_size_bytes,
             options.scan_interval,
             stats.clone(),
-            clock,
+            clock.clone(),
             rand,
             options.max_open_file_handles,
         ));
@@ -161,6 +170,7 @@ impl CachedObjectStore {
                 cache_on_compaction: options.cache_on_compaction,
             },
             stats,
+            clock,
         )?;
         cached.start_evictor().await;
         Ok(Some(cached))
@@ -397,6 +407,13 @@ impl CachedObjectStore {
         // go into the head we record below.
         let payload_size = payload.content_length() as u64;
         let attributes = opts.attributes.clone();
+        // Pace SST uploads only: tiny coordination writes (manifest CAS)
+        // must not queue behind a saturated upload budget.
+        if let Some(limiter) = &self.upload_limiter {
+            if tag.as_ref().map(|t| t.sst_type) == Some(SstType::Compacted) {
+                limiter.acquire(payload_size).await;
+            }
+        }
         self.stats
             .object_store_cache_upstream_put_requests
             .increment(1);
@@ -1021,6 +1038,7 @@ impl ObjectStore for CachedObjectStore {
             Arc::clone(&self.head_cache),
             Arc::clone(&self.stats),
             mirror,
+            self.upload_limiter.clone(),
         )))
     }
 
@@ -1147,6 +1165,9 @@ struct CachingMultipartUpload {
     /// Whether to tee parts into the cache. When false the upload is only
     /// counted, not cached.
     mirror: bool,
+    /// Shared upload pacing; every part waits for its slice of the
+    /// global budget before going upstream.
+    upload_limiter: Option<Arc<UploadRateLimiter>>,
 }
 
 impl CachingMultipartUpload {
@@ -1159,6 +1180,7 @@ impl CachingMultipartUpload {
         head_cache: Arc<HeadCache>,
         stats: Arc<CachedObjectStoreStats>,
         mirror: bool,
+        upload_limiter: Option<Arc<UploadRateLimiter>>,
     ) -> Self {
         Self {
             inner,
@@ -1172,6 +1194,7 @@ impl CachingMultipartUpload {
             head_cache,
             stats,
             mirror,
+            upload_limiter,
         }
     }
 }
@@ -1190,15 +1213,25 @@ impl MultipartUpload for CachingMultipartUpload {
         self.stats
             .object_store_cache_upstream_put_requests
             .increment(1);
+        let nbytes = data.content_length() as u64;
         self.stats
             .object_store_cache_upstream_put_bytes
-            .increment(data.content_length() as u64);
+            .increment(nbytes);
+        // The inner future is lazy, so pacing before its first poll
+        // delays the actual upload.
+        let limiter = self.upload_limiter.clone();
         if !self.mirror {
-            return self.inner.put_part(data);
+            let inner_fut = self.inner.put_part(data);
+            return Box::pin(async move {
+                if let Some(l) = &limiter {
+                    l.acquire(nbytes).await;
+                }
+                inner_fut.await
+            });
         }
         // Write the payload bytes into the cache buffer, then forward the
         // original payload upstream.
-        self.total_len += data.content_length() as u64;
+        self.total_len += nbytes;
         self.buffer.reserve(data.content_length());
         for bytes in &data {
             self.buffer.extend_from_slice(bytes);
@@ -1211,13 +1244,13 @@ impl MultipartUpload for CachingMultipartUpload {
         }
 
         let inner_fut = self.inner.put_part(data);
-        if parts.is_empty() {
-            return inner_fut;
-        }
         let cache_storage = Arc::clone(&self.cache_storage);
         let cache_location = self.cache_location.clone();
         let part_size = self.part_size;
         Box::pin(async move {
+            if let Some(l) = &limiter {
+                l.acquire(nbytes).await;
+            }
             // Overlap the cache disk writes with the upstream upload.
             let cache_fut = async {
                 let entry = cache_storage.entry(&cache_location, part_size);
@@ -1387,6 +1420,7 @@ mod tests {
             part_size_bytes,
             CachePutConfig::default(),
             stats,
+            Arc::new(DefaultSystemClock::new()),
         )
         .unwrap()
     }
@@ -1448,6 +1482,7 @@ mod tests {
             1024,
             CachePutConfig::default(),
             cache_stats,
+            Arc::new(DefaultSystemClock::new()),
         )
         .unwrap();
 
@@ -1559,6 +1594,7 @@ mod tests {
             1024,
             CachePutConfig::default(),
             stats,
+            Arc::new(DefaultSystemClock::new()),
         )
         .unwrap();
 
@@ -1660,6 +1696,7 @@ mod tests {
             part_size,
             CachePutConfig::default(),
             stats,
+            Arc::new(DefaultSystemClock::new()),
         )
         .unwrap();
         let entry = cached_store.cache_storage.entry(&location, 1024);
@@ -1743,6 +1780,7 @@ mod tests {
             part_size,
             CachePutConfig::default(),
             stats,
+            Arc::new(DefaultSystemClock::new()),
         )
         .unwrap();
         let entry = cached_store.cache_storage.entry(&location, part_size);
@@ -1850,6 +1888,7 @@ mod tests {
             1024,
             CachePutConfig::default(),
             stats,
+            Arc::new(DefaultSystemClock::new()),
         )
         .unwrap();
 
@@ -1946,6 +1985,7 @@ mod tests {
             1024,
             CachePutConfig::default(),
             stats,
+            Arc::new(DefaultSystemClock::new()),
         )
         .unwrap();
 
@@ -1976,6 +2016,7 @@ mod tests {
             1024,
             CachePutConfig::default(),
             stats,
+            Arc::new(DefaultSystemClock::new()),
         )
         .unwrap();
 
@@ -2014,6 +2055,7 @@ mod tests {
             1024,
             CachePutConfig::default(),
             stats,
+            Arc::new(DefaultSystemClock::new()),
         )
         .unwrap();
 
@@ -2105,6 +2147,7 @@ mod tests {
             1024,
             CachePutConfig::default(),
             stats,
+            Arc::new(DefaultSystemClock::new()),
         )
         .unwrap();
 
@@ -2162,6 +2205,7 @@ mod tests {
             1024,
             CachePutConfig::default(),
             stats,
+            Arc::new(DefaultSystemClock::new()),
         )
         .unwrap();
 
@@ -2231,6 +2275,7 @@ mod tests {
             1024,
             CachePutConfig::default(),
             stats,
+            Arc::new(DefaultSystemClock::new()),
         )
         .unwrap();
 
@@ -2622,6 +2667,7 @@ mod tests {
             part_size,
             CachePutConfig::default(),
             stats.clone(),
+            Arc::new(DefaultSystemClock::new()),
         )
         .unwrap();
         prefill
@@ -2644,6 +2690,7 @@ mod tests {
             part_size,
             CachePutConfig::default(),
             stats,
+            Arc::new(DefaultSystemClock::new()),
         )
         .unwrap();
         let instrumented = Arc::new(InstrumentedObjectStore::new(
@@ -2714,6 +2761,7 @@ mod tests {
             PART_SIZE,
             CachePutConfig::default(),
             stats,
+            Arc::new(DefaultSystemClock::new()),
         )
         .unwrap();
         cached_store.start_evictor().await;
@@ -2794,7 +2842,15 @@ mod tests {
             Arc::new(DbRand::default()),
             1000,
         ));
-        CachedObjectStore::new(upstream, cache_storage, 1024, policy, stats).unwrap()
+        CachedObjectStore::new(
+            upstream,
+            cache_storage,
+            1024,
+            policy,
+            stats,
+            Arc::new(DefaultSystemClock::new()),
+        )
+        .unwrap()
     }
 
     fn put_opts_tagged(tag: ObjectStoreCallTag) -> object_store::PutOptions {
@@ -2955,6 +3011,7 @@ mod tests {
             1024,
             CachePutConfig::default(),
             stats,
+            Arc::new(DefaultSystemClock::new()),
         )
         .unwrap();
         store.start_evictor().await;
