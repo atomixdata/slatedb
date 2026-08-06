@@ -241,9 +241,14 @@ impl CachedObjectStore {
 
         // Second pass: load the selected files in bounded parallelism and cache
         // them. For each file we also warm the file-handle cache and populate
-        // the in-memory head cache — done even when the file is already on disk,
+        // the in-memory head cache - done even when the file is already on disk,
         // so a restart with a warm disk cache still primes both in-memory tiers.
-        let degree_of_parallelism = 32;
+        //
+        // Preload runs before the store serves traffic, so the bound exists to
+        // cap buffered part memory (roughly parallelism x part size), not to
+        // leave headroom for foreground work. Raise it to fill the network
+        // link faster on a large dataset.
+        let degree_of_parallelism = preload_parallelism();
         let _result = build_concurrent(files_to_load.into_iter(), degree_of_parallelism, |path| {
             let this = self.clone();
             async move {
@@ -1336,6 +1341,23 @@ impl MultipartUpload for CachingMultipartUpload {
     }
 }
 
+/// Concurrent file loads during disk-cache preload. Override with
+/// [`PRELOAD_PARALLELISM_ENV`].
+const DEFAULT_PRELOAD_PARALLELISM: usize = 32;
+
+/// Env var overriding [`DEFAULT_PRELOAD_PARALLELISM`].
+const PRELOAD_PARALLELISM_ENV: &str = "SLATEDB_PRELOAD_PARALLELISM";
+
+/// Concurrent file loads for preload. Values that are absent, zero, or
+/// unparsable fall back to the default rather than stalling the preload.
+fn preload_parallelism() -> usize {
+    std::env::var(PRELOAD_PARALLELISM_ENV)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_PRELOAD_PARALLELISM)
+}
+
 /// Where a read (of the object head or of a single part) was served from.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ReadResultSource {
@@ -1607,6 +1629,21 @@ mod tests {
             .expect("upload rate histogram should be registered");
         assert_eq!(rate.0, 2, "one observation per uploaded part");
         assert!(rate.1 > 0.0, "recorded rate should be positive");
+    }
+
+    #[test]
+    fn test_preload_parallelism() {
+        use super::{preload_parallelism, DEFAULT_PRELOAD_PARALLELISM, PRELOAD_PARALLELISM_ENV};
+        std::env::remove_var(PRELOAD_PARALLELISM_ENV);
+        assert_eq!(preload_parallelism(), DEFAULT_PRELOAD_PARALLELISM);
+        std::env::set_var(PRELOAD_PARALLELISM_ENV, "64");
+        assert_eq!(preload_parallelism(), 64);
+        // Zero and junk fall back rather than stalling the preload.
+        std::env::set_var(PRELOAD_PARALLELISM_ENV, "0");
+        assert_eq!(preload_parallelism(), DEFAULT_PRELOAD_PARALLELISM);
+        std::env::set_var(PRELOAD_PARALLELISM_ENV, "junk");
+        assert_eq!(preload_parallelism(), DEFAULT_PRELOAD_PARALLELISM);
+        std::env::remove_var(PRELOAD_PARALLELISM_ENV);
     }
 
     #[tokio::test]
