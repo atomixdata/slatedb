@@ -824,6 +824,10 @@ impl TokioCompactionExecutorInner {
             None;
 
         while let Some(kv) = all_iter.next().await? {
+            // Keep cached compaction work cooperative: inputs served from
+            // the local cache never yield, so the merge can otherwise run
+            // for a long stretch without releasing the worker.
+            tokio::task::coop::consume_budget().await;
             // Opportunistically collect a finished background close without
             // stalling the merge loop to promptly lets us report progress
             // and persist the newly uploaded output SST in compactor state
