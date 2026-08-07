@@ -115,28 +115,59 @@ fn drop_from_page_cache(_file: &std::fs::File) {}
 /// [`ObjectStoreCacheOptions::max_open_file_handles`](crate::config::ObjectStoreCacheOptions)).
 /// Sizing it well below the working set makes nearly every read take the
 /// `open` miss path, so raise it toward `RLIMIT_NOFILE` for large datasets.
+/// Number of independently locked shards. Every disk-cache read bumps
+/// LRU recency, so at tens of thousands of reads per second a single
+/// mutex becomes the busiest lock on the read path and shows up
+/// directly in the latency tail. Sharding by path spreads that traffic.
+const FILE_HANDLE_CACHE_SHARDS: usize = 64;
+
 #[derive(Clone)]
 pub(crate) struct FileHandleCache {
-    inner: Arc<parking_lot::Mutex<LruCache<std::path::PathBuf, Arc<CachedFileHandle>>>>,
+    shards: Arc<Vec<parking_lot::Mutex<LruCache<std::path::PathBuf, Arc<CachedFileHandle>>>>>,
 }
 
 impl std::fmt::Debug for FileHandleCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let inner = self.inner.lock();
         f.debug_struct("FileHandleCache")
-            .field("len", &inner.len())
-            .field("cap", &inner.cap())
+            .field("len", &self.len())
+            .field("shards", &self.shards.len())
             .finish()
     }
 }
 
 impl FileHandleCache {
     fn new(max_handles: usize) -> Self {
+        assert!(max_handles > 0, "max_handles must be > 0");
+        // Split the budget across shards, keeping at least one handle
+        // each so a small configured cap still works.
+        let per_shard = max_handles.div_ceil(FILE_HANDLE_CACHE_SHARDS).max(1);
+        let shards = (0..FILE_HANDLE_CACHE_SHARDS)
+            .map(|_| {
+                parking_lot::Mutex::new(LruCache::new(
+                    NonZeroUsize::new(per_shard).expect("per-shard cap is at least one"),
+                ))
+            })
+            .collect();
         Self {
-            inner: Arc::new(parking_lot::Mutex::new(LruCache::new(
-                NonZeroUsize::new(max_handles).expect("max_handles must be > 0"),
-            ))),
+            shards: Arc::new(shards),
         }
+    }
+
+    /// The shard owning `path`. A path always maps to the same shard, so
+    /// concurrent readers of one file share an entry as before.
+    fn shard(
+        &self,
+        path: &std::path::Path,
+    ) -> &parking_lot::Mutex<LruCache<std::path::PathBuf, Arc<CachedFileHandle>>> {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        path.hash(&mut hasher);
+        &self.shards[(hasher.finish() as usize) % self.shards.len()]
+    }
+
+    /// Total cached handles across all shards.
+    fn len(&self) -> usize {
+        self.shards.iter().map(|s| s.lock().len()).sum()
     }
 
     /// Look up a cached file handle, or open the file and cache it.
@@ -147,8 +178,9 @@ impl FileHandleCache {
     ) -> Result<Option<Arc<CachedFileHandle>>, std::io::Error> {
         // Hot path: bump LRU recency, clone the Arc, and drop the lock before
         // doing any I/O on the returned handle.
+        let shard = self.shard(path);
         {
-            let mut guard = self.inner.lock();
+            let mut guard = shard.lock();
             if let Some(entry) = guard.get(path) {
                 let entry = entry.clone();
                 drop(guard);
@@ -157,7 +189,7 @@ impl FileHandleCache {
                 }
                 // Stale (file replaced or unlinked). Remove and fall through
                 // to reopen.
-                self.inner.lock().pop(path);
+                shard.lock().pop(path);
             }
         }
 
@@ -174,7 +206,7 @@ impl FileHandleCache {
         // Race-tolerant insert: if another thread opened the same path while we
         // were outside the lock, use theirs and drop our freshly opened fd, so
         // concurrent readers all share one Arc instead of duplicating fds.
-        let mut guard = self.inner.lock();
+        let mut guard = shard.lock();
         if let Some(existing) = guard.get(path) {
             return Ok(Some(existing.clone()));
         }
@@ -187,14 +219,15 @@ impl FileHandleCache {
     /// the inline read fast path avoid the blocking `open` syscall and defer to
     /// `get_or_open` (on the blocking pool) instead.
     fn get(&self, path: &std::path::Path) -> Option<Arc<CachedFileHandle>> {
+        let shard = self.shard(path);
         let entry = {
-            let mut guard = self.inner.lock();
+            let mut guard = shard.lock();
             guard.get(path)?.clone()
         };
         if Self::is_valid(&entry, path) {
             Some(entry)
         } else {
-            self.inner.lock().pop(path);
+            shard.lock().pop(path);
             None
         }
     }
@@ -249,7 +282,7 @@ impl FileHandleCache {
     /// Remove a cached handle, e.g. after eviction or after a write replaces
     /// the file (since the cached fd would still reference the old inode).
     fn invalidate(&self, path: &std::path::Path) {
-        self.inner.lock().pop(path);
+        self.shard(path).lock().pop(path);
     }
 }
 
@@ -365,7 +398,7 @@ impl FsCacheStorage {
 
     #[cfg(test)]
     pub(crate) fn file_handle_cache_population(&self) -> usize {
-        self.file_handle_cache.inner.lock().len()
+        self.file_handle_cache.len()
     }
 }
 
@@ -1507,7 +1540,7 @@ mod tests {
                 "concurrent get_or_open returned distinct fds"
             );
         }
-        assert_eq!(cache.inner.lock().len(), 1);
+        assert_eq!(cache.len(), 1);
     }
 
     #[tokio::test]
