@@ -49,9 +49,33 @@ fn drop_written_pages() -> bool {
     })
 }
 
-/// Flush this file's pages to disk and drop them from the page cache.
-/// Both calls are advisory; errors are ignored on purpose. The hint is
-/// only honoured once writeback completes, hence the sync first.
+/// Bytes written between writeback nudges. Parts can be over a hundred
+/// megabytes; syncing one in a single call submits that much I/O at
+/// once, which queues ahead of foreground reads. Starting writeback
+/// every few megabytes spreads it out so the wait at the end is short.
+const SYNC_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+
+/// Start asynchronous writeback for a range without waiting for it.
+#[cfg(target_os = "linux")]
+fn start_writeback(file: &std::fs::File, offset: usize, len: usize) {
+    use std::os::unix::io::AsRawFd;
+    // SAFETY: the fd is owned by `file` and valid; the call only
+    // schedules writeback and never alters file contents.
+    unsafe {
+        libc::sync_file_range(
+            file.as_raw_fd(),
+            offset as libc::off64_t,
+            len as libc::off64_t,
+            libc::SYNC_FILE_RANGE_WRITE,
+        );
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn start_writeback(_file: &std::fs::File, _offset: usize, _len: usize) {}
+
+/// Wait for this file's writeback to finish, then drop its pages from
+/// the page cache. Advisory: failures only mean the pages stay cached.
 #[cfg(target_os = "linux")]
 fn drop_from_page_cache(file: &std::fs::File) {
     use std::os::unix::io::AsRawFd;
@@ -422,7 +446,18 @@ impl FsCacheEntry {
                 .truncate(true)
                 .open(tmp_path)
                 .map_err(wrap_io_err)?;
-            file.write_all(&buf).map_err(wrap_io_err)?;
+            if drop_written_pages() {
+                // Pipeline writeback with the write so the sync below
+                // has little left to wait for.
+                let mut offset = 0;
+                for chunk in buf.chunks(SYNC_CHUNK_BYTES) {
+                    file.write_all(chunk).map_err(wrap_io_err)?;
+                    start_writeback(&file, offset, chunk.len());
+                    offset += chunk.len();
+                }
+            } else {
+                file.write_all(&buf).map_err(wrap_io_err)?;
+            }
 
             // Drop the just-written pages from the page cache. The disk
             // cache is far larger than RAM (terabytes against tens of
