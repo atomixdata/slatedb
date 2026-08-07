@@ -37,6 +37,45 @@ impl CachedFileHandle {
 
 /// A bounded LRU cache of open file descriptors, keyed by filesystem path.
 ///
+/// Env var enabling the page-cache drop for written cache parts.
+/// Defaults on; set to "false" or "0" to keep pages cached.
+pub(crate) const DROP_WRITTEN_PAGES_ENV: &str = "SLATEDB_CACHE_DROP_WRITTEN_PAGES";
+
+fn drop_written_pages() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var(DROP_WRITTEN_PAGES_ENV) {
+        Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "false" | "0" | "no"),
+        Err(_) => true,
+    })
+}
+
+/// Flush this file's pages to disk and drop them from the page cache.
+/// Both calls are advisory; errors are ignored on purpose. The hint is
+/// only honoured once writeback completes, hence the sync first.
+#[cfg(target_os = "linux")]
+fn drop_from_page_cache(file: &std::fs::File) {
+    use std::os::unix::io::AsRawFd;
+    let fd = file.as_raw_fd();
+    // SAFETY: `fd` is owned by `file` and valid for these calls. Both
+    // only affect caching, never file contents.
+    unsafe {
+        libc::sync_file_range(
+            fd,
+            0,
+            0,
+            libc::SYNC_FILE_RANGE_WAIT_BEFORE
+                | libc::SYNC_FILE_RANGE_WRITE
+                | libc::SYNC_FILE_RANGE_WAIT_AFTER,
+        );
+        libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_DONTNEED);
+    }
+}
+
+/// No-op off Linux: the benchmark and production hosts are Linux, and
+/// other platforms spell these hints differently.
+#[cfg(not(target_os = "linux"))]
+fn drop_from_page_cache(_file: &std::fs::File) {}
+
 /// Backed by an `LruCache` under a `parking_lot::Mutex`. The mutex is held only
 /// long enough to bump the recency entry / evict / insert — **never across the
 /// `fstat` validity check or the `open` syscall**. `get_or_open` is called once
@@ -384,6 +423,19 @@ impl FsCacheEntry {
                 .open(tmp_path)
                 .map_err(wrap_io_err)?;
             file.write_all(&buf).map_err(wrap_io_err)?;
+
+            // Drop the just-written pages from the page cache. The disk
+            // cache is far larger than RAM (terabytes against tens of
+            // gigabytes), so these pages are almost never read back
+            // before eviction, but leaving them dirty-then-clean forces
+            // the kernel to reclaim to make room. On a memory-tight host
+            // that reclaim stalls the request threads. Writeback must
+            // finish first or the hint is ignored, so sync this file's
+            // range before dropping it. Best effort: any failure here
+            // only means the pages stay cached.
+            if drop_written_pages() {
+                drop_from_page_cache(&file);
+            }
 
             // Note: There is no fsync before the rename. The cache holds copies
             // of durable upstream bytes, so part durability is not required, only
