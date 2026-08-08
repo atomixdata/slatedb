@@ -42,6 +42,22 @@ use sysinfo::{CpuRefreshKind, System};
 pub struct FoyerCacheOptions {
     pub max_capacity: u64,
     pub shards: usize,
+    /// Eviction algorithm. LRU (the default) reorders a list on every
+    /// hit; at tens of millions of hits per minute that bookkeeping is
+    /// pure overhead when the working set fits, so FIFO can be cheaper.
+    pub eviction: FoyerEviction,
+}
+
+/// Eviction algorithm for [`FoyerCache`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FoyerEviction {
+    /// Least recently used. Tracks recency on every access.
+    #[default]
+    Lru,
+    /// First in, first out. No per-hit bookkeeping.
+    Fifo,
+    /// S3-FIFO: FIFO queues with a small admission filter.
+    S3Fifo,
 }
 
 impl Default for FoyerCacheOptions {
@@ -53,6 +69,7 @@ impl Default for FoyerCacheOptions {
                 sys.refresh_cpu_specifics(CpuRefreshKind::nothing());
                 sys.cpus().len()
             },
+            eviction: FoyerEviction::default(),
         }
     }
 }
@@ -82,10 +99,15 @@ impl FoyerCache {
     }
 
     pub fn new_with_opts(options: FoyerCacheOptions) -> Self {
-        let cache = foyer::CacheBuilder::new(options.max_capacity as _)
+        let builder = foyer::CacheBuilder::new(options.max_capacity as _)
             .with_weighter(|_, v: &CachedEntry| v.size())
-            .with_shards(options.shards)
-            .build();
+            .with_shards(options.shards);
+        let builder = match options.eviction {
+            FoyerEviction::Lru => builder,
+            FoyerEviction::Fifo => builder.with_eviction_config(foyer::FifoConfig::default()),
+            FoyerEviction::S3Fifo => builder.with_eviction_config(foyer::S3FifoConfig::default()),
+        };
+        let cache = builder.build();
         Self { inner: cache }
     }
 }
