@@ -87,6 +87,23 @@ impl SsTableIndexOwned {
         Ok(Self { data })
     }
 
+    /// Wrap index bytes whose integrity has already been established,
+    /// skipping flatbuffer verification.
+    ///
+    /// Verifying an index walks every table and vector in the buffer.
+    /// Indexes of large SSTs run to megabytes, so on a cache miss that
+    /// walk costs milliseconds, and profiling a read-heavy benchmark
+    /// attributed roughly a fifth of all CPU to it.
+    ///
+    /// The caller must have validated the block checksum covering these
+    /// bytes. That proves they are exactly what this code wrote through
+    /// the flatbuffer builder, which is a stronger guarantee than the
+    /// structural verifier provides. [`Self::borrow`] already reads the
+    /// buffer unchecked, so the type assumes validity regardless.
+    pub(crate) fn new_checksum_validated(data: Bytes) -> Self {
+        Self { data }
+    }
+
     pub(crate) fn borrow(&self) -> SsTableIndex<'_> {
         let raw = &self.data;
         unsafe { flatbuffers::root_unchecked::<SsTableIndex>(raw) }
