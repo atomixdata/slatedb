@@ -836,12 +836,7 @@ impl SsTableFormat {
             None => untransformed_bytes,
         };
 
-        // `validate_checksum` above already proved these bytes are the
-        // ones we wrote, so the structural verifier would only repeat
-        // work; it is the single largest CPU cost on the read path.
-        Ok(SsTableIndexOwned::new_checksum_validated(
-            decompressed_bytes,
-        ))
+        Ok(SsTableIndexOwned::new(decompressed_bytes)?)
     }
 
     pub(crate) async fn read_stats(
