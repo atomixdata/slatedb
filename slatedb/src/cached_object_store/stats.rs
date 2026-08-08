@@ -18,6 +18,15 @@ pub const UPSTREAM_PUT_REQUESTS: &str = oscache_stat_name!("upstream_put_request
 pub const UPSTREAM_PUT_BYTES: &str = oscache_stat_name!("upstream_put_bytes");
 pub const UPSTREAM_MULTIPART_BYTES: &str = oscache_stat_name!("upstream_multipart_bytes");
 pub const UPSTREAM_PUT_RATE: &str = oscache_stat_name!("upstream_put_rate_bytes_per_second");
+pub const UPSTREAM_GET_LATENCY: &str = oscache_stat_name!("upstream_get_latency_seconds");
+
+/// Latency buckets for upstream reads, out to 8s. Cache misses go to
+/// the object store, whose tail runs to seconds; a request waiting on
+/// one waits with it, and single-flight makes every request wanting the
+/// same object wait too. Buckets must reach far enough to see that.
+const GET_LATENCY_BOUNDARIES: &[f64] = &[
+    5e-3, 1e-2, 2.5e-2, 5e-2, 1e-1, 2.5e-1, 5e-1, 1.0, 2.0, 4.0, 8.0,
+];
 
 /// Per-part upload rate buckets, 1 MB/s to 3.2 GB/s. Wide because a
 /// part that transmits at line rate is the interesting case: it is what
@@ -50,6 +59,8 @@ pub struct CachedObjectStoreStats {
     /// Upload rate of each individual multipart part, in bytes per
     /// second, measured across the upstream call alone.
     pub(super) object_store_cache_upstream_put_rate: Arc<dyn HistogramFn>,
+    /// Wall time of each read that reached the object store.
+    pub(super) object_store_cache_upstream_get_latency: Arc<dyn HistogramFn>,
     pub(super) object_store_cache_keys: Arc<dyn GaugeFn>,
     pub(super) object_store_cache_bytes: Arc<dyn GaugeFn>,
     pub(super) object_store_cache_evicted_keys: Arc<dyn CounterFn>,
@@ -69,6 +80,7 @@ impl Debug for CachedObjectStoreStats {
             .field("object_store_cache_upstream_put_bytes", &"<counter>")
             .field("object_store_cache_upstream_multipart_bytes", &"<counter>")
             .field("object_store_cache_upstream_put_rate", &"<histogram>")
+            .field("object_store_cache_upstream_get_latency", &"<histogram>")
             .field("object_store_cache_keys", &"<gauge>")
             .field("object_store_cache_bytes", &"<gauge>")
             .field("object_store_cache_evicted_keys", &"<counter>")
@@ -98,6 +110,10 @@ impl CachedObjectStoreStats {
             object_store_cache_upstream_put_rate: recorder
                 .histogram(UPSTREAM_PUT_RATE, PUT_RATE_BOUNDARIES)
                 .description("Upload rate of each multipart part in bytes per second")
+                .register(),
+            object_store_cache_upstream_get_latency: recorder
+                .histogram(UPSTREAM_GET_LATENCY, GET_LATENCY_BOUNDARIES)
+                .description("Latency of reads served from the object store rather than the cache")
                 .register(),
             object_store_cache_keys: recorder.gauge(CACHE_KEYS).register(),
             object_store_cache_bytes: recorder.gauge(CACHE_BYTES).register(),

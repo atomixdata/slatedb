@@ -464,6 +464,11 @@ impl CachedObjectStore {
     // single GET request, and save the related parts into local disks together.
     // when it sends GET requests to the object store, the range is expected to be ALIGNED with the part
     // size.
+    // `std::time::Instant` is used for monotonic elapsed-time
+    // measurement of the upstream read. SlateDB's clock abstraction is
+    // for wall-clock timestamps, not request timing (the same exception
+    // `instrumented_object_store` makes).
+    #[allow(clippy::disallowed_methods, clippy::disallowed_types)]
     async fn maybe_prefetch_range(
         &self,
         location: &Path,
@@ -525,7 +530,11 @@ impl CachedObjectStore {
                     self.stats
                         .object_store_cache_upstream_get_requests
                         .increment(1);
+                    let started = std::time::Instant::now();
                     let get_result = self.object_store.get_opts(location, opts).await?;
+                    self.stats
+                        .object_store_cache_upstream_get_latency
+                        .record(started.elapsed().as_secs_f64());
                     self.stats
                         .object_store_cache_upstream_get_bytes
                         .increment(get_result.range.end - get_result.range.start);
@@ -659,6 +668,11 @@ impl CachedObjectStore {
     ///
     /// Returns the bytes plus where they were served from, so the caller can
     /// classify the read as a hit or a miss.
+    // `std::time::Instant` is used for monotonic elapsed-time
+    // measurement of the upstream read. SlateDB's clock abstraction is
+    // for wall-clock timestamps, not request timing (the same exception
+    // `instrumented_object_store` makes).
+    #[allow(clippy::disallowed_methods, clippy::disallowed_types)]
     fn read_part(
         &self,
         location: &Path,
@@ -690,6 +704,7 @@ impl CachedObjectStore {
                     this.stats
                         .object_store_cache_upstream_get_requests
                         .increment(1);
+                    let started = std::time::Instant::now();
                     let get_result = this
                         .object_store
                         .get_opts(
@@ -700,6 +715,9 @@ impl CachedObjectStore {
                             },
                         )
                         .await?;
+                    this.stats
+                        .object_store_cache_upstream_get_latency
+                        .record(started.elapsed().as_secs_f64());
                     this.stats
                         .object_store_cache_upstream_get_bytes
                         .increment(get_result.range.end - get_result.range.start);
