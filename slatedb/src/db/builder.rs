@@ -183,6 +183,7 @@ pub struct DbBuilder<P: Into<Path>> {
     block_cache_policy: BlockCachePolicy,
     system_clock: Option<Arc<dyn SystemClock>>,
     gc_runtime: Option<Handle>,
+    flush_runtime: Option<Handle>,
     compactor_builder: Option<CompactorBuilder<Path>>,
     gc_builder: Option<GarbageCollectorBuilder<Path>>,
     fp_registry: Arc<FailPointRegistry>,
@@ -212,6 +213,7 @@ impl<P: Into<Path>> DbBuilder<P> {
             block_cache_policy: BlockCachePolicy::default(),
             system_clock: None,
             gc_runtime: None,
+            flush_runtime: None,
             compactor_builder: None,
             gc_builder: None,
             fp_registry: Arc::new(FailPointRegistry::new()),
@@ -301,6 +303,18 @@ impl<P: Into<Path>> DbBuilder<P> {
     /// Sets the garbage collection runtime to use for the database.
     pub fn with_gc_runtime(mut self, gc_runtime: Handle) -> Self {
         self.gc_runtime = Some(gc_runtime);
+        self
+    }
+
+    /// Sets the runtime that memtable flush runs on.
+    ///
+    /// Flush encodes SSTs, computes checksums and drives their upload.
+    /// Left unset it shares the runtime that serves reads and writes, so
+    /// that work competes with request handling; pointing it at a
+    /// background runtime keeps the foreground clear. The uploader and
+    /// manifest writer follow the flusher.
+    pub fn with_flush_runtime(mut self, flush_runtime: Handle) -> Self {
+        self.flush_runtime = Some(flush_runtime);
         self
     }
 
@@ -792,10 +806,11 @@ impl<P: Into<Path>> DbBuilder<P> {
 
         // Start the memtable flusher before WAL replay so that
         // replayed immutable memtables can be flushed concurrently.
+        let flush_handle = self.flush_runtime.as_ref().unwrap_or(&tokio_handle);
         memtable_flusher.start(
             inner.clone(),
             manifest,
-            &tokio_handle,
+            flush_handle,
             &task_executor,
             &inner.status_manager,
         )?;
