@@ -25,6 +25,15 @@ use crate::{
 };
 
 enum FetchTask {
+    /// A read that has not been started yet, held as its block range.
+    ///
+    /// With `max_fetch_tasks == 1` there is never more than one fetch
+    /// outstanding, so the consumer awaits it immediately and spawning
+    /// buys no overlap - only a task spawn and a worker wakeup per
+    /// block. Point reads take this path (mineraldb's `get` scans a
+    /// single key prefix and stops at the first match), where it is the
+    /// busiest spawn site in the process.
+    Deferred { start: usize, end: usize },
     InFlight(JoinHandle<Result<VecDeque<Arc<Block>>, SlateDBError>>),
     Finished(VecDeque<Arc<Block>>),
 }
@@ -362,6 +371,32 @@ impl<'a> InternalSstIterator<'a> {
         )
     }
 
+    /// Schedule one block-range read.
+    ///
+    /// Spawns only when more than one fetch may be outstanding, since that
+    /// is the only case where the read can overlap with iteration. With a
+    /// single permitted task the consumer awaits immediately, so the read
+    /// is deferred and run inline instead.
+    fn make_fetch(
+        &self,
+        index: &Arc<SsTableIndexOwned>,
+        start: usize,
+        end: usize,
+    ) -> FetchTask {
+        if self.options.max_fetch_tasks <= 1 {
+            return FetchTask::Deferred { start, end };
+        }
+        let table = self.view.table_as_ref().sst.clone();
+        let table_store = self.table_store.clone();
+        let index = index.clone();
+        let cache_blocks = self.options.cache_blocks;
+        FetchTask::InFlight(tokio::spawn(async move {
+            table_store
+                .read_blocks_using_index(&table, index, start..end, cache_blocks)
+                .await
+        }))
+    }
+
     /// Spawns fetch tasks for blocks based on iteration order.
     ///
     /// For ascending order: Fetches blocks forward from `next_block_idx_to_fetch`, incrementing it
@@ -385,40 +420,10 @@ impl<'a> InternalSstIterator<'a> {
                         self.options.blocks_to_fetch,
                         self.block_idx_range.end - self.next_block_idx_to_fetch,
                     );
-                    let table = self.view.table_as_ref().sst.clone();
-                    let table_store = self.table_store.clone();
                     let blocks_start = self.next_block_idx_to_fetch;
                     let blocks_end = self.next_block_idx_to_fetch + blocks_to_fetch;
-                    // VERIFY: actual block fetch (not just the covered
-                    // range). One line per block range physically read.
-                    // if self.options.prefix.is_some() {
-                    //     tracing::info!(
-                    //         _no_suppress = true,
-                    //         sst_id = ?self.view.table_as_ref().sst.id,
-                    //         blocks = ?(blocks_start..blocks_end),
-                    //         // filter_len == 0 means this SST has no filter
-                    //         // block, so the recency scan can't prune it and
-                    //         // reads this data block unconditionally.
-                    //         // sst_blocks is a size proxy (small SSTs are
-                    //         // filterless when below `min_filter_keys`).
-                    //         filter_len = self.view.table_as_ref().sst.info.filter_len,
-                    //         sst_blocks = index.borrow().block_meta().len(),
-                    //         "prefix scan: fetching block(s) from disk"
-                    //     );
-                    // }
-                    let index = index.clone();
-                    let cache_blocks = self.options.cache_blocks;
                     self.fetch_tasks
-                        .push_back(FetchTask::InFlight(tokio::spawn(async move {
-                            table_store
-                                .read_blocks_using_index(
-                                    &table,
-                                    index,
-                                    blocks_start..blocks_end,
-                                    cache_blocks,
-                                )
-                                .await
-                        })));
+                        .push_back(self.make_fetch(index, blocks_start, blocks_end));
                     self.next_block_idx_to_fetch = blocks_end;
                 }
             }
@@ -431,23 +436,10 @@ impl<'a> InternalSstIterator<'a> {
                         self.options.blocks_to_fetch,
                         self.next_block_idx_to_fetch - self.block_idx_range.start,
                     );
-                    let table = self.view.table_as_ref().sst.clone();
-                    let table_store = self.table_store.clone();
                     let blocks_end = self.next_block_idx_to_fetch;
                     let blocks_start = blocks_end - blocks_to_fetch;
-                    let index = index.clone();
-                    let cache_blocks = self.options.cache_blocks;
                     self.fetch_tasks
-                        .push_back(FetchTask::InFlight(tokio::spawn(async move {
-                            table_store
-                                .read_blocks_using_index(
-                                    &table,
-                                    index,
-                                    blocks_start..blocks_end,
-                                    cache_blocks,
-                                )
-                                .await
-                        })));
+                        .push_back(self.make_fetch(index, blocks_start, blocks_end));
                     self.next_block_idx_to_fetch = blocks_start;
                 }
             }
@@ -466,8 +458,34 @@ impl<'a> InternalSstIterator<'a> {
             if spawn_fetches {
                 self.spawn_fetches();
             }
+            // Run a deferred read here rather than in a spawned task. Taken
+            // before borrowing the queue mutably, since the read needs the
+            // iterator's own table and index.
+            let deferred = match self.fetch_tasks.front() {
+                Some(FetchTask::Deferred { start, end }) => Some((*start, *end)),
+                _ => None,
+            };
+            if let Some((start, end)) = deferred {
+                let table = self.view.table_as_ref().sst.clone();
+                let index = self
+                    .index
+                    .as_ref()
+                    .expect("index is present as checked above")
+                    .clone();
+                let blocks = self
+                    .table_store
+                    .read_blocks_using_index(&table, index, start..end, self.options.cache_blocks)
+                    .await?;
+                if let Some(front) = self.fetch_tasks.front_mut() {
+                    *front = FetchTask::Finished(blocks);
+                }
+                continue;
+            }
             if let Some(fetch_task) = self.fetch_tasks.front_mut() {
                 match fetch_task {
+                    FetchTask::Deferred { .. } => {
+                        unreachable!("deferred reads are resolved above")
+                    }
                     FetchTask::InFlight(jh) => {
                         let blocks = jh.await.expect("join task failed")?;
                         *fetch_task = FetchTask::Finished(blocks);
