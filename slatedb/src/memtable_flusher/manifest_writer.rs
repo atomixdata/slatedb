@@ -31,7 +31,6 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::BoxStream;
 use futures::StreamExt;
-use parking_lot::RwLockWriteGuard;
 use std::cmp;
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
@@ -562,7 +561,7 @@ impl ManifestWriterHandler {
     ///  ```
     fn report_to_status_manager(
         &self,
-        guarded_db_state: &RwLockWriteGuard<DbState>,
+        guarded_db_state: &DbState,
         manifest: VersionedManifest,
     ) {
         let segments = collect_touched_segments(&guarded_db_state.view());

@@ -39,7 +39,7 @@ use crate::garbage_collector::GC_TASK_NAME;
 use crate::transaction_manager::IsolationLevel;
 use crate::CloseReason;
 use log::{debug, info, trace, warn};
-use parking_lot::RwLock;
+use crate::state_lock::StateLock;
 use std::time::Duration;
 
 use crate::batch::WriteBatch;
@@ -87,7 +87,7 @@ pub use builder::DbReaderBuilder;
 pub(crate) mod builder;
 
 pub(crate) struct DbInner {
-    pub(crate) state: Arc<RwLock<DbState>>,
+    pub(crate) state: Arc<StateLock>,
     pub(crate) settings: Settings,
     pub(crate) table_store: Arc<TableStore>,
     pub(crate) memtable_flusher: Arc<MemtableFlusher>,
@@ -153,11 +153,11 @@ impl DbInner {
             manifest.value.core.last_l0_clock_tick,
         ));
 
+        let db_stats = DbStats::new(&recorder);
+
         // state are mostly manifest, including IMM, L0, etc.
         let db_state = DbState::new(manifest);
-        let state = Arc::new(RwLock::new(db_state));
-
-        let db_stats = DbStats::new(&recorder);
+        let state = Arc::new(StateLock::new(db_state, &db_stats));
         let wal_enabled = DbInner::wal_enabled_in_options(&settings);
         let flush_merge_operator = merge_operator.clone().map(|merge_operator| {
             instrument_merge_operator(
@@ -2076,7 +2076,7 @@ impl DbWalObserver {
     fn new(
         wrapped: WalObserver,
         oracle: Arc<DbOracle>,
-        db_state: Arc<RwLock<DbState>>,
+        db_state: Arc<StateLock>,
         closed_reader: WatchableOnceCellReader<Result<(), SlateDBError>>,
     ) -> Self {
         let (status_tx, status_rx) = tokio::sync::watch::channel(wrapped.status());

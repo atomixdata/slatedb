@@ -41,6 +41,14 @@ pub const SST_FILTER_NEGATIVE_COUNT: &str = db_stat_name!("sst_filter_negative_c
 ///               / `MEMTABLE_WRITE_BYTES`
 pub const MEMTABLE_WRITE_BYTES: &str = db_stat_name!("memtable_write_bytes");
 
+/// State-lock contention counters; see [`crate::state_lock::StateLock`].
+pub const STATE_LOCK_READ_WAIT_OVER_1MS: &str = db_stat_name!("state_lock_read_wait_over_1ms");
+pub const STATE_LOCK_READ_WAIT_OVER_10MS: &str = db_stat_name!("state_lock_read_wait_over_10ms");
+pub const STATE_LOCK_WRITE_WAIT_OVER_1MS: &str = db_stat_name!("state_lock_write_wait_over_1ms");
+pub const STATE_LOCK_WRITE_WAIT_OVER_10MS: &str = db_stat_name!("state_lock_write_wait_over_10ms");
+pub const STATE_LOCK_WRITE_HOLD_OVER_1MS: &str = db_stat_name!("state_lock_write_hold_over_1ms");
+pub const STATE_LOCK_WRITE_HOLD_OVER_10MS: &str = db_stat_name!("state_lock_write_hold_over_10ms");
+
 /// Label key distinguishing filter metrics for point lookups from those for
 /// prefix scans. Value is one of [`FILTER_KIND_POINT`] or
 /// [`FILTER_KIND_PREFIX`].
@@ -75,6 +83,12 @@ pub(crate) struct DbStatsInner {
     pub(crate) merge_operator_read_operands: Arc<dyn CounterFn>,
     pub(crate) merge_operator_flush_operands: Arc<dyn CounterFn>,
     pub(crate) memtable_write_bytes: Arc<dyn CounterFn>,
+    pub(crate) state_lock_read_wait_over_1ms: Arc<dyn CounterFn>,
+    pub(crate) state_lock_read_wait_over_10ms: Arc<dyn CounterFn>,
+    pub(crate) state_lock_write_wait_over_1ms: Arc<dyn CounterFn>,
+    pub(crate) state_lock_write_wait_over_10ms: Arc<dyn CounterFn>,
+    pub(crate) state_lock_write_hold_over_1ms: Arc<dyn CounterFn>,
+    pub(crate) state_lock_write_hold_over_10ms: Arc<dyn CounterFn>,
 }
 
 #[derive(Clone)]
@@ -161,6 +175,24 @@ impl DbStats {
                 .description(MERGE_OPERATOR_OPERANDS_DESCRIPTION)
                 .register(),
             memtable_write_bytes: recorder.counter(MEMTABLE_WRITE_BYTES).register(),
+            state_lock_read_wait_over_1ms: recorder
+                .counter(STATE_LOCK_READ_WAIT_OVER_1MS)
+                .register(),
+            state_lock_read_wait_over_10ms: recorder
+                .counter(STATE_LOCK_READ_WAIT_OVER_10MS)
+                .register(),
+            state_lock_write_wait_over_1ms: recorder
+                .counter(STATE_LOCK_WRITE_WAIT_OVER_1MS)
+                .register(),
+            state_lock_write_wait_over_10ms: recorder
+                .counter(STATE_LOCK_WRITE_WAIT_OVER_10MS)
+                .register(),
+            state_lock_write_hold_over_1ms: recorder
+                .counter(STATE_LOCK_WRITE_HOLD_OVER_1MS)
+                .register(),
+            state_lock_write_hold_over_10ms: recorder
+                .counter(STATE_LOCK_WRITE_HOLD_OVER_10MS)
+                .register(),
         };
         DbStats {
             inner: Arc::new(inner),

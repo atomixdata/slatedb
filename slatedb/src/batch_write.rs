@@ -46,7 +46,6 @@ use crate::utils::WatchableOnceCellReader;
 use crate::wal_buffer::WalBufferManager;
 use crate::{batch::WriteBatch, db::DbInner, db::WriteHandle, error::SlateDBError};
 use bytes::Bytes;
-use parking_lot::RwLockWriteGuard;
 use slatedb_common::clock::SystemClock;
 use tokio::sync::oneshot;
 
@@ -369,7 +368,7 @@ impl DbInner {
     //       should consolidate replay and the write path into one module and make this private
     pub(crate) fn freeze_current_memtable_with_state_guard(
         &self,
-        guard: &mut RwLockWriteGuard<'_, DbState>,
+        guard: &mut DbState,
         replay_after_wal_id: u64,
     ) {
         if guard.memtable().is_empty() {
