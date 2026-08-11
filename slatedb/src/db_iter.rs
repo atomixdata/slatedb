@@ -284,11 +284,6 @@ impl DbIterator {
             Err(error)
         } else {
             let result = loop {
-                // Keep cached iteration cooperative: entries served from
-                // memory never yield on their own, so a long run of
-                // tombstones would hold the worker and defer every task
-                // queued behind it.
-                tokio::task::coop::consume_budget().await;
                 match self.iter.next().await {
                     Ok(Some(entry)) => match entry.value {
                         ValueDeletable::Tombstone => continue,
@@ -415,9 +410,6 @@ impl DbRecencyIterator {
         }
 
         loop {
-            // Same reasoning as above: merging cached iterators can spin
-            // without pending.
-            tokio::task::coop::consume_budget().await;
             let Some(iter) = self.iters.front_mut() else {
                 return Ok(None);
             };

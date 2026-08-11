@@ -222,10 +222,6 @@ impl<T: RowEntryIterator> RowEntryIterator for RetentionIterator<T> {
     /// The state machine ensures efficient processing by batching operations for each key.
     async fn next(&mut self) -> Result<Option<RowEntry>, SlateDBError> {
         loop {
-            // A key with many versions buffers entirely from upstream
-            // without hitting I/O, so this loop needs its own yield
-            // point to stay cooperative.
-            tokio::task::coop::consume_budget().await;
             match self.buffer.state() {
                 RetentionBufferState::NeedPush => {
                     // Fetch next entry from upstream iterator

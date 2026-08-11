@@ -153,12 +153,6 @@ impl<'a> MergeIterator<'a> {
 
     async fn advance(&mut self) -> Result<Option<RowEntry>, SlateDBError> {
         self.ensure_initialized().await?;
-        // Entries served from the block cache complete without ever
-        // returning Pending, so this loop can run a whole scheduler
-        // slice without yielding and stall the request threads sharing
-        // these cores. Charge each entry against the coop budget so the
-        // runtime gets a yield point.
-        tokio::task::coop::consume_budget().await;
         if let Some(mut iterator_state) = self.current.take() {
             let current_kv = iterator_state.next_kv;
             if let Some(kv) = iterator_state.iterator.next().await? {

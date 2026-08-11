@@ -304,10 +304,6 @@ impl EncodedSsTableBuilder {
             block_builder = block_builder.with_block_transformer(transformer);
         }
         let block = block_builder.build().await?;
-        // Account for the CPU-only encoding work above: building a block
-        // never pends, so a flush that encodes many blocks back to back
-        // would otherwise hold the worker for the whole SST.
-        tokio::task::coop::consume_budget().await;
         let block_meta = BlockMeta::create(
             &mut self.index_builder,
             &BlockMetaArgs {
