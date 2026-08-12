@@ -3224,7 +3224,6 @@ dependencies = [
  "chrono",
  "crc32fast",
  "criterion",
- "crossbeam-channel",
  "crossbeam-skiplist",
  "ctor",
  "dotenvy",

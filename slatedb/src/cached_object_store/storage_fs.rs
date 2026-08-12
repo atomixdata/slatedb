@@ -231,105 +231,12 @@ fn read_exact_at_offset(file: &std::fs::File, buf: &mut [u8], offset: u64) -> st
     }
 }
 
-/// Threads in the disk-cache read pool. The default covers the device's
-/// latency-bandwidth product with headroom (at ~70us per read, 32 threads
-/// sustain ~450k reads/s); the threads are parked in `recv` or blocked in
-/// `pread`, so idle ones cost no CPU.
-const IO_POOL_THREADS_ENV: &str = "SLATEDB_DISK_CACHE_IO_THREADS";
-const IO_POOL_THREADS_DEFAULT: usize = 32;
-
-/// A fixed pool of long-lived threads serving disk-cache part reads.
-///
-/// Dispatching each read through `spawn_blocking` takes tokio's single
-/// blocking-pool mutex and signals its condvar once per read. At ~100k
-/// reads/s that lock is the hottest stack in CPU profiles of slow request
-/// polls. Long-lived workers on an MPMC channel keep the submit path
-/// lock-free while workers are busy, and a parked worker's single wakeup
-/// drains every request queued behind it.
-#[derive(Clone, Debug)]
-struct IoPool {
-    tx: crossbeam_channel::Sender<IoRequest>,
-}
-
-struct IoRequest {
-    path: std::path::PathBuf,
-    range: Range<usize>,
-    reply: tokio::sync::oneshot::Sender<object_store::Result<Option<Bytes>>>,
-}
-
-impl IoPool {
-    // Real OS threads by design: the workers block in pread and must live
-    // outside any tokio runtime.
-    #[allow(clippy::disallowed_types)]
-    fn new(threads: usize, file_cache: FileHandleCache) -> Self {
-        let (tx, rx) = crossbeam_channel::unbounded::<IoRequest>();
-        for i in 0..threads {
-            let rx = rx.clone();
-            let cache = file_cache.clone();
-            std::thread::Builder::new()
-                .name(format!("slatedb-dc-io-{i}"))
-                .spawn(move || {
-                    // Exits when the last sender (the storage and its
-                    // entries) is dropped.
-                    while let Ok(req) = rx.recv() {
-                        let result = Self::read(&cache, &req.path, req.range);
-                        // A closed reply means the caller was cancelled.
-                        let _ = req.reply.send(result);
-                    }
-                })
-                .expect("failed to spawn disk cache io thread");
-        }
-        Self { tx }
-    }
-
-    fn from_env(file_cache: FileHandleCache) -> Self {
-        let threads = std::env::var(IO_POOL_THREADS_ENV)
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or(IO_POOL_THREADS_DEFAULT);
-        Self::new(threads, file_cache)
-    }
-
-    fn read(
-        cache: &FileHandleCache,
-        path: &std::path::Path,
-        range: Range<usize>,
-    ) -> object_store::Result<Option<Bytes>> {
-        let file = match cache.get_or_open(path) {
-            Ok(Some(f)) => f,
-            Ok(None) => return Ok(None),
-            Err(err) => return Err(wrap_io_err(err)),
-        };
-        // Use positional I/O (pread) — no seek required, and safe for
-        // concurrent readers sharing the same Arc<File>.
-        let mut buffer = vec![0; range.len()];
-        read_exact_at_offset(file.file(), &mut buffer, range.start as u64).map_err(wrap_io_err)?;
-        Ok(Some(Bytes::from(buffer)))
-    }
-
-    async fn submit(
-        &self,
-        path: std::path::PathBuf,
-        range: Range<usize>,
-    ) -> object_store::Result<Option<Bytes>> {
-        let (reply, rx) = tokio::sync::oneshot::channel();
-        self.tx
-            .send(IoRequest { path, range, reply })
-            .map_err(|_| wrap_io_err(std::io::Error::other("disk cache io pool shut down")))?;
-        rx.await.map_err(|_| {
-            wrap_io_err(std::io::Error::other("disk cache io pool dropped request"))
-        })?
-    }
-}
-
 #[derive(Debug)]
 pub struct FsCacheStorage {
     root_folder: std::path::PathBuf,
     evictor: Option<Arc<FsCacheEvictor>>,
     rand: Arc<DbRand>,
     file_handle_cache: FileHandleCache,
-    io_pool: IoPool,
 }
 
 impl FsCacheStorage {
@@ -355,14 +262,11 @@ impl FsCacheStorage {
             ))
         });
 
-        let io_pool = IoPool::from_env(file_handle_cache.clone());
-
         Self {
             root_folder,
             evictor,
             rand,
             file_handle_cache,
-            io_pool,
         }
     }
 
@@ -386,7 +290,6 @@ impl LocalCacheStorage for FsCacheStorage {
             part_size,
             rand: self.rand.clone(),
             file_handle_cache: self.file_handle_cache.clone(),
-            io_pool: self.io_pool.clone(),
         })
     }
 
@@ -411,7 +314,6 @@ pub(crate) struct FsCacheEntry {
     evictor: Option<Arc<FsCacheEvictor>>,
     rand: Arc<DbRand>,
     file_handle_cache: FileHandleCache,
-    io_pool: IoPool,
 }
 
 impl FsCacheEntry {
@@ -532,10 +434,31 @@ impl LocalCacheEntry for FsCacheEntry {
             self.part_size,
         );
 
-        // Dispatch to the dedicated read pool rather than `spawn_blocking`:
-        // at the request rate of the hot path, the blocking pool's global
-        // spawn lock is itself a bottleneck. See [IoPool].
-        let result = self.io_pool.submit(part_path.clone(), range_in_part).await?;
+        // Spawn a blocking task and do synchronous I/O rather than use the tokio async apis.
+        // Under the hood, on linux systems , tokio itself spawns a blocking task for each call to
+        // drive i/o since it hasn't yet adopted the native fully async i/o api (io_uring). Each
+        // blocking task adds overhead, so its better to just batch all the calls into a single
+        // blocking task.
+        // see https://github.com/slatedb/slatedb/pull/1342
+        let file_cache = self.file_handle_cache.clone();
+        let this_part_path = part_path.clone();
+        #[allow(clippy::disallowed_methods)]
+        let result = tokio::task::spawn_blocking(move || {
+            let file = match file_cache.get_or_open(&this_part_path) {
+                Ok(Some(f)) => f,
+                Ok(None) => return Ok(None),
+                Err(err) => return Err(wrap_io_err(err)),
+            };
+
+            // Use positional I/O (pread) — no seek required, and safe for
+            // concurrent readers sharing the same Arc<File>.
+            let mut buffer = vec![0; range_in_part.len()];
+            read_exact_at_offset(file.file(), &mut buffer, range_in_part.start as u64)
+                .map_err(wrap_io_err)?;
+            Ok(Some(Bytes::from(buffer)))
+        })
+        .await
+        .map_err(wrap_io_err)??;
 
         // track the part access for evictor
         if result.is_some() {
