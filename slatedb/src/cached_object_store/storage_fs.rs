@@ -22,11 +22,26 @@ use walkdir::WalkDir;
 use crate::cached_object_store::storage::{LocalCacheEntry, LocalCacheHead, LocalCacheStorage};
 use crate::utils::format_bytes_si;
 
+/// Opt-in `O_DIRECT` for disk-cache reads (Linux only). The page cache
+/// serves only ~2% of part reads on a large dataset, but routes every
+/// read through page allocation, which stalls for milliseconds during
+/// flush/compaction writeback storms (measured 16ms worst-case against
+/// 1ms for direct reads under the same storm). Direct reads trade the
+/// tiny hit rate for immunity to those stalls.
+#[cfg(target_os = "linux")]
+const DIRECT_READS_ENV: &str = "SLATEDB_DISK_CACHE_DIRECT_READS";
+
+/// Alignment for direct I/O: offset, length, and buffer address must
+/// all be multiples of this. 4096 covers every NVMe logical block size
+/// in practice.
+const DIRECT_IO_ALIGN_BYTES: usize = 4096;
+
 /// A cached file handle node. Callers that obtain an `Arc<CachedFileHandle>`
 /// keep the underlying fd alive even after the entry is evicted from the cache.
 #[derive(Debug)]
 pub(crate) struct CachedFileHandle {
     file: std::fs::File,
+    direct: bool,
 }
 
 impl CachedFileHandle {
@@ -64,6 +79,7 @@ type HandleShard = parking_lot::Mutex<LruCache<std::path::PathBuf, Arc<CachedFil
 #[derive(Clone)]
 pub(crate) struct FileHandleCache {
     shards: Arc<Vec<HandleShard>>,
+    direct: bool,
 }
 
 impl std::fmt::Debug for FileHandleCache {
@@ -90,7 +106,36 @@ impl FileHandleCache {
             .collect();
         Self {
             shards: Arc::new(shards),
+            direct: Self::direct_reads_enabled(),
         }
+    }
+
+    /// `O_DIRECT` is Linux-only; everywhere else the flag stays off and
+    /// reads take the buffered path unchanged.
+    fn direct_reads_enabled() -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            std::env::var(DIRECT_READS_ENV)
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
+    }
+
+    /// Opens `path` for reading, honoring the cache's direct-I/O mode.
+    fn open_for_read(&self, path: &std::path::Path) -> std::io::Result<std::fs::File> {
+        #[cfg(target_os = "linux")]
+        if self.direct {
+            use std::os::unix::fs::OpenOptionsExt;
+            return std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECT)
+                .open(path);
+        }
+        std::fs::File::open(path)
     }
 
     /// The shard owning `path`. A path always maps to the same shard, so
@@ -131,14 +176,17 @@ impl FileHandleCache {
         }
 
         // Open with no lock held: this can block on disk.
-        let file = match std::fs::File::open(path) {
+        let file = match self.open_for_read(path) {
             Ok(f) => f,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(err) => return Err(err),
         };
         Self::set_random_advise(&file);
 
-        let handle = Arc::new(CachedFileHandle { file });
+        let handle = Arc::new(CachedFileHandle {
+            file,
+            direct: self.direct,
+        });
 
         // Race-tolerant insert: if another thread opened the same path while we
         // were outside the lock, use theirs and drop our freshly opened fd, so
@@ -229,6 +277,70 @@ fn read_exact_at_offset(file: &std::fs::File, buf: &mut [u8], offset: u64) -> st
         }
         Ok(())
     }
+}
+
+/// Reads `range` from a cached handle, honoring its open mode: plain
+/// positional read for buffered handles, aligned direct read for
+/// `O_DIRECT` ones.
+fn read_file_range(
+    handle: &CachedFileHandle,
+    range: Range<usize>,
+) -> std::io::Result<Vec<u8>> {
+    #[cfg(unix)]
+    if handle.direct {
+        return read_range_direct(handle.file(), range);
+    }
+    let mut buffer = vec![0; range.len()];
+    read_exact_at_offset(handle.file(), &mut buffer, range.start as u64)?;
+    Ok(buffer)
+}
+
+/// Positional read of an arbitrary byte range from a file opened with
+/// `O_DIRECT`.
+///
+/// Direct I/O requires the file offset, transfer size, and buffer
+/// address to all be block-aligned, so this reads the containing
+/// aligned span and copies out the requested window. The aligned span
+/// may run past EOF; that is fine as long as the read covers the
+/// requested window. Also correct (just wasteful) on buffered files,
+/// which is what the tests exercise since `O_DIRECT` needs a real
+/// filesystem.
+#[cfg(unix)]
+fn read_range_direct(
+    file: &std::fs::File,
+    range: Range<usize>,
+) -> std::io::Result<Vec<u8>> {
+    use std::os::unix::fs::FileExt;
+    if range.is_empty() {
+        return Ok(Vec::new());
+    }
+    let span_start = range.start - range.start % DIRECT_IO_ALIGN_BYTES;
+    let span_end = range.end.div_ceil(DIRECT_IO_ALIGN_BYTES) * DIRECT_IO_ALIGN_BYTES;
+    let span = span_end - span_start;
+    // Over-allocate and slice at an aligned offset, which satisfies the
+    // buffer-address requirement without raw allocation.
+    let mut backing = vec![0u8; span + DIRECT_IO_ALIGN_BYTES];
+    let shift = backing.as_ptr().align_offset(DIRECT_IO_ALIGN_BYTES);
+    let buf = &mut backing[shift..shift + span];
+    // `filled` counts contiguous valid bytes from span_start. A short
+    // read restarts from the previous aligned boundary so every pread
+    // stays aligned. EOF is detected as lack of forward progress, not
+    // as a zero-byte read: a read starting before EOF returns the
+    // remaining bytes rather than zero, and retrying it from the same
+    // aligned boundary would loop forever.
+    let mut filled = 0;
+    while filled < range.end - span_start {
+        let aligned_filled = filled - filled % DIRECT_IO_ALIGN_BYTES;
+        let n = file.read_at(&mut buf[aligned_filled..], (span_start + aligned_filled) as u64)?;
+        if aligned_filled + n <= filled {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "eof before requested range was covered",
+            ));
+        }
+        filled = aligned_filled + n;
+    }
+    Ok(buf[range.start - span_start..range.end - span_start].to_vec())
 }
 
 #[derive(Debug)]
@@ -450,11 +562,9 @@ impl LocalCacheEntry for FsCacheEntry {
                 Err(err) => return Err(wrap_io_err(err)),
             };
 
-            // Use positional I/O (pread) — no seek required, and safe for
+            // Positional I/O — no seek required, and safe for
             // concurrent readers sharing the same Arc<File>.
-            let mut buffer = vec![0; range_in_part.len()];
-            read_exact_at_offset(file.file(), &mut buffer, range_in_part.start as u64)
-                .map_err(wrap_io_err)?;
+            let buffer = read_file_range(&file, range_in_part).map_err(wrap_io_err)?;
             Ok(Some(Bytes::from(buffer)))
         })
         .await
@@ -571,9 +681,8 @@ impl LocalCacheEntry for FsCacheEntry {
             let metadata = file.file().metadata().map_err(wrap_io_err)?;
             let head_size_bytes = metadata.len() as usize;
 
-            // Use positional read from offset 0 to read the entire file.
-            let mut buffer = vec![0u8; head_size_bytes];
-            read_exact_at_offset(file.file(), &mut buffer, 0).map_err(wrap_io_err)?;
+            // Positional read from offset 0 of the entire file.
+            let buffer = read_file_range(&file, 0..head_size_bytes).map_err(wrap_io_err)?;
 
             let content = String::from_utf8(buffer).map_err(|e| {
                 wrap_io_err(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
@@ -1309,6 +1418,47 @@ mod tests {
         let mut file = std::fs::File::create(&file_path).unwrap();
         file.write_all(&bytes).unwrap();
         file_path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_read_range_direct() {
+        // A plain buffered file: read_range_direct's alignment logic is
+        // identical either way, and O_DIRECT itself needs a real
+        // filesystem that CI temp dirs do not guarantee.
+        let temp_dir = tempfile::Builder::new()
+            .prefix("test_read_range_direct")
+            .tempdir()
+            .unwrap();
+        let n = 3 * DIRECT_IO_ALIGN_BYTES + 100;
+        let path = gen_rand_file(temp_dir.path(), "data.bin", n);
+        let want = std::fs::read(&path).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+
+        // Misaligned window in the middle.
+        let got = read_range_direct(&file, 100..DIRECT_IO_ALIGN_BYTES + 50).unwrap();
+        assert_eq!(got, want[100..DIRECT_IO_ALIGN_BYTES + 50]);
+
+        // Window whose aligned span runs past EOF.
+        let got = read_range_direct(&file, n - 50..n).unwrap();
+        assert_eq!(got, want[n - 50..n]);
+
+        // Whole file and empty range.
+        assert_eq!(read_range_direct(&file, 0..n).unwrap(), want);
+        assert!(read_range_direct(&file, 10..10).unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_read_range_direct_eof_underrun() {
+        let temp_dir = tempfile::Builder::new()
+            .prefix("test_read_range_direct_eof")
+            .tempdir()
+            .unwrap();
+        let path = gen_rand_file(temp_dir.path(), "small.bin", 100);
+        let file = std::fs::File::open(&path).unwrap();
+        let err = read_range_direct(&file, 50..200).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
     }
 
     #[test]

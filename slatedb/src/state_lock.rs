@@ -1,3 +1,9 @@
+// Real monotonic time by design: these counters diagnose actual lock
+// wait/hold durations in production, which a mockable clock must not
+// distort, and the measurements happen inside synchronous lock paths
+// where the async clock is unavailable.
+#![allow(clippy::disallowed_types)]
+
 use crate::db_state::DbState;
 use crate::db_stats::DbStats;
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
