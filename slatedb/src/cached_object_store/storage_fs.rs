@@ -31,6 +31,15 @@ use crate::utils::format_bytes_si;
 #[cfg(target_os = "linux")]
 const DIRECT_READS_ENV: &str = "SLATEDB_DISK_CACHE_DIRECT_READS";
 
+/// Opt-in `O_DIRECT` for disk-cache part writes (Linux only). Flush and
+/// compaction write whole parts in sub-second blasts (~355MB observed in
+/// 250ms); through the page cache that allocates hundreds of MB at once
+/// and stalls page allocation machine-wide, which is the residual
+/// latency-spike source after reads went direct. Direct writes never
+/// touch the page cache. Head files are small JSON and stay buffered.
+#[cfg(target_os = "linux")]
+const DIRECT_WRITES_ENV: &str = "SLATEDB_DISK_CACHE_DIRECT_WRITES";
+
 /// Alignment for direct I/O: offset, length, and buffer address must
 /// all be multiples of this. 4096 covers every NVMe logical block size
 /// in practice.
@@ -295,6 +304,58 @@ fn read_file_range(
     Ok(buffer)
 }
 
+/// `O_DIRECT` writes are enabled by env on Linux; everywhere else the
+/// buffered path stays.
+fn direct_writes_enabled() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        std::env::var(DIRECT_WRITES_ENV)
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+/// Writes `buf` to a file opened with `O_DIRECT`, streaming through an
+/// aligned bounce buffer. The final partial block is zero-padded to
+/// satisfy the transfer-size alignment requirement; the caller trims
+/// the padding with `set_len`. Also correct (just wasteful) on
+/// buffered files, which is what the tests exercise since `O_DIRECT`
+/// needs a real filesystem.
+#[cfg(unix)]
+fn write_all_direct(file: &mut std::fs::File, buf: &[u8]) -> std::io::Result<()> {
+    const CHUNK_BYTES: usize = 4 * 1024 * 1024;
+    write_all_direct_chunked(file, buf, CHUNK_BYTES)
+}
+
+#[cfg(unix)]
+fn write_all_direct_chunked(
+    file: &mut std::fs::File,
+    buf: &[u8],
+    chunk_bytes: usize,
+) -> std::io::Result<()> {
+    debug_assert!(chunk_bytes.is_multiple_of(DIRECT_IO_ALIGN_BYTES));
+    // Over-allocate and slice at an aligned offset, which satisfies the
+    // buffer-address requirement without raw allocation.
+    let mut backing = vec![0u8; chunk_bytes + DIRECT_IO_ALIGN_BYTES];
+    let shift = backing.as_ptr().align_offset(DIRECT_IO_ALIGN_BYTES);
+    let chunk = &mut backing[shift..shift + chunk_bytes];
+    let mut off = 0;
+    while off < buf.len() {
+        let n = (buf.len() - off).min(chunk_bytes);
+        chunk[..n].copy_from_slice(&buf[off..off + n]);
+        // Only the final chunk can be partial; pad it to alignment.
+        let padded = n.div_ceil(DIRECT_IO_ALIGN_BYTES) * DIRECT_IO_ALIGN_BYTES;
+        chunk[n..padded].fill(0);
+        file.write_all(&chunk[..padded])?;
+        off += n;
+    }
+    Ok(())
+}
+
 /// Positional read of an arbitrary byte range from a file opened with
 /// `O_DIRECT`.
 ///
@@ -349,6 +410,7 @@ pub struct FsCacheStorage {
     evictor: Option<Arc<FsCacheEvictor>>,
     rand: Arc<DbRand>,
     file_handle_cache: FileHandleCache,
+    direct_writes: bool,
 }
 
 impl FsCacheStorage {
@@ -379,6 +441,7 @@ impl FsCacheStorage {
             evictor,
             rand,
             file_handle_cache,
+            direct_writes: direct_writes_enabled(),
         }
     }
 
@@ -402,6 +465,7 @@ impl LocalCacheStorage for FsCacheStorage {
             part_size,
             rand: self.rand.clone(),
             file_handle_cache: self.file_handle_cache.clone(),
+            direct_writes: self.direct_writes,
         })
     }
 
@@ -426,6 +490,7 @@ pub(crate) struct FsCacheEntry {
     evictor: Option<Arc<FsCacheEvictor>>,
     rand: Arc<DbRand>,
     file_handle_cache: FileHandleCache,
+    direct_writes: bool,
 }
 
 impl FsCacheEntry {
@@ -451,6 +516,9 @@ impl FsCacheEntry {
         // blocking task.
         // see https://github.com/slatedb/slatedb/pull/1342
         let invalidate_path = path.clone();
+        // Direct writes only pay off for bulk part payloads; tiny
+        // buffers (heads) stay on the buffered path.
+        let use_direct = self.direct_writes && buf.len() >= DIRECT_IO_ALIGN_BYTES;
         #[allow(clippy::disallowed_methods)]
         tokio::task::spawn_blocking(move || {
             let tmp_path = tmp_path.as_path();
@@ -459,13 +527,23 @@ impl FsCacheEntry {
                 std::fs::create_dir_all(folder_path).map_err(wrap_io_err)?;
             }
 
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(tmp_path)
-                .map_err(wrap_io_err)?;
-            file.write_all(&buf).map_err(wrap_io_err)?;
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create(true).truncate(true);
+            #[cfg(target_os = "linux")]
+            if use_direct {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.custom_flags(libc::O_DIRECT);
+            }
+            let mut file = opts.open(tmp_path).map_err(wrap_io_err)?;
+            #[cfg(unix)]
+            if use_direct {
+                write_all_direct(&mut file, &buf).map_err(wrap_io_err)?;
+                // Trim the final block's alignment padding.
+                file.set_len(buf.len() as u64).map_err(wrap_io_err)?;
+            }
+            if !use_direct {
+                file.write_all(&buf).map_err(wrap_io_err)?;
+            }
 
             // Note: There is no fsync before the rename. The cache holds copies
             // of durable upstream bytes, so part durability is not required, only
@@ -1446,6 +1524,35 @@ mod tests {
         // Whole file and empty range.
         assert_eq!(read_range_direct(&file, 0..n).unwrap(), want);
         assert!(read_range_direct(&file, 10..10).unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_write_all_direct_chunked() {
+        // A plain buffered file: the chunking and padding logic is
+        // identical either way, and O_DIRECT itself needs a real
+        // filesystem.
+        let temp_dir = tempfile::Builder::new()
+            .prefix("test_write_all_direct")
+            .tempdir()
+            .unwrap();
+        let chunk = 2 * DIRECT_IO_ALIGN_BYTES;
+        // Sizes exercising: sub-block, exactly one block, chunk
+        // boundary, and multi-chunk with a partial tail.
+        for n in [
+            100,
+            DIRECT_IO_ALIGN_BYTES,
+            chunk,
+            2 * chunk + DIRECT_IO_ALIGN_BYTES + 300,
+        ] {
+            let want = gen_rand_bytes(n);
+            let path = temp_dir.path().join(format!("out_{n}.bin"));
+            let mut file = std::fs::File::create(&path).unwrap();
+            write_all_direct_chunked(&mut file, &want, chunk).unwrap();
+            file.set_len(want.len() as u64).unwrap();
+            drop(file);
+            assert_eq!(std::fs::read(&path).unwrap(), want, "size {n}");
+        }
     }
 
     #[cfg(unix)]
