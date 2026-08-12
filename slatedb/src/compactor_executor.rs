@@ -611,6 +611,16 @@ impl TokioCompactionExecutorInner {
             "executing compaction with subcompactions [id={}, subcompactions={}]",
             id, num_subcompactions
         );
+        // Real monotonic time for phase attribution in the latency-spike
+        // investigation.
+        #[allow(clippy::disallowed_types)]
+        let job_start = std::time::Instant::now();
+        log::info!(
+            "Compaction job starting [id={}, destination={}, subcompactions={}]",
+            id,
+            destination,
+            num_subcompactions
+        );
 
         // Per-range bytes-processed, summed into the job's progress total. Each
         // range folds its own resume offset into the values it reports (see
@@ -765,6 +775,13 @@ impl TokioCompactionExecutorInner {
             );
             return Err(SlateDBError::CompactorExecutorFailed);
         }
+        log::info!(
+            "Compaction job finished [id={}, ms={}, bytes={}, output_ssts={}]",
+            id,
+            job_start.elapsed().as_millis(),
+            bytes_processed_by_sub.iter().sum::<u64>(),
+            output_ssts.len()
+        );
         Ok(SortedRun {
             id: destination,
             sst_views: output_ssts
