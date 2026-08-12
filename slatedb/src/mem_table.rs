@@ -111,6 +111,19 @@ pub(crate) struct KVTable {
     touched_segments: Mutex<std::collections::BTreeSet<Bytes>>,
 }
 
+impl Drop for KVTable {
+    fn drop(&mut self) {
+        // Marks when a large (memtable-sized) skiplist deallocation
+        // begins, for aligning the first-flush latency burst against
+        // flush pipeline phases. The map itself drops right after this
+        // body returns, so the log marks the start, not the duration.
+        let bytes = self.entries_size_in_bytes.load(Ordering::Relaxed);
+        if bytes > 100 * 1024 * 1024 {
+            log::info!("KVTable drop starting [bytes={}]", bytes);
+        }
+    }
+}
+
 pub(crate) struct KVTableMetadata {
     pub(crate) entry_num: usize,
     pub(crate) entries_size_in_bytes: usize,

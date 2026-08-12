@@ -189,10 +189,15 @@ impl UploadHandler {
     }
 
     async fn upload_with_retry(&self, job: &UploadJob) -> Result<UploadedMemtable, SlateDBError> {
+        // Real monotonic time for phase attribution in the latency-spike
+        // investigation; a mock clock must not distort these.
+        #[allow(clippy::disallowed_types)]
+        let phase_start = std::time::Instant::now();
         // Build once, retry only the upload. `write_sst` takes
         // `&EncodedSsTable`, so the encoded SSTs stay alive for retries —
         // no need to rebuild from the memtable on transient upload errors.
         let built = self.db.build_imm_ssts(job.imm_memtable.table()).await?;
+        let build_ms = phase_start.elapsed().as_millis();
         let first_seq = job
             .imm_memtable
             .table()
@@ -223,6 +228,16 @@ impl UploadHandler {
             }
         }))
         .await?;
+
+        let total_ms = phase_start.elapsed().as_millis();
+        let bytes: u64 = built.iter().map(|s| s.encoded.remaining_len() as u64).sum();
+        info!(
+            "Flush phases [build_ms={}, upload_ms={}, ssts={}, bytes={}]",
+            build_ms,
+            total_ms - build_ms,
+            built.len(),
+            bytes
+        );
 
         Ok(UploadedMemtable {
             imm_memtable: Arc::clone(&job.imm_memtable),

@@ -167,7 +167,16 @@ impl MessageHandler<TrackerMessage> for FlushTracker {
             }
             TrackerMessage::UploadComplete(uploaded) => {
                 self.stats.l0_upload_count.increment(1);
-                self.handle_uploaded(uploaded).await
+                // Real monotonic time for phase attribution in the
+                // latency-spike investigation.
+                #[allow(clippy::disallowed_types)]
+                let start = std::time::Instant::now();
+                let result = self.handle_uploaded(uploaded).await;
+                log::info!(
+                    "Flush handle_uploaded took {}ms",
+                    start.elapsed().as_millis()
+                );
+                result
             }
             TrackerMessage::FlushComplete { through_seq } => {
                 self.stats.l0_flush_count.increment(1);
