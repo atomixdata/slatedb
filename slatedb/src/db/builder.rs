@@ -632,17 +632,18 @@ impl<P: Into<Path>> DbBuilder<P> {
             None,
         ));
 
-        // The compactor reads each input SST end-to-end. We deliberately
-        // route those reads through the *uncached* upstream object store
-        // (async network I/O via reqwest) rather than through the local
-        // disk cache (which would dispatch every block read through the
-        // shared `tokio::task::spawn_blocking` pool and contend with
-        // foreground reads). Outputs still go to upstream + the local
-        // disk cache via the prewarm tee, which is wired in by attaching
-        // `cached_object_store` and enabling `prewarm_compacted_on_write`
-        // below. Net effect: foreground readers keep an uncontested
-        // blocking pool while compaction outputs stay locally cached
-        // for the next reader.
+        // The compactor reads each input SST end-to-end, and routes those
+        // reads through the cached object store: inputs are nearly always
+        // resident in the local disk cache (flush and compaction outputs
+        // both tee into it), so reading them from NVMe is far faster than
+        // streaming from S3 (~35 MB/s per single-stream read, which left
+        // ingest compaction-bound). The old concern about cache reads
+        // contending with foreground reads on the shared `spawn_blocking`
+        // pool no longer applies with the io_uring backend, which pins
+        // cache I/O to its own worker thread. Outputs still go to
+        // upstream + the local disk cache via the prewarm tee, wired in
+        // by attaching `cached_object_store` and enabling
+        // `prewarm_compacted_on_write` below.
         //
         // The `db_cache` (in-memory filter/index meta cache) IS attached,
         // and shares the *same* `db_cache_wrapper` as the foreground
@@ -656,7 +657,7 @@ impl<P: Into<Path>> DbBuilder<P> {
         let compactor_table_store = Arc::new(
             TableStore::new_with_fp_registry(
                 ObjectStores::new(
-                    retrying_main_object_store.clone(),
+                    maybe_cached_main_object_store.clone(),
                     retrying_wal_object_store.clone(),
                 ),
                 sst_format,
