@@ -1,6 +1,8 @@
 use crate::bytes_range::BytesRange;
 use crate::config::CompressionCodec;
 use crate::error::SlateDBError;
+use crate::filter_policy::NamedFilter;
+use crate::flatbuffer_types::SsTableIndexOwned;
 use crate::manifest::{Manifest, ManifestCore};
 use crate::mem_table::{ImmutableMemtable, KVTable, WritableKVTable};
 use crate::reader::DbStateReader;
@@ -12,7 +14,7 @@ use std::collections::VecDeque;
 use std::fmt::{Debug, Formatter};
 use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::ops::{Bound, Range, RangeBounds};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use ulid::Ulid;
 use SsTableId::{Compacted, Wal};
 
@@ -81,7 +83,7 @@ impl std::ops::Deref for SsTableView {
 
 /// Payload of an [`SsTableView`]. Held behind an `Arc` and never mutated after
 /// construction; all access is through `SsTableView`'s `Deref`.
-#[derive(PartialEq, Serialize)]
+#[derive(Serialize)]
 pub struct SsTableViewInner {
     /// Unique identifier for this view.
     pub id: Ulid,
@@ -96,6 +98,29 @@ pub struct SsTableViewInner {
     /// The effective range of keys that are visible to the user, which is the intersection of the
     /// physical range (first_key..unbounded) and any projection range.
     effective_range: BytesRange,
+
+    /// Decoded bloom filters, pinned on first foreground read so subsequent
+    /// reads resolve them with a pointer load instead of a block-cache
+    /// transaction. Shared across all clones of this view (they share the
+    /// inner `Arc`), and dropped with the view when the manifest stops
+    /// referencing the SST.
+    #[serde(skip)]
+    pub(crate) pinned_filters: OnceLock<Arc<[NamedFilter]>>,
+
+    /// Decoded SST index, pinned like `pinned_filters`.
+    #[serde(skip)]
+    pub(crate) pinned_index: OnceLock<Arc<SsTableIndexOwned>>,
+}
+
+/// Pinned metadata is a cache, not identity: equality is defined by the
+/// view's id, handle, and ranges alone.
+impl PartialEq for SsTableViewInner {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.sst == other.sst
+            && self.visible_range == other.visible_range
+            && self.effective_range == other.effective_range
+    }
 }
 
 impl Debug for SsTableView {
@@ -138,6 +163,8 @@ impl SsTableView {
                 sst,
                 visible_range: None,
                 effective_range,
+                pinned_filters: OnceLock::new(),
+                pinned_index: OnceLock::new(),
             }),
         }
     }
@@ -175,6 +202,8 @@ impl SsTableView {
                 sst,
                 visible_range,
                 effective_range,
+                pinned_filters: OnceLock::new(),
+                pinned_index: OnceLock::new(),
             }),
         }
     }

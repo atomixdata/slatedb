@@ -560,10 +560,22 @@ impl<'a> InternalSstIterator<'a> {
 
     async fn ensure_metadata_loaded(&mut self) -> Result<(), SlateDBError> {
         if self.index.is_none() {
-            let index = self
-                .table_store
-                .read_index(&self.view.table_as_ref().sst, self.options.cache_blocks)
-                .await?;
+            // Pinned-fast-path mirroring the filter path in
+            // `FilterIterator::init`.
+            let table = self.view.table_as_ref();
+            let index = match table.pinned_index.get() {
+                Some(index) => index.clone(),
+                None => {
+                    let index = self
+                        .table_store
+                        .read_index(&table.sst, self.options.cache_blocks)
+                        .await?;
+                    if self.options.cache_blocks {
+                        let _ = table.pinned_index.set(index.clone());
+                    }
+                    index
+                }
+            };
             let block_idx_range = partitioned_keyspace::partitions_covering_range(
                 &SsTableIndexKeySpace::new(&index.borrow()),
                 self.view.start_key(),
@@ -811,14 +823,24 @@ impl<'a> FilterIterator<'a> {
 impl RowEntryIterator for FilterIterator<'_> {
     async fn init(&mut self) -> Result<(), SlateDBError> {
         if !self.initialized {
-            let filters = self
-                .inner
-                .table_store()
-                .read_filters(
-                    &self.inner.view().table_as_ref().sst,
-                    self.inner.options.cache_blocks,
-                )
-                .await?;
+            // Pinned-fast-path: hot views resolve their decoded filters
+            // with a pointer load; the block-cache transaction runs only
+            // on the first read per view.
+            let table = self.inner.view().table_as_ref();
+            let filters = match table.pinned_filters.get() {
+                Some(filters) => filters.clone(),
+                None => {
+                    let filters = self
+                        .inner
+                        .table_store()
+                        .read_filters(&table.sst, self.inner.options.cache_blocks)
+                        .await?;
+                    if self.inner.options.cache_blocks {
+                        let _ = table.pinned_filters.set(filters.clone());
+                    }
+                    filters
+                }
+            };
             self.filter.evaluate(&filters).await;
 
             if self.is_filtered_out() {
