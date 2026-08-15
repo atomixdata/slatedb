@@ -571,6 +571,13 @@ impl SortedRun {
         )
     }
 
+    /// Ensure the fence array is built on this instance. Call on a shared
+    /// (state-held) run before cloning it for iteration: `Clone` carries the
+    /// built array, so warming here prevents every clone from rebuilding it.
+    pub(crate) fn warm_fences(&self) {
+        self.fences();
+    }
+
     /// Effective start keys of the views, materialized once as a flat array
     /// for binary-search probes.
     fn fences(&self) -> &[Bytes] {

@@ -332,7 +332,13 @@ impl Reader {
             .compacted
             .iter()
             .filter(|sr| sr.overlaps_range(range))
-            .cloned()
+            .map(|sr| {
+                // Build the fence array on the state's shared instance so the
+                // owned clone below carries the warm Arc. Warming only the
+                // clone would rebuild the array on every read.
+                sr.warm_fences();
+                sr.clone()
+            })
             .collect();
         build_concurrent(overlapping.into_iter(), max_parallel, move |sr| {
             let table_store = table_store.clone();
