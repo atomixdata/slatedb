@@ -260,15 +260,17 @@ impl CachedObjectStore {
             }
         }
 
-        // Second pass: load the selected files in bounded parallelism and cache them.
+        // Second pass: load the selected files in bounded parallelism and
+        // cache them. This must not go through `maybe_prefetch_range`: the
+        // metadata pass above populated the in-memory and on-disk head
+        // caches, and `maybe_prefetch_range` short-circuits on a head hit
+        // before fetching any parts, which would make the preload a no-op
+        // on a cold cache.
         let degree_of_parallelism = 32;
         let _result = build_concurrent(files_to_load.into_iter(), degree_of_parallelism, |path| {
             let this = self.clone();
             async move {
-                match this
-                    .maybe_prefetch_range(&path, GetOptions::default())
-                    .await
-                {
+                match this.prefetch_missing_parts(&path).await {
                     Ok(_) => Ok(Some(())),
                     Err(e) => {
                         warn!(
@@ -282,6 +284,50 @@ impl CachedObjectStore {
         })
         .await;
 
+        Ok(())
+    }
+
+    /// Fetch every part of `location` that is not already in the disk
+    /// cache, coalescing contiguous gaps into single aligned ranged GETs.
+    /// Head lookups may be served from the head caches; part existence is
+    /// checked against the cache storage directly.
+    async fn prefetch_missing_parts(&self, location: &Path) -> object_store::Result<()> {
+        let meta = self.cached_head(location).await?;
+        let Some(cache_location) = self.cache_location_for(location) else {
+            return Ok(());
+        };
+        let entry = self
+            .cache_storage
+            .entry(&cache_location, self.part_size_bytes);
+        let part_size = self.part_size_bytes as u64;
+        let total_parts = usize::try_from(meta.size.div_ceil(part_size))
+            .expect("part count exceeds usize");
+        let cached: std::collections::HashSet<PartID> =
+            entry.cached_parts().await?.into_iter().collect();
+
+        let mut idx = 0;
+        while idx < total_parts {
+            if cached.contains(&idx) {
+                idx += 1;
+                continue;
+            }
+            let gap_start = idx;
+            while idx < total_parts && !cached.contains(&idx) {
+                idx += 1;
+            }
+            let byte_range =
+                (gap_start as u64 * part_size)..std::cmp::min(idx as u64 * part_size, meta.size);
+            let opts = GetOptions {
+                range: Some(GetRange::Bounded(byte_range)),
+                ..GetOptions::default()
+            };
+            let get_result = self.object_store.get_opts(location, opts).await?;
+            if self.resolve_root(location, &get_result.meta.location) {
+                // Disk-full and similar save errors are non-fatal for a
+                // prefetch; reads fall back to the object store.
+                self.save_get_result(get_result).await.ok();
+            }
+        }
         Ok(())
     }
 

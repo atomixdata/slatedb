@@ -685,7 +685,6 @@ impl LocalCacheEntry for FsCacheEntry {
         Ok(result)
     }
 
-    #[cfg(test)]
     async fn cached_parts(
         &self,
     ) -> object_store::Result<Vec<crate::cached_object_store::storage::PartID>> {

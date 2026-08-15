@@ -125,7 +125,6 @@ pub trait LocalCacheEntry: Send + Sync + std::fmt::Debug + 'static {
     /// might be useful on rewriting GET request on the prefetch phase. the cached files are
     /// expected to be in the same folder, so it'd be expected to be fast without expensive
     /// globbing.
-    #[cfg(test)]
     async fn cached_parts(&self) -> object_store::Result<Vec<PartID>>;
 
     async fn save_head(&self, meta: (&ObjectMeta, &Attributes)) -> object_store::Result<()>;

@@ -1441,7 +1441,6 @@ impl LocalCacheEntry for IoUringCacheEntry {
         }
     }
 
-    #[cfg(test)]
     async fn cached_parts(&self) -> object_store::Result<Vec<PartID>> {
         // Cold path; sync read_dir is fine.
         let dir = self.root_folder.join(self.location.to_string());
