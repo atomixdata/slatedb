@@ -80,12 +80,7 @@ impl CachedObjectStore {
     ///   authoritative source. Non-SST paths (manifests, WALs) must
     ///   NOT trigger this from the read side - they can be rewritten
     ///   without any invalidation signal into this cache.
-    pub(crate) fn populate_head_cache(
-        &self,
-        location: &Path,
-        meta: ObjectMeta,
-        attrs: Attributes,
-    ) {
+    pub(crate) fn populate_head_cache(&self, location: &Path, meta: ObjectMeta, attrs: Attributes) {
         self.head_cache
             .lock()
             .insert(location.clone(), (meta, attrs));
@@ -157,59 +152,60 @@ impl CachedObjectStore {
             Some(f) => f,
         };
         let stats = Arc::new(CachedObjectStoreStats::new(recorder));
-        let cache_storage: Arc<dyn crate::cached_object_store::LocalCacheStorage> =
-            if options.use_io_uring {
-                #[cfg(target_os = "linux")]
-                {
-                    match crate::cached_object_store::storage_uring::IoUringCacheStorage::try_new(
-                        cache_root_folder.clone(),
-                        options.direct_io,
-                    ) {
-                        Ok(s) => Arc::new(s),
-                        Err(e) => {
-                            warn!(
+        let cache_storage: Arc<dyn crate::cached_object_store::LocalCacheStorage> = if options
+            .use_io_uring
+        {
+            #[cfg(target_os = "linux")]
+            {
+                match crate::cached_object_store::storage_uring::IoUringCacheStorage::try_new(
+                    cache_root_folder.clone(),
+                    options.direct_io,
+                ) {
+                    Ok(s) => Arc::new(s),
+                    Err(e) => {
+                        warn!(
                                 "io_uring cache storage init failed; falling back to FsCacheStorage [error={:?}]",
                                 e
                             );
-                            Arc::new(FsCacheStorage::new(
-                                cache_root_folder.clone(),
-                                options.max_cache_size_bytes,
-                                options.scan_interval,
-                                stats.clone(),
-                                clock.clone(),
-                                rand.clone(),
-                                options.max_open_file_handles,
-                                options.direct_io,
-                            ))
-                        }
+                        Arc::new(FsCacheStorage::new(
+                            cache_root_folder.clone(),
+                            options.max_cache_size_bytes,
+                            options.scan_interval,
+                            stats.clone(),
+                            clock.clone(),
+                            rand.clone(),
+                            options.max_open_file_handles,
+                            options.direct_io,
+                        ))
                     }
                 }
-                #[cfg(not(target_os = "linux"))]
-                {
-                    warn!("use_io_uring set but not on Linux; falling back to FsCacheStorage");
-                    Arc::new(FsCacheStorage::new(
-                        cache_root_folder.clone(),
-                        options.max_cache_size_bytes,
-                        options.scan_interval,
-                        stats.clone(),
-                        clock.clone(),
-                        rand.clone(),
-                        options.max_open_file_handles,
-                        options.direct_io,
-                    ))
-                }
-            } else {
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                warn!("use_io_uring set but not on Linux; falling back to FsCacheStorage");
                 Arc::new(FsCacheStorage::new(
                     cache_root_folder.clone(),
                     options.max_cache_size_bytes,
                     options.scan_interval,
                     stats.clone(),
-                    clock,
-                    rand,
+                    clock.clone(),
+                    rand.clone(),
                     options.max_open_file_handles,
                     options.direct_io,
                 ))
-            };
+            }
+        } else {
+            Arc::new(FsCacheStorage::new(
+                cache_root_folder.clone(),
+                options.max_cache_size_bytes,
+                options.scan_interval,
+                stats.clone(),
+                clock,
+                rand,
+                options.max_open_file_handles,
+                options.direct_io,
+            ))
+        };
         let cached = Self::new(
             object_store,
             cache_storage,
@@ -491,10 +487,7 @@ impl CachedObjectStore {
         // upstream PUT - we need it to build the ObjectMeta we save
         // alongside the parts so subsequent reads don't have to do an
         // S3 HEAD round-trip.
-        let payload_size: u64 = payload
-            .iter()
-            .map(|b| b.len() as u64)
-            .sum();
+        let payload_size: u64 = payload.iter().map(|b| b.len() as u64).sum();
 
         // First, write to the upstream object store (cloning payload is cheap since it's just a Arc internally)
         let result = self
@@ -540,10 +533,7 @@ impl CachedObjectStore {
             // in-memory head was already populated above; here we
             // mirror it on disk so a reader served after eviction
             // of the in-memory entry still hits the local cache.
-            entry
-                .save_head((&head_meta, &head_attrs))
-                .await
-                .ok();
+            entry.save_head((&head_meta, &head_attrs)).await.ok();
 
             // Convert PutPayload to stream and save parts to cache.
             let stream = stream::iter(payload.into_iter()).map(Ok::<Bytes, object_store::Error>);
@@ -603,11 +593,7 @@ impl CachedObjectStore {
                         // disk hit. See the matching block in
                         // `cached_head` for the safety argument: only
                         // valid for immutable compacted-SST paths.
-                        self.populate_head_cache(
-                            location,
-                            meta.clone(),
-                            attrs.clone(),
-                        );
+                        self.populate_head_cache(location, meta.clone(), attrs.clone());
                     }
                     return Ok((meta, attrs));
                 }
@@ -1903,7 +1889,10 @@ mod tests {
         // should not have any parts for it.
         let wal_path = Path::from("db/wal/00000000000000000001.sst");
         cached
-            .put(&wal_path, PutPayload::from_bytes(Bytes::from_static(b"wal-frame")))
+            .put(
+                &wal_path,
+                PutPayload::from_bytes(Bytes::from_static(b"wal-frame")),
+            )
             .await
             .unwrap();
         let wal_entry = cached.cache_storage.entry(&wal_path, 1024);

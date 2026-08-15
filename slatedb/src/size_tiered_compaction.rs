@@ -901,6 +901,7 @@ mod tests {
     fn create_sr(id: u32, sst_size: u64, num_ssts: usize) -> SortedRun {
         let ssts: Vec<SsTableView> = (0..num_ssts).map(|_| create_sst_view(sst_size)).collect();
         SortedRun {
+            fences: Default::default(),
             id,
             sst_views: ssts.into(),
         }

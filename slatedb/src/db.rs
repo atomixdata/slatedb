@@ -1852,6 +1852,7 @@ impl Db {
             .collect();
         let ssts_written = sst_views.len();
         let sorted_run = SortedRun {
+            fences: Default::default(),
             id: 0,
             sst_views: sst_views.into(),
         };
@@ -1876,8 +1877,7 @@ impl Db {
                 }
                 let mut dirty = sm.prepare_dirty()?;
                 dirty.value.core.tree.compacted = vec![sorted_run_for_apply.clone()];
-                dirty.value.core.last_l0_seq =
-                    dirty.value.core.last_l0_seq.max(max_seq);
+                dirty.value.core.last_l0_seq = dirty.value.core.last_l0_seq.max(max_seq);
                 Ok(Some(dirty))
             })
             .await
@@ -4248,13 +4248,7 @@ mod tests {
         .await;
 
         let tracker = persisted_state.sequence_tracker.clone();
-        let live_tracker = kv_store
-            .inner
-            .state
-            .state()
-            .core()
-            .sequence_tracker
-            .clone();
+        let live_tracker = kv_store.inner.state.state().core().sequence_tracker.clone();
         assert_eq!(tracker, live_tracker);
 
         let seq1_ts = tracker.find_ts(1, FindOption::RoundDown).unwrap();
@@ -4278,13 +4272,7 @@ mod tests {
             .await
             .unwrap();
 
-        let reopened_tracker = reopened
-            .inner
-            .state
-            .state()
-            .core()
-            .sequence_tracker
-            .clone();
+        let reopened_tracker = reopened.inner.state.state().core().sequence_tracker.clone();
         assert_eq!(tracker, reopened_tracker);
 
         reopened.close().await.unwrap();
@@ -8545,10 +8533,7 @@ mod tests {
             .await
             .unwrap();
 
-        let entries = vec![
-            bulk_entry(b"b", b"v", 1),
-            bulk_entry(b"a", b"v", 2),
-        ];
+        let entries = vec![bulk_entry(b"b", b"v", 1), bulk_entry(b"a", b"v", 2)];
         let err = db
             .bulk_load_sorted_run(entries, 64 * 1024)
             .await

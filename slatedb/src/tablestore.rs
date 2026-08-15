@@ -856,9 +856,8 @@ impl EncodedSsTableWriter<'_> {
         // succeeded (shutdown finalizes the upload). This is the invariant
         // that keeps the cache from holding bytes the upstream never accepted.
         if let Some(tee) = self.cache_tee.take() {
-            let total_size = encoded_sst.info.filter_offset
-                + encoded_sst.info.filter_len
-                + footer.len() as u64;
+            let total_size =
+                encoded_sst.info.filter_offset + encoded_sst.info.filter_len + footer.len() as u64;
             // total_size above is a best-effort hint; the tee tracks the
             // truth itself via accumulated extend() bytes. We use the upstream
             // Path for `location` so the head matches what cached reads would
@@ -2027,7 +2026,10 @@ mod tests {
         // begin_tee calls succeed.
         let sentinel = Path::from("warmup");
         upstream
-            .put(&sentinel, object_store::PutPayload::from_bytes(Bytes::from_static(b"x")))
+            .put(
+                &sentinel,
+                object_store::PutPayload::from_bytes(Bytes::from_static(b"x")),
+            )
             .await
             .unwrap();
         let _ = cached.cached_head(&sentinel).await.unwrap();
@@ -2063,7 +2065,9 @@ mod tests {
 
         // The committed cache directory must contain at least one part file
         // and a head, under "<cache_dir>/<sst path>".
-        let sst_cache_dir = cache_dir.join("root/compacted").join(format!("{}.sst", id.unwrap_compacted_id()));
+        let sst_cache_dir = cache_dir
+            .join("root/compacted")
+            .join(format!("{}.sst", id.unwrap_compacted_id()));
         let mut found_part = false;
         let mut found_head = false;
         for entry in walkdir::WalkDir::new(&sst_cache_dir).into_iter().flatten() {

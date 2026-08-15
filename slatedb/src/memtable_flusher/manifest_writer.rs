@@ -473,28 +473,18 @@ impl ManifestWriterHandler {
         let manifest = self.db.state.modify(|cow| {
             for uploaded in staged_batch {
                 let uploaded_tracker = uploaded.imm_memtable.sequence_tracker();
-                let popped = cow
-                    .imm_memtable
-                    .pop_back()
-                    .expect("expected imm memtable");
+                let popped = cow.imm_memtable.pop_back().expect("expected imm memtable");
                 assert!(Arc::ptr_eq(&popped, &uploaded.imm_memtable));
-                cow.manifest
-                    .value
-                    .core
-                    .tree
-                    .l0
-                    .push_front(SsTableView::new(
-                        self.db.rand.rng().gen_ulid(self.db.system_clock.as_ref()),
-                        uploaded.sst_handle.clone(),
-                    ));
+                cow.manifest.value.core.tree.l0.push_front(SsTableView::new(
+                    self.db.rand.rng().gen_ulid(self.db.system_clock.as_ref()),
+                    uploaded.sst_handle.clone(),
+                ));
                 cow.manifest.value.core.replay_after_wal_id =
                     uploaded.imm_memtable.recent_flushed_wal_id();
 
                 let memtable_tick = uploaded.imm_memtable.table().last_tick();
-                cow.manifest.value.core.last_l0_clock_tick = cmp::max(
-                    cow.manifest.value.core.last_l0_clock_tick,
-                    memtable_tick,
-                );
+                cow.manifest.value.core.last_l0_clock_tick =
+                    cmp::max(cow.manifest.value.core.last_l0_clock_tick, memtable_tick);
                 if cow.manifest.value.core.last_l0_clock_tick != memtable_tick {
                     return Err(SlateDBError::InvalidClockTick {
                         last_tick: cow.manifest.value.core.last_l0_clock_tick,
@@ -516,9 +506,8 @@ impl ManifestWriterHandler {
                 // taken on a previous tick; under steady-state load
                 // those snapshots are short-lived, so this is
                 // effectively an in-place mutation most of the time.
-                let tracker = std::sync::Arc::make_mut(
-                    &mut cow.manifest.value.core.sequence_tracker,
-                );
+                let tracker =
+                    std::sync::Arc::make_mut(&mut cow.manifest.value.core.sequence_tracker);
                 tracker.extend_from(uploaded_tracker);
             }
             Ok(cow.manifest.clone())

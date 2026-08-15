@@ -2902,20 +2902,24 @@ mod tests {
         dirty.value.core.tree.l0 = VecDeque::from(vec![l0_view_newest, l0_view_oldest]);
         dirty.value.core.tree.compacted = vec![
             SortedRun {
+                fences: Default::default(),
                 id: 2,
                 sst_views: vec![SsTableView::identity(SsTableHandle::new(
                     SsTableId::Compacted(Ulid::new()),
                     SST_FORMAT_VERSION_LATEST,
                     sr_info.clone(),
-                ))].into(),
+                ))]
+                .into(),
             },
             SortedRun {
+                fences: Default::default(),
                 id: 1,
                 sst_views: vec![SsTableView::identity(SsTableHandle::new(
                     SsTableId::Compacted(Ulid::new()),
                     SST_FORMAT_VERSION_LATEST,
                     sr_info.clone(),
-                ))].into(),
+                ))]
+                .into(),
             },
         ];
         stored_manifest.update(dirty).await.unwrap();
@@ -3003,20 +3007,24 @@ mod tests {
         core.tree.l0 = VecDeque::from(vec![l0_view_first, l0_view_second]);
         core.tree.compacted = vec![
             SortedRun {
+                fences: Default::default(),
                 id: 5,
                 sst_views: vec![SsTableView::identity(SsTableHandle::new(
                     SsTableId::Compacted(Ulid::from_parts(10, 0)),
                     SST_FORMAT_VERSION_LATEST,
                     sr_info.clone(),
-                ))].into(),
+                ))]
+                .into(),
             },
             SortedRun {
+                fences: Default::default(),
                 id: 2,
                 sst_views: vec![SsTableView::identity(SsTableHandle::new(
                     SsTableId::Compacted(Ulid::from_parts(11, 0)),
                     SST_FORMAT_VERSION_LATEST,
                     sr_info,
-                ))].into(),
+                ))]
+                .into(),
             },
         ];
         let state = CompactorStateView {
@@ -3693,6 +3701,7 @@ mod tests {
         // Finish the compaction and ensure status is persisted as Completed.
         let db_state = handler.state().db_state().clone();
         let output_sr = SortedRun {
+            fences: Default::default(),
             id: jobs[0].destination,
             sst_views: db_state.tree.l0.iter().cloned().collect(),
         };
@@ -3812,6 +3821,7 @@ mod tests {
         // Build a minimal successful result
         let db_state = fixture.latest_db_state().await;
         let output_sr = SortedRun {
+            fences: Default::default(),
             id: compaction.destination(),
             sst_views: db_state.tree.l0.iter().cloned().collect(),
         };

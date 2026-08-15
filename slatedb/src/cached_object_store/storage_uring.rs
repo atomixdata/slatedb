@@ -435,11 +435,7 @@ impl Drop for WorkerHandle {
 
 /// Worker thread main loop. Owns the io_uring, the file-handle cache, and
 /// the in-flight map.
-fn run_worker(
-    rx: CbReceiver<WorkerOp>,
-    direct_io: bool,
-    worker_idx: usize,
-) -> std::io::Result<()> {
+fn run_worker(rx: CbReceiver<WorkerOp>, direct_io: bool, worker_idx: usize) -> std::io::Result<()> {
     let mut ring = IoUring::new(URING_SQ_ENTRIES)?;
     let mut fd_cache: HashMap<std::path::PathBuf, Arc<File>> = HashMap::new();
     let mut pending: HashMap<u64, InFlight> = HashMap::new();
@@ -554,9 +550,11 @@ fn run_worker(
                     next_user_data = next_user_data.wrapping_add(1);
                     if direct_io {
                         // Round to 4KB on both ends; we'll slice on completion.
-                        let aligned_offset = (offset / O_DIRECT_ALIGN as u64) * O_DIRECT_ALIGN as u64;
+                        let aligned_offset =
+                            (offset / O_DIRECT_ALIGN as u64) * O_DIRECT_ALIGN as u64;
                         let head_pad = (offset - aligned_offset) as usize;
-                        let aligned_len = (head_pad + len).div_ceil(O_DIRECT_ALIGN) * O_DIRECT_ALIGN;
+                        let aligned_len =
+                            (head_pad + len).div_ceil(O_DIRECT_ALIGN) * O_DIRECT_ALIGN;
                         let mut aligned = match AlignedBuf::new(aligned_len) {
                             Ok(b) => b,
                             Err(e) => {
@@ -565,17 +563,17 @@ fn run_worker(
                             }
                         };
                         let ptr = aligned.as_mut_slice().as_mut_ptr();
-                        let entry = opcode::Read::new(types::Fd(fd.as_raw_fd()), ptr, aligned_len as u32)
-                            .offset(aligned_offset)
-                            .build()
-                            .user_data(user_data);
+                        let entry =
+                            opcode::Read::new(types::Fd(fd.as_raw_fd()), ptr, aligned_len as u32)
+                                .offset(aligned_offset)
+                                .build()
+                                .user_data(user_data);
                         // SAFETY: pending map keeps the buffer alive until we
                         // drain the matching CQE.
                         unsafe {
                             if ring.submission().push(&entry).is_err() {
-                                let _ = sender.send(Err(wrap_io_err(std::io::Error::other(
-                                    "uring SQ full",
-                                ))));
+                                let _ = sender
+                                    .send(Err(wrap_io_err(std::io::Error::other("uring SQ full"))));
                                 continue;
                             }
                         }
@@ -600,9 +598,8 @@ fn run_worker(
                         // SAFETY: see comment above.
                         unsafe {
                             if ring.submission().push(&entry).is_err() {
-                                let _ = sender.send(Err(wrap_io_err(std::io::Error::other(
-                                    "uring SQ full",
-                                ))));
+                                let _ = sender
+                                    .send(Err(wrap_io_err(std::io::Error::other("uring SQ full"))));
                                 continue;
                             }
                         }
@@ -697,14 +694,8 @@ fn run_worker(
                         // just allocate as they go.
                         // SAFETY: raw_fd is valid; len is the total
                         // payload size.
-                        let preallocated = unsafe {
-                            libc::fallocate(
-                                raw_fd,
-                                0,
-                                0,
-                                bytes.len() as libc::off_t,
-                            )
-                        };
+                        let preallocated =
+                            unsafe { libc::fallocate(raw_fd, 0, 0, bytes.len() as libc::off_t) };
                         if preallocated != 0 {
                             // Not fatal; log once and move on.
                             log::debug!(
@@ -796,9 +787,8 @@ fn run_worker(
                     // the entirety of the I/O.
                     unsafe {
                         if ring.submission().push(&entry).is_err() {
-                            let _ = sender.send(Err(wrap_io_err(std::io::Error::other(
-                                "uring SQ full",
-                            ))));
+                            let _ = sender
+                                .send(Err(wrap_io_err(std::io::Error::other("uring SQ full"))));
                             continue;
                         }
                     }
@@ -894,14 +884,10 @@ fn run_worker(
                 (ptr, chunk_len)
             };
 
-            let entry = opcode::Write::new(
-                types::Fd(pw.raw_fd),
-                chunk_ptr,
-                submit_len as u32,
-            )
-            .offset(chunk_start as u64)
-            .build()
-            .user_data(chunk_user_data);
+            let entry = opcode::Write::new(types::Fd(pw.raw_fd), chunk_ptr, submit_len as u32)
+                .offset(chunk_start as u64)
+                .build()
+                .user_data(chunk_user_data);
             // SAFETY: see comment above re. buffer lifetime.
             unsafe {
                 if ring.submission().push(&entry).is_err() {
@@ -989,9 +975,8 @@ fn run_worker(
                     let lat_us = submitted_at.elapsed().as_micros().min(u64::MAX as u128) as u64;
                     pacing_controller.record_read(lat_us);
                     if result < 0 {
-                        let _ = sender.send(Err(wrap_io_err(std::io::Error::from_raw_os_error(
-                            -result,
-                        ))));
+                        let _ = sender
+                            .send(Err(wrap_io_err(std::io::Error::from_raw_os_error(-result))));
                     } else {
                         let n = result as usize;
                         // For O_DIRECT path, slice from aligned buf.
@@ -1258,7 +1243,9 @@ impl IoUringCacheStorage {
         }
         let mut write_workers = Vec::with_capacity(n_write);
         for i in 0..n_write {
-            write_workers.push(Arc::new(WorkerHandle::spawn(direct_io, "w", i, write_cpus)?));
+            write_workers.push(Arc::new(WorkerHandle::spawn(
+                direct_io, "w", i, write_cpus,
+            )?));
         }
         info!(
             "using io_uring cache storage [root={}, direct_io={}, \
@@ -1350,7 +1337,6 @@ impl LocalCacheStorage for IoUringCacheStorage {
             pending_renames: Vec::new(),
         }))
     }
-
 }
 
 #[derive(Debug)]
@@ -1487,7 +1473,9 @@ impl LocalCacheEntry for IoUringCacheEntry {
             return Ok(());
         }
         let head_struct: LocalCacheHead = head.into();
-        let buf: Bytes = serde_json::to_vec(&head_struct).map_err(wrap_io_err)?.into();
+        let buf: Bytes = serde_json::to_vec(&head_struct)
+            .map_err(wrap_io_err)?
+            .into();
         let tmp_path = head_path.with_extension(format!("_tmp{}", self.make_rand_suffix()));
         let (sender, recv) = oneshot::channel();
         self.write_worker
@@ -1650,7 +1638,9 @@ impl LocalCacheTee for IoUringCacheTee {
 
         // Build head bytes + write head temp file.
         let head_struct: LocalCacheHead = (meta, attrs).into();
-        let head_bytes: Bytes = serde_json::to_vec(&head_struct).map_err(wrap_io_err)?.into();
+        let head_bytes: Bytes = serde_json::to_vec(&head_struct)
+            .map_err(wrap_io_err)?
+            .into();
         let head_final = make_head_path(self.root_folder.clone(), &self.location);
         let head_tmp = head_final.with_extension(format!("_tee{}-head", self.tee_id));
         let (sender, recv) = oneshot::channel();
@@ -1724,7 +1714,8 @@ impl LocalCacheTee for IoUringCacheTee {
         // expected to amortize over the size of the SST.
         tokio::task::spawn_blocking(move || {
             let mut open = OpenOptions::new();
-            open.read(true).custom_flags(libc::O_DIRECT | libc::O_NOATIME);
+            open.read(true)
+                .custom_flags(libc::O_DIRECT | libc::O_NOATIME);
             for path in part_paths.into_iter().chain(std::iter::once(head_path)) {
                 match open.open(&path) {
                     Ok(f) => {

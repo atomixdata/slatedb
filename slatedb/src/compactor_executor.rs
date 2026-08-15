@@ -452,6 +452,7 @@ impl TokioCompactionExecutorInner {
         }
 
         Ok(SortedRun {
+            fences: Default::default(),
             id: args.destination,
             sst_views: output_ssts
                 .into_iter()
@@ -1057,6 +1058,7 @@ mod tests {
                     all_entries.extend(entries.iter().cloned());
                 }
                 sorted_runs.push(SortedRun {
+                    fences: Default::default(),
                     id: sr_id as u32,
                     sst_views: sr_ssts.into_iter().map(SsTableView::identity).collect(),
                 });

@@ -578,15 +578,10 @@ mod tests {
         harness.inner.state.modify(|cow| {
             cow.manifest.value.core.tree.l0.clear();
             for (first, last) in ranges {
-                cow.manifest
-                    .value
-                    .core
-                    .tree
-                    .l0
-                    .push_back(SsTableView::new(
-                        ulid::Ulid::new(),
-                        seeded_l0_handle_with_bounds(first, Some(last)),
-                    ));
+                cow.manifest.value.core.tree.l0.push_back(SsTableView::new(
+                    ulid::Ulid::new(),
+                    seeded_l0_handle_with_bounds(first, Some(last)),
+                ));
             }
         });
     }
@@ -612,15 +607,10 @@ mod tests {
         harness.inner.state.modify(|cow| {
             cow.manifest.value.core.tree.l0.clear();
             for idx in 0..l0_len {
-                cow.manifest
-                    .value
-                    .core
-                    .tree
-                    .l0
-                    .push_back(SsTableView::new(
-                        ulid::Ulid::new(),
-                        seeded_l0_handle(format!("local-seed-{idx}").as_bytes()),
-                    ));
+                cow.manifest.value.core.tree.l0.push_back(SsTableView::new(
+                    ulid::Ulid::new(),
+                    seeded_l0_handle(format!("local-seed-{idx}").as_bytes()),
+                ));
             }
         });
     }

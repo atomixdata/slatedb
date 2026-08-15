@@ -276,10 +276,7 @@ impl SsTableView {
         // (effective start, end_bound) with the query range, but comparing
         // every bound by reference instead of building owned ranges.
         let eff = &self.effective_range;
-        let slot_clipped_end = min(
-            EndBound::from(end_bound),
-            EndBound::from(eff.end_bound()),
-        );
+        let slot_clipped_end = min(EndBound::from(end_bound), EndBound::from(eff.end_bound()));
         if !bounds_non_empty(eff.start_bound(), slot_clipped_end.inner) {
             return false;
         }
@@ -522,7 +519,7 @@ impl Clone for Box<dyn SsTableInfoCodec> {
 }
 
 /// A sorted run consisting of multiple compacted SSTables.
-#[derive(Clone, PartialEq, Serialize, Debug)]
+#[derive(Clone, Serialize, Debug)]
 pub struct SortedRun {
     /// The unique identifier for this sorted run.
     pub id: u32,
@@ -532,6 +529,20 @@ pub struct SortedRun {
     /// scan path) is a single refcount bump rather than a deep clone of every
     /// view's `Bytes` handles.
     pub sst_views: Arc<[SsTableView]>,
+    /// Effective start keys of `sst_views`, in order, built lazily on first
+    /// search. Binary searches probe this flat array instead of chasing each
+    /// view's inner `Arc` and range structs, touching one contiguous
+    /// allocation per probe. Shared by `Clone` (the `OnceLock` clones its
+    /// value), so iterator-owned copies keep the warm array.
+    #[serde(skip)]
+    pub(crate) fences: OnceLock<Arc<[Bytes]>>,
+}
+
+/// The fence array is a cache, not identity.
+impl PartialEq for SortedRun {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id && self.sst_views == other.sst_views
+    }
 }
 
 impl SortedRun {
@@ -560,11 +571,20 @@ impl SortedRun {
         )
     }
 
+    /// Effective start keys of the views, materialized once as a flat array
+    /// for binary-search probes.
+    fn fences(&self) -> &[Bytes] {
+        self.fences.get_or_init(|| {
+            self.sst_views
+                .iter()
+                .map(|view| view.compacted_effective_start_key().clone())
+                .collect()
+        })
+    }
+
     pub(crate) fn find_last_sst_with_range_covering_key(&self, key: &[u8]) -> Option<usize> {
         // returns the sst after the one whose range includes the key
-        let first_sst = self
-            .sst_views
-            .partition_point(|sst| sst.compacted_effective_start_key() <= key);
+        let first_sst = self.fences().partition_point(|fence| fence.as_ref() <= key);
         if first_sst > 0 {
             return Some(first_sst - 1);
         }
@@ -627,16 +647,17 @@ impl SortedRun {
         // Upper bound: last SST whose start key falls within the range's upper
         // bound. SST[i]'s slot begins at start_key[i]; if start_key[i] is past
         // the range's upper bound the slot cannot overlap.
+        let fences = self.fences();
         let max_idx = match range.end_bound() {
             Included(hi) => {
-                let p = views.partition_point(|sst| sst.compacted_effective_start_key() <= hi);
+                let p = fences.partition_point(|fence| fence <= hi);
                 if p == 0 {
                     return 0..0;
                 }
                 p - 1
             }
             Excluded(hi) => {
-                let p = views.partition_point(|sst| sst.compacted_effective_start_key() < hi);
+                let p = fences.partition_point(|fence| fence < hi);
                 if p == 0 {
                     return 0..0;
                 }
@@ -653,9 +674,9 @@ impl SortedRun {
         // before it cannot intersect except via boundary-key overlap, handled
         // by the backward walk below.
         let start_candidate = match range.start_bound() {
-            Included(lo) | Excluded(lo) => views
-                .partition_point(|sst| sst.compacted_effective_start_key() <= lo)
-                .checked_sub(1),
+            Included(lo) | Excluded(lo) => {
+                fences.partition_point(|fence| fence <= lo).checked_sub(1)
+            }
             Unbounded => None,
         };
 
@@ -687,10 +708,7 @@ impl SortedRun {
         &self.sst_views[matching_range]
     }
 
-    pub(crate) fn into_tables_covering_range(
-        self,
-        range: &BytesRange,
-    ) -> VecDeque<SsTableView> {
+    pub(crate) fn into_tables_covering_range(self, range: &BytesRange) -> VecDeque<SsTableView> {
         let matching_range = self.table_idx_covering_range(range);
         // `sst_views` is shared behind an `Arc`, so we clone only the few
         // covering views rather than draining the whole run. The full slice
@@ -1196,13 +1214,15 @@ mod tests {
     #[test]
     fn test_sorted_run_collect_tables_for_point_key() {
         let sorted_run = SortedRun {
+            fences: Default::default(),
             id: 0,
             sst_views: vec![
                 create_compacted_sst_view_with_bounds(b"a", Some(b"k")),
                 create_compacted_sst_view_with_bounds(b"k", Some(b"k")),
                 create_compacted_sst_view_with_bounds(b"k", Some(b"m")),
                 create_compacted_sst_view_with_bounds(b"z", Some(b"z")),
-            ].into(),
+            ]
+            .into(),
         };
 
         let covering_tables = sorted_run.tables_covering_point_key(b"k");
@@ -1229,6 +1249,7 @@ mod tests {
             ssts.push(create_compacted_sst_view(Some(first_key.clone())));
         }
         SortedRun {
+            fences: Default::default(),
             id,
             sst_views: ssts.into(),
         }

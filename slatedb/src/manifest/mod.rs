@@ -618,10 +618,10 @@ impl Manifest {
         let mut projected = source_manifest.clone();
         let mut sorter_runs_filtered = vec![];
         for sorter_run in &projected.core.tree.compacted {
-            let sst_views =
-                Self::filter_view_handles(sorter_run.sst_views.iter(), false, &range);
+            let sst_views = Self::filter_view_handles(sorter_run.sst_views.iter(), false, &range);
             if !sst_views.is_empty() {
                 sorter_runs_filtered.push(SortedRun {
+                    fences: Default::default(),
                     id: sorter_run.id,
                     sst_views: sst_views.into(),
                 });
@@ -1297,7 +1297,7 @@ mod tests {
                 l0: writer_l0.clone(),
                 compacted: vec![],
             };
-            let compactor_compacted = vec![SortedRun { id: 42, sst_views: vec![].into() }];
+            let compactor_compacted = vec![SortedRun { fences: Default::default(), id: 42, sst_views: vec![].into() }];
             let compactor = LsmTreeState {
                 last_compacted_l0_sst_view_id: last_view,
                 last_compacted_l0_sst_id: last_sst,
@@ -1546,6 +1546,7 @@ mod tests {
                     seg.tree.compacted.insert(
                         0,
                         SortedRun {
+                            fences: Default::default(),
                             id: self.next_sr_id,
                             sst_views: sr_views.into(),
                         },
@@ -2039,6 +2040,7 @@ mod tests {
         }
         for (idx, sorted_run) in manifest.sorted_runs.iter().enumerate() {
             core.tree.compacted.push(SortedRun {
+                fences: Default::default(),
                 id: idx as u32,
                 sst_views: sorted_run
                     .iter()
@@ -2215,6 +2217,7 @@ mod tests {
         let mut core = ManifestCore::new();
         core.tree.l0.push_back(create_sst_view(live_l0, b"a"));
         core.tree.compacted.push(SortedRun {
+            fences: Default::default(),
             id: 0,
             sst_views: vec![create_sst_view(live_compacted, b"b")].into(),
         });
@@ -2271,6 +2274,7 @@ mod tests {
     ) -> Manifest {
         let mut core = ManifestCore::new();
         core.tree.compacted.push(SortedRun {
+            fences: Default::default(),
             id: 0,
             sst_views: vec![SsTableView::new_projected(
                 sst_id.unwrap_compacted_id(),
@@ -2283,7 +2287,8 @@ mod tests {
                     },
                 ),
                 Some(visible_range),
-            )].into(),
+            )]
+            .into(),
         });
         Manifest::initial(core)
     }

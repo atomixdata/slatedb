@@ -341,6 +341,7 @@ pub(crate) async fn build_sorted_runs(
             sr_ssts.extend(ssts.into_iter().map(SsTableView::identity));
         }
         sorted_runs.push(SortedRun {
+            fences: Default::default(),
             id: sr_id as u32,
             sst_views: sr_ssts.into(),
         });

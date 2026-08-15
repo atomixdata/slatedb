@@ -199,16 +199,15 @@ impl Reader {
         } else {
             match mode {
                 IteratorBuildMode::Eager => {
-                    let l0_future = self
-                        .build_range_l0_iters(range, db_state, sst_iter_options, max_parallel);
-                    let sr_future = self
-                        .build_range_sr_iters(range, db_state, sst_iter_options, max_parallel);
+                    let l0_future =
+                        self.build_range_l0_iters(range, db_state, sst_iter_options, max_parallel);
+                    let sr_future =
+                        self.build_range_sr_iters(range, db_state, sst_iter_options, max_parallel);
                     let (l0_res, sr_res) = join(l0_future, sr_future).await;
                     (l0_res?, sr_res?)
                 }
                 IteratorBuildMode::Lazy => {
-                    let l0 =
-                        self.build_lazy_range_l0_iters(range, db_state, sst_iter_options)?;
+                    let l0 = self.build_lazy_range_l0_iters(range, db_state, sst_iter_options)?;
                     let sr = self
                         .build_lazy_range_sr_iters(range, db_state, sst_iter_options)
                         .await?;
@@ -298,27 +297,23 @@ impl Reader {
             .filter(|sst| sst.overlaps_range(range))
             .cloned()
             .collect();
-        build_concurrent(
-            overlapping.into_iter(),
-            max_parallel,
-            move |sst| {
-                let table_store = table_store.clone();
-                let range = range_clone.clone();
-                let sst_iter_options = sst_iter_options.clone();
-                async move {
-                    SstIterator::new_owned_initialized(
-                        range.clone(),
-                        sst,
-                        table_store,
-                        sst_iter_options,
-                    )
-                    .await
-                    .map(|maybe_iter| {
-                        maybe_iter.map(|iter| Box::new(iter) as Box<dyn RowEntryIterator + 'a>)
-                    })
-                }
-            },
-        )
+        build_concurrent(overlapping.into_iter(), max_parallel, move |sst| {
+            let table_store = table_store.clone();
+            let range = range_clone.clone();
+            let sst_iter_options = sst_iter_options.clone();
+            async move {
+                SstIterator::new_owned_initialized(
+                    range.clone(),
+                    sst,
+                    table_store,
+                    sst_iter_options,
+                )
+                .await
+                .map(|maybe_iter| {
+                    maybe_iter.map(|iter| Box::new(iter) as Box<dyn RowEntryIterator + 'a>)
+                })
+            }
+        })
         .await
     }
 
@@ -807,6 +802,7 @@ mod tests {
                 sr.sst_views = views.into();
             } else {
                 let new_sr = SortedRun {
+                    fences: Default::default(),
                     id: sr_id,
                     sst_views: vec![SsTableView::identity(sst_handle)].into(),
                 };

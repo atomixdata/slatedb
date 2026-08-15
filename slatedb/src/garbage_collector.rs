@@ -1048,12 +1048,14 @@ mod tests {
             .push_back(SsTableView::identity(active_expired_l0_sst_handle.clone()));
         // Dont' push inactive_expired_l0_sst_handle
         state.tree.compacted.push(SortedRun {
+            fences: Default::default(),
             id: 1,
             // Don't add inactive_expired_sst_handle
             sst_views: vec![
                 SsTableView::identity(active_sst_handle.clone()),
                 SsTableView::identity(active_expired_sst_handle.clone()),
-            ].into(),
+            ]
+            .into(),
         });
         StoredManifest::create_new_db(
             manifest_store.clone(),
@@ -1167,10 +1169,12 @@ mod tests {
             active_checkpoint_l0_sst_handle.clone(),
         ));
         state.tree.compacted.push(SortedRun {
+            fences: Default::default(),
             id: 1,
             sst_views: vec![SsTableView::identity(active_sst_handle.clone())].into(),
         });
         state.tree.compacted.push(SortedRun {
+            fences: Default::default(),
             id: 2,
             sst_views: vec![SsTableView::identity(active_checkpoint_sst_handle.clone())].into(),
         });
@@ -1787,6 +1791,7 @@ mod tests {
             .l0
             .push_back(SsTableView::identity(active_l0_handle));
         state.tree.compacted.push(SortedRun {
+            fences: Default::default(),
             id: 1,
             sst_views: vec![SsTableView::identity(active_handle)].into(),
         });

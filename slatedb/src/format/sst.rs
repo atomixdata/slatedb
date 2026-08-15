@@ -309,10 +309,8 @@ impl EncodedSsTableBlockBuilder {
             let aligned_end = slot_end.div_ceil(align) * align;
             let pad = (aligned_end - slot_end) as usize;
             if pad > 0 {
-                compressed_and_transformed_block.resize(
-                    compressed_and_transformed_block.len() + pad,
-                    0,
-                );
+                compressed_and_transformed_block
+                    .resize(compressed_and_transformed_block.len() + pad, 0);
             }
         }
         Ok(EncodedSsTableBlock {

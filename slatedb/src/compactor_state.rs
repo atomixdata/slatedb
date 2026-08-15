@@ -958,6 +958,7 @@ mod tests {
         // when:
         let compacted_ssts = before_compaction.tree.l0.iter().cloned().collect();
         let sr = SortedRun {
+            fences: Default::default(),
             id: 0,
             sst_views: compacted_ssts,
         };
@@ -1021,6 +1022,7 @@ mod tests {
             .expect("failed to add compaction");
 
         let sr = SortedRun {
+            fences: Default::default(),
             id: 0,
             sst_views: before_compaction.tree.l0.iter().cloned().collect(),
         };
@@ -1056,6 +1058,7 @@ mod tests {
         // when:
         let compacted_ssts = before_compaction.tree.l0.iter().cloned().collect();
         let sr = SortedRun {
+            fences: Default::default(),
             id: 0,
             sst_views: compacted_ssts,
         };
@@ -1119,6 +1122,7 @@ mod tests {
         state.finish_compaction(
             compaction_id,
             SortedRun {
+                fences: Default::default(),
                 id: 0,
                 sst_views: vec![original_l0s.back().unwrap().clone()].into(),
             },
@@ -1186,6 +1190,7 @@ mod tests {
         state.finish_compaction(
             compaction_id,
             SortedRun {
+                fences: Default::default(),
                 id: 0,
                 sst_views: original_l0s.clone().into_iter().collect(),
             },
