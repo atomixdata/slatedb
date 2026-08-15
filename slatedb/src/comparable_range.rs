@@ -8,7 +8,7 @@ use serde::{ser::SerializeStruct, Serialize, Serializer};
 
 #[derive(Debug, Eq)]
 pub(crate) struct StartBound<T: Ord> {
-    inner: Bound<T>,
+    pub(crate) inner: Bound<T>,
 }
 
 impl<T: Ord + Clone> Clone for StartBound<T> {
@@ -74,7 +74,7 @@ impl<T: Ord> Ord for StartBound<T> {
 
 #[derive(Debug, Eq)]
 pub(crate) struct EndBound<T: Ord> {
-    inner: Bound<T>,
+    pub(crate) inner: Bound<T>,
 }
 
 impl<T: Ord + Clone> Clone for EndBound<T> {
@@ -136,6 +136,33 @@ impl<T: Ord> Ord for EndBound<T> {
     fn cmp(&self, other: &Self) -> Ordering {
         cmp_bound(&self.inner, &other.inner, false)
     }
+}
+
+/// True iff the interval described by `start`/`end` contains at least one
+/// point. Compares bounds by reference and never clones them; the owned
+/// counterpart is [`ComparableRange::non_empty`].
+pub(crate) fn bounds_non_empty<T: Ord>(start: Bound<&T>, end: Bound<&T>) -> bool {
+    match (start, end) {
+        (Bound::Included(a), Bound::Included(b)) => a <= b,
+        (Bound::Included(a), Bound::Excluded(b)) => a < b,
+        (Bound::Excluded(a), Bound::Excluded(b)) => a < b,
+        (Bound::Excluded(a), Bound::Included(b)) => a < b,
+        (Bound::Unbounded, _) => true,
+        (_, Bound::Unbounded) => true,
+    }
+}
+
+/// True iff the spans `(a_start, a_end)` and `(b_start, b_end)` share at
+/// least one point, comparing all bounds by reference.
+pub(crate) fn bounds_overlap<T: Ord>(
+    a_start: Bound<&T>,
+    a_end: Bound<&T>,
+    b_start: Bound<&T>,
+    b_end: Bound<&T>,
+) -> bool {
+    let start = max(StartBound::from(a_start), StartBound::from(b_start));
+    let end = min(EndBound::from(a_end), EndBound::from(b_end));
+    bounds_non_empty(start.inner, end.inner)
 }
 
 fn cmp_bound<T: Ord>(a: &Bound<T>, b: &Bound<T>, start: bool) -> Ordering {
@@ -219,6 +246,18 @@ impl<T: Ord + Clone> ComparableRange<T> {
     #[cfg(test)]
     pub(crate) fn from_range<R: RangeBounds<T>>(range: R) -> Self {
         Self::new(range.start_bound().cloned(), range.end_bound().cloned())
+    }
+
+    /// True iff `self` and `other` share at least one point. Unlike
+    /// `intersect(..).is_some()`, this compares bounds by reference and
+    /// never clones them.
+    pub(crate) fn overlaps(&self, other: &Self) -> bool {
+        let start = max(
+            self.comparable_start_bound(),
+            other.comparable_start_bound(),
+        );
+        let end = min(self.comparable_end_bound(), other.comparable_end_bound());
+        bounds_non_empty(start.inner, end.inner)
     }
 
     pub(crate) fn intersect(&self, other: &Self) -> Option<Self> {

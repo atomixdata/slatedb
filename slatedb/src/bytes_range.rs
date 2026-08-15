@@ -50,6 +50,12 @@ impl BytesRange {
         Self { inner }
     }
 
+    /// True iff `self` and `other` share at least one point, without
+    /// cloning any bounds.
+    pub(crate) fn overlaps(&self, other: &Self) -> bool {
+        self.inner.overlaps(&other.inner)
+    }
+
     /// Build a `BytesRange` without panicking on empty ranges. Returns `None`
     /// when the bounds describe an empty key interval.
     pub(crate) fn try_new(start_bound: Bound<Bytes>, end_bound: Bound<Bytes>) -> Option<Self> {

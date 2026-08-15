@@ -1,4 +1,5 @@
 use crate::bytes_range::BytesRange;
+use crate::comparable_range::{bounds_non_empty, bounds_overlap, EndBound, StartBound};
 use crate::config::CompressionCodec;
 use crate::error::SlateDBError;
 use crate::filter_policy::NamedFilter;
@@ -10,6 +11,7 @@ use crate::wal_id::WalIdStore;
 use bytes::Bytes;
 use serde::Serialize;
 use slatedb_txn_obj::DirtyObject;
+use std::cmp::{max, min};
 use std::collections::VecDeque;
 use std::fmt::{Debug, Formatter};
 use std::ops::Bound::{Excluded, Included, Unbounded};
@@ -248,7 +250,7 @@ impl SsTableView {
     /// Cheap, in-memory check used to skip non-overlapping SSTs before
     /// paying for an iterator (clone, index read, block search).
     pub(crate) fn overlaps_range(&self, range: &BytesRange) -> bool {
-        self.effective_range.intersect(range).is_some()
+        self.effective_range.overlaps(range)
     }
 
     pub(crate) fn compacted_intersection(
@@ -268,15 +270,25 @@ impl SsTableView {
         }
     }
 
-    pub(crate) fn intersects_range(&self, end_bound: Bound<Bytes>, range: &BytesRange) -> bool {
-        let sst_range =
-            BytesRange::new(Unbounded, end_bound.clone()).intersect(&self.effective_range);
-        match sst_range {
-            Some(sst_range) => BytesRange::new(sst_range.start_bound().cloned(), end_bound)
-                .intersect(range)
-                .is_some(),
-            None => false,
+    pub(crate) fn intersects_range(&self, end_bound: Bound<&Bytes>, range: &BytesRange) -> bool {
+        // Equivalent to intersecting (Unbounded, end_bound) with the
+        // effective range and then intersecting the surviving slot range
+        // (effective start, end_bound) with the query range, but comparing
+        // every bound by reference instead of building owned ranges.
+        let eff = &self.effective_range;
+        let slot_clipped_end = min(
+            EndBound::from(end_bound),
+            EndBound::from(eff.end_bound()),
+        );
+        if !bounds_non_empty(eff.start_bound(), slot_clipped_end.inner) {
+            return false;
         }
+        let start = max(
+            StartBound::from(eff.start_bound()),
+            StartBound::from(range.start_bound()),
+        );
+        let end = min(EndBound::from(end_bound), EndBound::from(range.end_bound()));
+        bounds_non_empty(start.inner, end.inner)
     }
 
     /// Calculate the view range for the given range.
@@ -540,11 +552,12 @@ impl SortedRun {
             .sst_views
             .last()
             .expect("non-empty: first exists, so last exists");
-        let span = BytesRange::new(
-            first.compacted_effective_range().start_bound().cloned(),
-            last.compacted_effective_range().end_bound().cloned(),
-        );
-        span.intersect(range).is_some()
+        bounds_overlap(
+            first.compacted_effective_range().start_bound(),
+            last.compacted_effective_range().end_bound(),
+            range.start_bound(),
+            range.end_bound(),
+        )
     }
 
     pub(crate) fn find_last_sst_with_range_covering_key(&self, key: &[u8]) -> Option<usize> {
@@ -563,7 +576,7 @@ impl SortedRun {
     ///
     /// The bound is normally the next view's start key, but becomes inclusive
     /// when adjacent views overlap on that boundary key.
-    fn table_end_bound(&self, idx: usize) -> Bound<Bytes> {
+    fn table_end_bound(&self, idx: usize) -> Bound<&Bytes> {
         let current_sst = &self.sst_views[idx];
         if idx + 1 < self.sst_views.len() {
             let next_sst = &self.sst_views[idx + 1];
@@ -571,9 +584,9 @@ impl SortedRun {
                 .compacted_effective_range()
                 .contains(next_sst.compacted_effective_start_key())
             {
-                Included(next_sst.compacted_effective_start_key().clone())
+                Included(next_sst.compacted_effective_start_key())
             } else {
-                Excluded(next_sst.compacted_effective_start_key().clone())
+                Excluded(next_sst.compacted_effective_start_key())
             }
         } else {
             Unbounded
