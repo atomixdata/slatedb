@@ -411,7 +411,14 @@ impl Reader {
             .compacted
             .iter()
             .filter(|sr| sr.overlaps_range(range))
-            .cloned()
+            .map(|sr| {
+                // As in build_range_sr_iters: build the fence array on the
+                // state's shared instance so the owned clone carries the
+                // warm Arc instead of rebuilding it per read. This lazy
+                // path serves scan_prefix_by_recency, i.e. every get.
+                sr.warm_fences();
+                sr.clone()
+            })
         {
             let iter = SortedRunIterator::new_owned(
                 range.clone(),
