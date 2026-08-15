@@ -486,7 +486,11 @@ pub struct SortedRun {
     /// The unique identifier for this sorted run.
     pub id: u32,
     /// The list of SSTable views in this sorted run.
-    pub sst_views: Vec<SsTableView>,
+    ///
+    /// Held behind an `Arc` so cloning a `SortedRun` (e.g. per read in the
+    /// scan path) is a single refcount bump rather than a deep clone of every
+    /// view's `Bytes` handles.
+    pub sst_views: Arc<[SsTableView]>,
 }
 
 impl SortedRun {
@@ -642,11 +646,14 @@ impl SortedRun {
     }
 
     pub(crate) fn into_tables_covering_range(
-        mut self,
+        self,
         range: &BytesRange,
     ) -> VecDeque<SsTableView> {
         let matching_range = self.table_idx_covering_range(range);
-        self.sst_views.drain(matching_range).collect()
+        // `sst_views` is shared behind an `Arc`, so we clone only the few
+        // covering views rather than draining the whole run. The full slice
+        // is released with a single refcount decrement when `self` drops.
+        self.sst_views[matching_range].iter().cloned().collect()
     }
 }
 
@@ -1153,7 +1160,7 @@ mod tests {
                 create_compacted_sst_view_with_bounds(b"k", Some(b"k")),
                 create_compacted_sst_view_with_bounds(b"k", Some(b"m")),
                 create_compacted_sst_view_with_bounds(b"z", Some(b"z")),
-            ],
+            ].into(),
         };
 
         let covering_tables = sorted_run.tables_covering_point_key(b"k");
@@ -1181,7 +1188,7 @@ mod tests {
         }
         SortedRun {
             id,
-            sst_views: ssts,
+            sst_views: ssts.into(),
         }
     }
 

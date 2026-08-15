@@ -1267,7 +1267,7 @@ mod tests {
                     .unwrap();
 
                 let mut expected_entries = Vec::new();
-                for sst in &full_run.sst_views {
+                for sst in full_run.sst_views.iter() {
                     let mut iter = SstIterator::new(
                         SstView::Borrowed(sst, BytesRange::from(..)),
                         table_store.clone(),
@@ -1312,7 +1312,7 @@ mod tests {
                         .unwrap();
 
                     let mut resumed_entries = Vec::new();
-                    for sst in &resumed_run.sst_views {
+                    for sst in resumed_run.sst_views.iter() {
                         let mut iter = SstIterator::new(
                             SstView::Borrowed(sst, BytesRange::from(..)),
                             table_store.clone(),

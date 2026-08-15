@@ -67,7 +67,12 @@ pub(crate) async fn warm_sst_impl(
     let matching: Vec<&SsTableView> = manifest
         .l0()
         .iter()
-        .chain(manifest.compacted().iter().flat_map(|run| &run.sst_views))
+        .chain(
+            manifest
+                .compacted()
+                .iter()
+                .flat_map(|run| run.sst_views.iter()),
+        )
         .filter(|view| view.sst.id == sst_id)
         .collect();
     let Some(first) = matching.first() else {

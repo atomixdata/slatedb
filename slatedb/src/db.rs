@@ -1853,7 +1853,7 @@ impl Db {
         let ssts_written = sst_views.len();
         let sorted_run = SortedRun {
             id: 0,
-            sst_views,
+            sst_views: sst_views.into(),
         };
 
         // Reload the latest manifest, mutate it, and persist. Using

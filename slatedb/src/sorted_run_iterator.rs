@@ -288,7 +288,7 @@ mod tests {
         let handle = table_store.write_sst(&id, encoded, false).await.unwrap();
         let sr = SortedRun {
             id: 0,
-            sst_views: vec![SsTableView::identity(handle)],
+            sst_views: vec![SsTableView::identity(handle)].into(),
         };
 
         let mut iter = SortedRunIterator::new_owned_initialized(
@@ -352,7 +352,7 @@ mod tests {
             sst_views: vec![
                 SsTableView::identity(handle1),
                 SsTableView::identity(handle2),
-            ],
+            ].into(),
         };
 
         let mut iter = SortedRunIterator::new_owned_initialized(
@@ -569,7 +569,7 @@ mod tests {
 
         SortedRun {
             id: 0,
-            sst_views: ssts,
+            sst_views: ssts.into(),
         }
     }
 
@@ -593,7 +593,7 @@ mod tests {
         }
         SortedRun {
             id: 0,
-            sst_views: ssts,
+            sst_views: ssts.into(),
         }
     }
 
@@ -675,7 +675,7 @@ mod tests {
                     SsTableView::identity(sst2_v2),
                     SsTableView::identity(sst3_v1),
                     SsTableView::identity(sst4_v2),
-                ],
+                ].into(),
             };
 
             // when: iterating over the sorted run
@@ -746,7 +746,7 @@ mod tests {
                     SsTableView::identity(sst2_v2),
                     SsTableView::identity(sst3_v1),
                     SsTableView::identity(sst4_v2),
-                ],
+                ].into(),
             };
 
             let mut iter = SortedRunIterator::new_owned_initialized(

@@ -1186,7 +1186,7 @@ mod tests {
         // then:
         let db_state = db_state.expect("db was not compacted");
         for run in db_state.tree.compacted {
-            for sst in run.sst_views {
+            for sst in run.sst_views.iter().cloned() {
                 let mut iter = SstIterator::new_borrowed_initialized(
                     ..,
                     &sst,
@@ -2907,7 +2907,7 @@ mod tests {
                     SsTableId::Compacted(Ulid::new()),
                     SST_FORMAT_VERSION_LATEST,
                     sr_info.clone(),
-                ))],
+                ))].into(),
             },
             SortedRun {
                 id: 1,
@@ -2915,7 +2915,7 @@ mod tests {
                     SsTableId::Compacted(Ulid::new()),
                     SST_FORMAT_VERSION_LATEST,
                     sr_info.clone(),
-                ))],
+                ))].into(),
             },
         ];
         stored_manifest.update(dirty).await.unwrap();
@@ -3008,7 +3008,7 @@ mod tests {
                     SsTableId::Compacted(Ulid::from_parts(10, 0)),
                     SST_FORMAT_VERSION_LATEST,
                     sr_info.clone(),
-                ))],
+                ))].into(),
             },
             SortedRun {
                 id: 2,
@@ -3016,7 +3016,7 @@ mod tests {
                     SsTableId::Compacted(Ulid::from_parts(11, 0)),
                     SST_FORMAT_VERSION_LATEST,
                     sr_info,
-                ))],
+                ))].into(),
             },
         ];
         let state = CompactorStateView {

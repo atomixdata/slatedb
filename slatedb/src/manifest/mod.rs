@@ -618,11 +618,12 @@ impl Manifest {
         let mut projected = source_manifest.clone();
         let mut sorter_runs_filtered = vec![];
         for sorter_run in &projected.core.tree.compacted {
-            let sst_views = Self::filter_view_handles(&sorter_run.sst_views, false, &range);
+            let sst_views =
+                Self::filter_view_handles(sorter_run.sst_views.iter(), false, &range);
             if !sst_views.is_empty() {
                 sorter_runs_filtered.push(SortedRun {
                     id: sorter_run.id,
-                    sst_views,
+                    sst_views: sst_views.into(),
                 });
             }
         }
@@ -1296,7 +1297,7 @@ mod tests {
                 l0: writer_l0.clone(),
                 compacted: vec![],
             };
-            let compactor_compacted = vec![SortedRun { id: 42, sst_views: vec![] }];
+            let compactor_compacted = vec![SortedRun { id: 42, sst_views: vec![].into() }];
             let compactor = LsmTreeState {
                 last_compacted_l0_sst_view_id: last_view,
                 last_compacted_l0_sst_id: last_sst,
@@ -1546,7 +1547,7 @@ mod tests {
                         0,
                         SortedRun {
                             id: self.next_sr_id,
-                            sst_views: sr_views,
+                            sst_views: sr_views.into(),
                         },
                     );
                 }
@@ -1646,7 +1647,7 @@ mod tests {
                 }
                 for seg in &self.store {
                     for sr in &seg.tree.compacted {
-                        for view in &sr.sst_views {
+                        for view in sr.sst_views.iter() {
                             assert!(
                                 self.flushed_l0s.contains(&view.id),
                                 "SR {} references L0 {} that was never flushed",
@@ -1733,7 +1734,7 @@ mod tests {
                 for seg in &self.store {
                     let l0_ids: BTreeSet<Ulid> = seg.tree.l0.iter().map(|v| v.id).collect();
                     for sr in &seg.tree.compacted {
-                        for view in &sr.sst_views {
+                        for view in sr.sst_views.iter() {
                             assert!(
                                 !l0_ids.contains(&view.id),
                                 "L0 {} appears in both l0 list and SR {} of segment {:?}",
@@ -2215,7 +2216,7 @@ mod tests {
         core.tree.l0.push_back(create_sst_view(live_l0, b"a"));
         core.tree.compacted.push(SortedRun {
             id: 0,
-            sst_views: vec![create_sst_view(live_compacted, b"b")],
+            sst_views: vec![create_sst_view(live_compacted, b"b")].into(),
         });
 
         let mut manifest = Manifest::initial(core);
@@ -2282,7 +2283,7 @@ mod tests {
                     },
                 ),
                 Some(visible_range),
-            )],
+            )].into(),
         });
         Manifest::initial(core)
     }

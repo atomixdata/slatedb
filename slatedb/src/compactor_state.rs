@@ -1120,7 +1120,7 @@ mod tests {
             compaction_id,
             SortedRun {
                 id: 0,
-                sst_views: vec![original_l0s.back().unwrap().clone()],
+                sst_views: vec![original_l0s.back().unwrap().clone()].into(),
             },
         );
         // open a new db and write another l0
@@ -1187,7 +1187,7 @@ mod tests {
             compaction_id,
             SortedRun {
                 id: 0,
-                sst_views: original_l0s.clone().into(),
+                sst_views: original_l0s.clone().into_iter().collect(),
             },
         );
         assert_eq!(state.db_state().tree.l0.len(), 0);

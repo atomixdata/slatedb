@@ -902,7 +902,7 @@ mod tests {
         let ssts: Vec<SsTableView> = (0..num_ssts).map(|_| create_sst_view(sst_size)).collect();
         SortedRun {
             id,
-            sst_views: ssts,
+            sst_views: ssts.into(),
         }
     }
 

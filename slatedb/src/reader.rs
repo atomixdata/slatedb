@@ -802,11 +802,13 @@ mod tests {
                 .iter_mut()
                 .find(|sr| sr.id == sr_id)
             {
-                sr.sst_views.push(SsTableView::identity(sst_handle));
+                let mut views: Vec<SsTableView> = sr.sst_views.iter().cloned().collect();
+                views.push(SsTableView::identity(sst_handle));
+                sr.sst_views = views.into();
             } else {
                 let new_sr = SortedRun {
                     id: sr_id,
-                    sst_views: vec![SsTableView::identity(sst_handle)],
+                    sst_views: vec![SsTableView::identity(sst_handle)].into(),
                 };
                 self.core.tree.compacted.push(new_sr);
             }
