@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 use std::ops::{Bound, RangeBounds};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use bytes::{BufMut, Bytes, BytesMut};
 use chrono::{DateTime, Utc};
@@ -68,17 +68,49 @@ fn verifier_options() -> VerifierOptions {
 #[derive(PartialEq, Eq, Clone)]
 pub(crate) struct SsTableIndexOwned {
     data: Bytes,
+    /// `(offset, len)` of each block's first key within `data`, built once
+    /// on first search. Binary-search probes over a large index walk two
+    /// flatbuffer indirections per probe (vector entry, then key vector)
+    /// before reaching the key bytes; probing this flat array instead
+    /// touches one contiguous allocation. Built lazily so indexes decoded
+    /// for one-shot uses (compaction inputs) never pay for it.
+    fences: OnceLock<Box<[(u32, u32)]>>,
 }
 
 impl SsTableIndexOwned {
     pub(crate) fn new(data: Bytes) -> Result<Self, InvalidFlatbuffer> {
         flatbuffers::root_with_opts::<SsTableIndex>(&verifier_options(), &data)?;
-        Ok(Self { data })
+        Ok(Self {
+            data,
+            fences: OnceLock::new(),
+        })
     }
 
     pub(crate) fn borrow(&self) -> SsTableIndex<'_> {
         let raw = &self.data;
         unsafe { flatbuffers::root_unchecked::<SsTableIndex>(raw) }
+    }
+
+    /// A [`RangePartitionedKeySpace`] over this index backed by the flat
+    /// fence array. Preferred over [`SsTableIndexKeySpace`] on hot search
+    /// paths.
+    pub(crate) fn fenced_keyspace(&self) -> FencedIndexKeySpace<'_> {
+        let fences = self.fences.get_or_init(|| {
+            let index = self.borrow();
+            let block_meta = index.block_meta();
+            let base = self.data.as_ptr() as usize;
+            (0..block_meta.len())
+                .map(|i| {
+                    let key = block_meta.get(i).first_key().bytes();
+                    let off = key.as_ptr() as usize - base;
+                    (off as u32, key.len() as u32)
+                })
+                .collect()
+        });
+        FencedIndexKeySpace {
+            data: &self.data,
+            fences,
+        }
     }
 
     pub(crate) fn data(&self) -> Bytes {
@@ -122,6 +154,25 @@ impl RangePartitionedKeySpace for SsTableIndexKeySpace<'_> {
 
     fn partition_first_key(&self, partition: usize) -> &[u8] {
         self.block_meta.get(partition).first_key().bytes()
+    }
+}
+
+/// A [`RangePartitionedKeySpace`] over an SST index whose probes read the
+/// owned index's flat fence array instead of walking flatbuffer
+/// indirections. See [`SsTableIndexOwned::fenced_keyspace`].
+pub(crate) struct FencedIndexKeySpace<'a> {
+    data: &'a Bytes,
+    fences: &'a [(u32, u32)],
+}
+
+impl RangePartitionedKeySpace for FencedIndexKeySpace<'_> {
+    fn partitions(&self) -> usize {
+        self.fences.len()
+    }
+
+    fn partition_first_key(&self, partition: usize) -> &[u8] {
+        let (off, len) = self.fences[partition];
+        &self.data[off as usize..(off + len) as usize]
     }
 }
 

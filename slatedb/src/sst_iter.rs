@@ -14,7 +14,7 @@ use crate::db_state::{SsTableId, SsTableView};
 use crate::db_stats::DbStats;
 use crate::error::SlateDBError;
 use crate::filter_policy::{FilterContext, FilterQuery, NamedFilter};
-use crate::flatbuffer_types::{SsTableIndexKeySpace, SsTableIndexOwned};
+use crate::flatbuffer_types::SsTableIndexOwned;
 use crate::format::block::Block;
 use crate::prefix_extractor::PrefixTarget;
 use crate::{
@@ -595,7 +595,7 @@ impl<'a> InternalSstIterator<'a> {
                 }
             };
             let block_idx_range = partitioned_keyspace::partitions_covering_range(
-                &SsTableIndexKeySpace::new(&index.borrow()),
+                &index.fenced_keyspace(),
                 self.view.start_key(),
                 self.view.end_key(),
             );
@@ -769,12 +769,12 @@ impl RowEntryIterator for InternalSstIterator<'_> {
             let block_idx = match self.options.order {
                 IterationOrder::Ascending => {
                     partitioned_keyspace::first_partition_including_or_after_key(
-                        &SsTableIndexKeySpace::new(&index.borrow()),
+                        &index.fenced_keyspace(),
                         next_key,
                     )
                 }
                 IterationOrder::Descending => partitioned_keyspace::last_partition_including_key(
-                    &SsTableIndexKeySpace::new(&index.borrow()),
+                    &index.fenced_keyspace(),
                     next_key,
                 )
                 .unwrap_or(self.block_idx_range.start),
