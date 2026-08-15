@@ -518,6 +518,54 @@ impl Clone for Box<dyn SsTableInfoCodec> {
     }
 }
 
+/// Flat fence array for a sorted run: per-view effective start keys plus
+/// the length of the prefix they all share. Searches compare only the
+/// bytes past the shared prefix.
+#[derive(Debug)]
+pub(crate) struct RunFences {
+    keys: Box<[Bytes]>,
+    lcp: usize,
+}
+
+impl RunFences {
+    /// Compares `key` against the shared prefix once, then counts leading
+    /// fences via suffix-only comparisons. `inclusive` selects `<=` vs `<`.
+    fn count(&self, key: &[u8], inclusive: bool) -> usize {
+        if self.keys.is_empty() {
+            return 0;
+        }
+        let lcp = self.lcp;
+        let prefix = &self.keys[0].as_ref()[..lcp];
+        let head_len = key.len().min(lcp);
+        match key[..head_len].cmp(&prefix[..head_len]) {
+            // key sorts before every fence, or is a proper prefix of the
+            // shared prefix (and thus less than every fence).
+            std::cmp::Ordering::Less => 0,
+            std::cmp::Ordering::Greater => self.keys.len(),
+            std::cmp::Ordering::Equal if key.len() < lcp => 0,
+            std::cmp::Ordering::Equal => {
+                let suffix = &key[lcp..];
+                self.keys.partition_point(|fence| {
+                    let fence_suffix = &fence.as_ref()[lcp..];
+                    if inclusive {
+                        fence_suffix <= suffix
+                    } else {
+                        fence_suffix < suffix
+                    }
+                })
+            }
+        }
+    }
+
+    fn count_le(&self, key: &[u8]) -> usize {
+        self.count(key, true)
+    }
+
+    fn count_lt(&self, key: &[u8]) -> usize {
+        self.count(key, false)
+    }
+}
+
 /// A sorted run consisting of multiple compacted SSTables.
 #[derive(Clone, Serialize, Debug)]
 pub struct SortedRun {
@@ -535,7 +583,7 @@ pub struct SortedRun {
     /// allocation per probe. Shared by `Clone` (the `OnceLock` clones its
     /// value), so iterator-owned copies keep the warm array.
     #[serde(skip)]
-    pub(crate) fences: OnceLock<Arc<[Bytes]>>,
+    pub(crate) fences: OnceLock<Arc<RunFences>>,
 }
 
 /// The fence array is a cache, not identity.
@@ -580,18 +628,30 @@ impl SortedRun {
 
     /// Effective start keys of the views, materialized once as a flat array
     /// for binary-search probes.
-    fn fences(&self) -> &[Bytes] {
+    fn fences(&self) -> &RunFences {
         self.fences.get_or_init(|| {
-            self.sst_views
+            let keys: Box<[Bytes]> = self
+                .sst_views
                 .iter()
                 .map(|view| view.compacted_effective_start_key().clone())
-                .collect()
+                .collect();
+            // Sorted keys: the prefix shared by first and last is shared
+            // by every key in between.
+            let lcp = match (keys.first(), keys.last()) {
+                (Some(first), Some(last)) => first
+                    .iter()
+                    .zip(last.iter())
+                    .take_while(|(a, b)| a == b)
+                    .count(),
+                _ => 0,
+            };
+            Arc::new(RunFences { keys, lcp })
         })
     }
 
     pub(crate) fn find_last_sst_with_range_covering_key(&self, key: &[u8]) -> Option<usize> {
         // returns the sst after the one whose range includes the key
-        let first_sst = self.fences().partition_point(|fence| fence.as_ref() <= key);
+        let first_sst = self.fences().count_le(key);
         if first_sst > 0 {
             return Some(first_sst - 1);
         }
@@ -657,14 +717,14 @@ impl SortedRun {
         let fences = self.fences();
         let max_idx = match range.end_bound() {
             Included(hi) => {
-                let p = fences.partition_point(|fence| fence <= hi);
+                let p = fences.count_le(hi);
                 if p == 0 {
                     return 0..0;
                 }
                 p - 1
             }
             Excluded(hi) => {
-                let p = fences.partition_point(|fence| fence < hi);
+                let p = fences.count_lt(hi);
                 if p == 0 {
                     return 0..0;
                 }
@@ -681,9 +741,7 @@ impl SortedRun {
         // before it cannot intersect except via boundary-key overlap, handled
         // by the backward walk below.
         let start_candidate = match range.start_bound() {
-            Included(lo) | Excluded(lo) => {
-                fences.partition_point(|fence| fence <= lo).checked_sub(1)
-            }
+            Included(lo) | Excluded(lo) => fences.count_le(lo).checked_sub(1),
             Unbounded => None,
         };
 

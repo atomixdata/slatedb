@@ -300,8 +300,8 @@ impl CachedObjectStore {
             .cache_storage
             .entry(&cache_location, self.part_size_bytes);
         let part_size = self.part_size_bytes as u64;
-        let total_parts = usize::try_from(meta.size.div_ceil(part_size))
-            .expect("part count exceeds usize");
+        let total_parts =
+            usize::try_from(meta.size.div_ceil(part_size)).expect("part count exceeds usize");
         let cached: std::collections::HashSet<PartID> =
             entry.cached_parts().await?.into_iter().collect();
 

@@ -33,7 +33,10 @@ enum FetchTask {
     /// block. Point reads take this path (mineraldb's `get` scans a
     /// single key prefix and stops at the first match), where it is the
     /// busiest spawn site in the process.
-    Deferred { start: usize, end: usize },
+    Deferred {
+        start: usize,
+        end: usize,
+    },
     InFlight(JoinHandle<Result<VecDeque<Arc<Block>>, SlateDBError>>),
     Finished(VecDeque<Arc<Block>>),
 }
@@ -377,12 +380,7 @@ impl<'a> InternalSstIterator<'a> {
     /// is the only case where the read can overlap with iteration. With a
     /// single permitted task the consumer awaits immediately, so the read
     /// is deferred and run inline instead.
-    fn make_fetch(
-        &self,
-        index: &Arc<SsTableIndexOwned>,
-        start: usize,
-        end: usize,
-    ) -> FetchTask {
+    fn make_fetch(&self, index: &Arc<SsTableIndexOwned>, start: usize, end: usize) -> FetchTask {
         if self.options.max_fetch_tasks <= 1 {
             return FetchTask::Deferred { start, end };
         }

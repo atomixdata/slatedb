@@ -65,16 +65,36 @@ fn verifier_options() -> VerifierOptions {
 }
 
 /// A wrapper around a `Bytes` buffer containing a FlatBuffer-encoded `SsTableIndex`.
-#[derive(PartialEq, Eq, Clone)]
 pub(crate) struct SsTableIndexOwned {
     data: Bytes,
-    /// `(offset, len)` of each block's first key within `data`, built once
-    /// on first search. Binary-search probes over a large index walk two
-    /// flatbuffer indirections per probe (vector entry, then key vector)
-    /// before reaching the key bytes; probing this flat array instead
-    /// touches one contiguous allocation. Built lazily so indexes decoded
-    /// for one-shot uses (compaction inputs) never pay for it.
-    fences: OnceLock<Box<[(u32, u32)]>>,
+    /// `(offset, len)` of each block's first key within `data`, plus the
+    /// length of the prefix shared by every first key, built once on first
+    /// search. Binary-search probes over a large index walk two flatbuffer
+    /// indirections per probe (vector entry, then key vector) before
+    /// reaching the key bytes; probing this flat array instead touches one
+    /// contiguous allocation, and compares skip the shared prefix. Built
+    /// lazily so indexes decoded for one-shot uses (compaction inputs)
+    /// never pay for it.
+    fences: OnceLock<IndexFences>,
+}
+
+/// The fence cache is derived from `data`, so equality and cloning are
+/// defined by the buffer alone (the clone shares the built fences).
+impl PartialEq for SsTableIndexOwned {
+    fn eq(&self, other: &Self) -> bool {
+        self.data == other.data
+    }
+}
+
+impl Eq for SsTableIndexOwned {}
+
+impl Clone for SsTableIndexOwned {
+    fn clone(&self) -> Self {
+        Self {
+            data: self.data.clone(),
+            fences: self.fences.clone(),
+        }
+    }
 }
 
 impl SsTableIndexOwned {
@@ -99,13 +119,28 @@ impl SsTableIndexOwned {
             let index = self.borrow();
             let block_meta = index.block_meta();
             let base = self.data.as_ptr() as usize;
-            (0..block_meta.len())
+            let offsets: Box<[(u32, u32)]> = (0..block_meta.len())
                 .map(|i| {
                     let key = block_meta.get(i).first_key().bytes();
                     let off = key.as_ptr() as usize - base;
                     (off as u32, key.len() as u32)
                 })
-                .collect()
+                .collect();
+            // Sorted keys: the prefix shared by first and last is shared by
+            // every key in between.
+            let lcp = match (offsets.first(), offsets.last()) {
+                (Some(&(fo, fl)), Some(&(lo, ll))) => {
+                    let first = &self.data[fo as usize..(fo + fl) as usize];
+                    let last = &self.data[lo as usize..(lo + ll) as usize];
+                    first
+                        .iter()
+                        .zip(last.iter())
+                        .take_while(|(a, b)| a == b)
+                        .count()
+                }
+                _ => 0,
+            };
+            IndexFences { offsets, lcp }
         });
         FencedIndexKeySpace {
             data: &self.data,
@@ -157,22 +192,72 @@ impl RangePartitionedKeySpace for SsTableIndexKeySpace<'_> {
     }
 }
 
+/// Flat fence metadata for an owned SST index: per-block first-key
+/// locations plus the length of the prefix all first keys share.
+#[derive(Clone)]
+pub(crate) struct IndexFences {
+    offsets: Box<[(u32, u32)]>,
+    lcp: usize,
+}
+
 /// A [`RangePartitionedKeySpace`] over an SST index whose probes read the
 /// owned index's flat fence array instead of walking flatbuffer
-/// indirections. See [`SsTableIndexOwned::fenced_keyspace`].
+/// indirections, and whose searches compare only the bytes past the keys'
+/// shared prefix. See [`SsTableIndexOwned::fenced_keyspace`].
 pub(crate) struct FencedIndexKeySpace<'a> {
     data: &'a Bytes,
-    fences: &'a [(u32, u32)],
+    fences: &'a IndexFences,
+}
+
+impl FencedIndexKeySpace<'_> {
+    /// Compares `key` against the shared prefix once, then counts leading
+    /// fences via suffix-only comparisons. `inclusive` selects `<=` vs `<`.
+    fn count_with_prefix_skip(&self, key: &[u8], inclusive: bool) -> usize {
+        let offsets = &self.fences.offsets;
+        if offsets.is_empty() {
+            return 0;
+        }
+        let lcp = self.fences.lcp;
+        let (first_off, _) = offsets[0];
+        let prefix = &self.data[first_off as usize..first_off as usize + lcp];
+        let head_len = key.len().min(lcp);
+        match key[..head_len].cmp(&prefix[..head_len]) {
+            // key sorts before every fence, or is a proper prefix of the
+            // shared prefix (and thus less than every fence).
+            std::cmp::Ordering::Less => 0,
+            std::cmp::Ordering::Greater => offsets.len(),
+            std::cmp::Ordering::Equal if key.len() < lcp => 0,
+            std::cmp::Ordering::Equal => {
+                let suffix = &key[lcp..];
+                offsets.partition_point(|&(off, len)| {
+                    let fence_suffix = &self.data[off as usize + lcp..(off + len) as usize];
+                    if inclusive {
+                        fence_suffix <= suffix
+                    } else {
+                        fence_suffix < suffix
+                    }
+                })
+            }
+        }
+    }
 }
 
 impl RangePartitionedKeySpace for FencedIndexKeySpace<'_> {
     fn partitions(&self) -> usize {
-        self.fences.len()
+        self.fences.offsets.len()
     }
 
     fn partition_first_key(&self, partition: usize) -> &[u8] {
-        let (off, len) = self.fences[partition];
+        let (off, len) = self.fences.offsets[partition];
         &self.data[off as usize..(off + len) as usize]
+    }
+
+    fn count_first_keys_lt(&self, key: &[u8]) -> usize {
+        self.count_with_prefix_skip(key, false)
+    }
+
+    fn count_first_keys_le(&self, key: &[u8]) -> usize {
+        self.count_with_prefix_skip(key, true)
     }
 }
 

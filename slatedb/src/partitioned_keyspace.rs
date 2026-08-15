@@ -10,10 +10,23 @@ pub(crate) trait RangePartitionedKeySpace {
     fn partitions(&self) -> usize;
 
     fn partition_first_key(&self, partition: usize) -> &[u8];
+
+    /// Number of leading partitions whose first key is strictly less than
+    /// `key`. Implementations with precomputed fence metadata can override
+    /// this with a cheaper search.
+    fn count_first_keys_lt(&self, key: &[u8]) -> usize {
+        partition_point(self, |first_key| first_key < key)
+    }
+
+    /// Number of leading partitions whose first key is less than or equal
+    /// to `key`.
+    fn count_first_keys_le(&self, key: &[u8]) -> usize {
+        partition_point(self, |first_key| first_key <= key)
+    }
 }
 
 // equivalent to https://doc.rust-lang.org/std/primitive.slice.html#method.partition_point
-fn partition_point<T: RangePartitionedKeySpace, P: Fn(&[u8]) -> bool>(
+fn partition_point<T: RangePartitionedKeySpace + ?Sized, P: Fn(&[u8]) -> bool>(
     keyspace: &T,
     pred: P,
 ) -> usize {
@@ -54,7 +67,7 @@ pub(crate) fn first_partition_including_key<T: RangePartitionedKeySpace>(
     keyspace: &T,
     key: &[u8],
 ) -> Option<usize> {
-    let part_point = partition_point(keyspace, |first_key| first_key < key);
+    let part_point = keyspace.count_first_keys_lt(key);
     if part_point > 0 {
         // Some partition after the first has first_key >= key, so return the previous partition
         return Some(part_point - 1);
@@ -73,7 +86,7 @@ pub(crate) fn last_partition_including_key<T: RangePartitionedKeySpace>(
     keyspace: &T,
     key: &[u8],
 ) -> Option<usize> {
-    let part_point = partition_point(keyspace, |first_key| first_key <= key);
+    let part_point = keyspace.count_first_keys_le(key);
     if part_point == 0 {
         // If the partition point is 0, that means the first partition's first_key is strictly
         // greater than the key, so no partitions include the key.
