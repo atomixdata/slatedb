@@ -45,7 +45,9 @@ struct LazySortedRunSource<'a> {
 
 enum LazySortedRunState<'a> {
     Pending(crate::db_state::SortedRun),
-    Active(SortedRunIterator<'a>),
+    /// Boxed so enum moves (state transitions, wrapper drops) stay
+    /// pointer-sized instead of copying the large iterator struct.
+    Active(Box<SortedRunIterator<'a>>),
     /// Construction consumed the run but produced no iterator work; kept
     /// as a terminal state so repeated init calls stay idempotent.
     Building,
@@ -69,7 +71,7 @@ impl RowEntryIterator for LazySortedRunSource<'_> {
             )
             .await?;
             iter.init().await?;
-            self.state = LazySortedRunState::Active(iter);
+            self.state = LazySortedRunState::Active(Box::new(iter));
         }
         Ok(())
     }
