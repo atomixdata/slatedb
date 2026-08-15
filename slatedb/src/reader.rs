@@ -12,7 +12,7 @@ use crate::oracle::Oracle;
 use crate::sorted_run_iterator::SortedRunIterator;
 use crate::sst_iter::{SstIterator, SstIteratorOptions};
 use crate::tablestore::TableStore;
-use crate::types::{KeyValue, RowEntry};
+use crate::types::KeyValue;
 use crate::utils::{build_concurrent, compute_max_parallel};
 use crate::{db_iter::DbIteratorRangeTracker, error::SlateDBError, DbIterator};
 
@@ -25,68 +25,6 @@ pub(crate) trait DbStateReader {
     fn memtable(&self) -> Arc<KVTable>;
     fn imm_memtable(&self) -> &VecDeque<Arc<ImmutableMemtable>>;
     fn core(&self) -> &ManifestCore;
-}
-
-/// A sorted-run source whose iterator is not built until first use.
-///
-/// The recency walk consults sources newest-first and stops at the first
-/// hit, so sources ranked below the hit never need an iterator. Building
-/// eagerly paid the covering-table search and the full iterator assembly
-/// (sub-iterator structs, options clone, allocations) for every candidate
-/// run on every read; this wrapper defers all of it to `init`, which the
-/// walk only calls on sources it actually reaches.
-struct LazySortedRunSource<'a> {
-    range: BytesRange,
-    table_store: Arc<TableStore>,
-    options: SstIteratorOptions,
-    stats: Option<DbStats>,
-    state: LazySortedRunState<'a>,
-}
-
-enum LazySortedRunState<'a> {
-    Pending(crate::db_state::SortedRun),
-    Active(SortedRunIterator<'a>),
-    /// Construction consumed the run but produced no iterator work; kept
-    /// as a terminal state so repeated init calls stay idempotent.
-    Building,
-}
-
-#[async_trait::async_trait]
-impl RowEntryIterator for LazySortedRunSource<'_> {
-    async fn init(&mut self) -> Result<(), SlateDBError> {
-        if let LazySortedRunState::Pending(_) = self.state {
-            let LazySortedRunState::Pending(run) =
-                std::mem::replace(&mut self.state, LazySortedRunState::Building)
-            else {
-                unreachable!("checked Pending above");
-            };
-            let mut iter = SortedRunIterator::new_owned(
-                self.range.clone(),
-                run,
-                self.table_store.clone(),
-                self.options.clone(),
-                self.stats.clone(),
-            )
-            .await?;
-            iter.init().await?;
-            self.state = LazySortedRunState::Active(iter);
-        }
-        Ok(())
-    }
-
-    async fn next(&mut self) -> Result<Option<RowEntry>, SlateDBError> {
-        match &mut self.state {
-            LazySortedRunState::Active(iter) => iter.next().await,
-            _ => Err(SlateDBError::IteratorNotInitialized),
-        }
-    }
-
-    async fn seek(&mut self, next_key: &[u8]) -> Result<(), SlateDBError> {
-        match &mut self.state {
-            LazySortedRunState::Active(iter) => iter.seek(next_key).await,
-            _ => Err(SlateDBError::IteratorNotInitialized),
-        }
-    }
 }
 
 struct IteratorSources {
@@ -455,11 +393,11 @@ impl Reader {
         Ok(iters)
     }
 
-    /// Lazy counterpart to [`Self::build_range_sr_iters`]. Each source is
-    /// wrapped in a [`LazySortedRunSource`], so even iterator construction
-    /// (covering-table search, sub-iterator assembly) is deferred until the
-    /// recency walk reaches the source. Sources after the walk's first hit
-    /// are never constructed at all.
+    /// Lazy counterpart to [`Self::build_range_sr_iters`]. The
+    /// underlying `SortedRunIterator::new_owned` constructs the run's
+    /// first sub-SST iterator but does not init it; init (and
+    /// therefore the filter check / index load / block fetch) happens
+    /// only when the consumer first calls into the iterator.
     async fn build_lazy_range_sr_iters<'a>(
         &self,
         range: &BytesRange,
@@ -482,13 +420,14 @@ impl Reader {
                 sr.clone()
             })
         {
-            let iter = LazySortedRunSource {
-                range: range.clone(),
-                table_store: self.table_store.clone(),
-                options: sst_iter_options.clone(),
-                stats: Some(self.db_stats.clone()),
-                state: LazySortedRunState::Pending(sr),
-            };
+            let iter = SortedRunIterator::new_owned(
+                range.clone(),
+                sr,
+                self.table_store.clone(),
+                sst_iter_options.clone(),
+                Some(self.db_stats.clone()),
+            )
+            .await?;
             iters.push_back(Box::new(iter) as Box<dyn RowEntryIterator + 'a>);
         }
         Ok(iters)
