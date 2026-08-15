@@ -405,24 +405,59 @@ impl Reader {
         sst_iter_options: &SstIteratorOptions,
     ) -> Result<VecDeque<Box<dyn RowEntryIterator + 'a>>, SlateDBError> {
         let mut iters = VecDeque::new();
-        for sr in db_state
+        // One filter query serves every source's inline bloom pre-check.
+        let bloom_query = sst_iter_options.prefix.as_ref().map(|prefix| {
+            crate::filter_policy::FilterQuery::prefix(prefix.clone())
+                .with_context(sst_iter_options.filter_context.clone())
+        });
+        'runs: for sr in db_state
             .core()
             .tree
             .compacted
             .iter()
             .filter(|sr| sr.overlaps_range(range))
-            .map(|sr| {
-                // As in build_range_sr_iters: build the fence array on the
-                // state's shared instance so the owned clone carries the
-                // warm Arc instead of rebuilding it per read. This lazy
-                // path serves scan_prefix_by_recency, i.e. every get.
-                sr.warm_fences();
-                sr.clone()
-            })
         {
+            // As in build_range_sr_iters: build the fence array on the
+            // state's shared instance so the owned clone below carries the
+            // warm Arc instead of rebuilding it per read. This lazy path
+            // serves scan_prefix_by_recency, i.e. every get.
+            sr.warm_fences();
+            // Inline bloom pre-check: when every covering view has pinned
+            // filters and all of them exclude the query, skip the source
+            // without constructing an iterator at all. Views without
+            // pinned filters fall through to the normal path, whose
+            // FilterIterator fetches and pins them for later reads.
+            if let Some(query) = &bloom_query {
+                let covering = sr.tables_covering_range(range.clone());
+                if !covering.is_empty() {
+                    let mut all_pinned = true;
+                    let mut any_match = false;
+                    for view in &covering {
+                        match view.pinned_filters.get() {
+                            Some(filters) => {
+                                if crate::sst_iter::prefix_filters_match(
+                                    filters,
+                                    query,
+                                    Some(&self.db_stats),
+                                ) {
+                                    any_match = true;
+                                    break;
+                                }
+                            }
+                            None => {
+                                all_pinned = false;
+                                break;
+                            }
+                        }
+                    }
+                    if all_pinned && !any_match {
+                        continue 'runs;
+                    }
+                }
+            }
             let iter = SortedRunIterator::new_owned(
                 range.clone(),
-                sr,
+                sr.clone(),
                 self.table_store.clone(),
                 sst_iter_options.clone(),
                 Some(self.db_stats.clone()),

@@ -169,6 +169,30 @@ enum FilterState {
     Negative,
 }
 
+/// Inline bloom pre-check for the scan setup path: true if every filter
+/// agrees the query might match (or there are no filters). Mirrors
+/// `FilterEvaluator::evaluate`, including its positive/negative counters,
+/// so skipping a source based on this check keeps stats consistent.
+pub(crate) fn prefix_filters_match(
+    filters: &[NamedFilter],
+    query: &FilterQuery,
+    db_stats: Option<&DbStats>,
+) -> bool {
+    if filters.is_empty() {
+        return true;
+    }
+    let might_match = filters.iter().all(|nf| nf.filter.might_match(query));
+    // Only negatives are recorded here: a positive source still gets
+    // constructed and its FilterIterator records the positive when it
+    // re-evaluates, so counting it here would double-count.
+    if !might_match {
+        if let Some(stats) = db_stats {
+            stats.sst_filter_prefix_negatives.increment(1);
+        }
+    }
+    might_match
+}
+
 struct FilterEvaluator {
     query: FilterQuery,
     db_stats: Option<DbStats>,
