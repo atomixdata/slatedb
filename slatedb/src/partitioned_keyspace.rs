@@ -97,6 +97,19 @@ pub(crate) fn last_partition_including_key<T: RangePartitionedKeySpace>(
 
 /// Returns the half-open range of partitions that overlap `[start, end)`. Used for mapping
 /// key ranges to SST block ranges (range scans, cache warming).
+/// Packs up to the first 8 bytes of `suffix` into a big-endian u64,
+/// zero-padded on the right. Two packed values that differ order the same
+/// way as the full suffixes; equal packed values require a byte comparison
+/// to break the tie (the suffixes may still differ past byte 8, or differ
+/// in length with real zero bytes matching the padding).
+#[inline]
+pub(crate) fn pack_fence_suffix(suffix: &[u8]) -> u64 {
+    let mut buf = [0u8; 8];
+    let n = suffix.len().min(8);
+    buf[..n].copy_from_slice(&suffix[..n]);
+    u64::from_be_bytes(buf)
+}
+
 pub(crate) fn partitions_covering_range<T: RangePartitionedKeySpace>(
     keyspace: &T,
     start: Bound<&[u8]>,

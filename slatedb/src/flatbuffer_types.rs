@@ -140,7 +140,18 @@ impl SsTableIndexOwned {
                 }
                 _ => 0,
             };
-            IndexFences { offsets, lcp }
+            let sort_keys: Box<[u64]> = offsets
+                .iter()
+                .map(|&(off, len)| {
+                    let key = &self.data[off as usize..(off + len) as usize];
+                    crate::partitioned_keyspace::pack_fence_suffix(&key[lcp..])
+                })
+                .collect();
+            IndexFences {
+                offsets,
+                lcp,
+                sort_keys,
+            }
         });
         FencedIndexKeySpace {
             data: &self.data,
@@ -198,6 +209,10 @@ impl RangePartitionedKeySpace for SsTableIndexKeySpace<'_> {
 pub(crate) struct IndexFences {
     offsets: Box<[(u32, u32)]>,
     lcp: usize,
+    /// First 8 post-prefix bytes of each fence, packed big-endian and
+    /// zero-padded. Binary searches compare these registers and fall back
+    /// to byte comparison only on ties.
+    sort_keys: Box<[u64]>,
 }
 
 /// A [`RangePartitionedKeySpace`] over an SST index whose probes read the
@@ -229,14 +244,33 @@ impl FencedIndexKeySpace<'_> {
             std::cmp::Ordering::Equal if key.len() < lcp => 0,
             std::cmp::Ordering::Equal => {
                 let suffix = &key[lcp..];
-                offsets.partition_point(|&(off, len)| {
-                    let fence_suffix = &self.data[off as usize + lcp..(off + len) as usize];
-                    if inclusive {
-                        fence_suffix <= suffix
+                let q = crate::partitioned_keyspace::pack_fence_suffix(suffix);
+                let sort_keys = &self.fences.sort_keys;
+                let mut lo = 0;
+                let mut hi = offsets.len();
+                while lo < hi {
+                    let mid = lo + (hi - lo) / 2;
+                    let below = match sort_keys[mid].cmp(&q) {
+                        std::cmp::Ordering::Less => true,
+                        std::cmp::Ordering::Greater => false,
+                        std::cmp::Ordering::Equal => {
+                            let (off, len) = offsets[mid];
+                            let fence_suffix =
+                                &self.data[off as usize + lcp..(off + len) as usize];
+                            if inclusive {
+                                fence_suffix <= suffix
+                            } else {
+                                fence_suffix < suffix
+                            }
+                        }
+                    };
+                    if below {
+                        lo = mid + 1;
                     } else {
-                        fence_suffix < suffix
+                        hi = mid;
                     }
-                })
+                }
+                lo
             }
         }
     }

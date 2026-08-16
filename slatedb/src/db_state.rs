@@ -525,6 +525,10 @@ impl Clone for Box<dyn SsTableInfoCodec> {
 pub(crate) struct RunFences {
     keys: Box<[Bytes]>,
     lcp: usize,
+    /// First 8 post-prefix bytes of each fence, packed big-endian and
+    /// zero-padded. Binary searches compare these registers and fall back
+    /// to byte comparison only on ties.
+    sort_keys: Box<[u64]>,
 }
 
 impl RunFences {
@@ -545,14 +549,30 @@ impl RunFences {
             std::cmp::Ordering::Equal if key.len() < lcp => 0,
             std::cmp::Ordering::Equal => {
                 let suffix = &key[lcp..];
-                self.keys.partition_point(|fence| {
-                    let fence_suffix = &fence.as_ref()[lcp..];
-                    if inclusive {
-                        fence_suffix <= suffix
+                let q = crate::partitioned_keyspace::pack_fence_suffix(suffix);
+                let mut lo = 0;
+                let mut hi = self.keys.len();
+                while lo < hi {
+                    let mid = lo + (hi - lo) / 2;
+                    let below = match self.sort_keys[mid].cmp(&q) {
+                        std::cmp::Ordering::Less => true,
+                        std::cmp::Ordering::Greater => false,
+                        std::cmp::Ordering::Equal => {
+                            let fence_suffix = &self.keys[mid].as_ref()[lcp..];
+                            if inclusive {
+                                fence_suffix <= suffix
+                            } else {
+                                fence_suffix < suffix
+                            }
+                        }
+                    };
+                    if below {
+                        lo = mid + 1;
                     } else {
-                        fence_suffix < suffix
+                        hi = mid;
                     }
-                })
+                }
+                lo
             }
         }
     }
@@ -645,7 +665,15 @@ impl SortedRun {
                     .count(),
                 _ => 0,
             };
-            Arc::new(RunFences { keys, lcp })
+            let sort_keys: Box<[u64]> = keys
+                .iter()
+                .map(|key| crate::partitioned_keyspace::pack_fence_suffix(&key.as_ref()[lcp..]))
+                .collect();
+            Arc::new(RunFences {
+                keys,
+                lcp,
+                sort_keys,
+            })
         })
     }
 
