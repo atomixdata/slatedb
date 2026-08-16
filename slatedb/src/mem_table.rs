@@ -88,8 +88,81 @@ impl<T: RangeBounds<Bytes>> From<T> for KVTableInternalKeyRange {
     }
 }
 
+/// Number of leading key bytes indexed by [`PrefixBloom`]. A query
+/// prefix at least this long can be gated: a negative probe proves no
+/// stored key shares its first `PREFIX_BLOOM_LEN` bytes, so no key can
+/// start with the full prefix. Shorter query prefixes bypass the gate,
+/// and keys shorter than this can never match a gated prefix, so they
+/// are simply not indexed.
+pub(crate) const PREFIX_BLOOM_LEN: usize = 12;
+
+/// Lock-free bloom filter over the first [`PREFIX_BLOOM_LEN`] bytes of
+/// every inserted key. Point-prefix scans probe it to skip the skiplist
+/// search on memtables that cannot contain the prefix - on uniform
+/// workloads that search is a multi-microsecond pointer chase paid by
+/// nearly every read for a ~0.1% hit rate.
+pub(crate) struct PrefixBloom {
+    /// 2^23 bits = 1 MiB per memtable.
+    words: Box<[std::sync::atomic::AtomicU64]>,
+}
+
+impl PrefixBloom {
+    const BITS_LOG2: u32 = 23;
+
+    fn new() -> Self {
+        let words = (0..(1usize << Self::BITS_LOG2) / 64)
+            .map(|_| std::sync::atomic::AtomicU64::new(0))
+            .collect();
+        Self { words }
+    }
+
+    /// Four bit positions from two independent 64-bit hashes, using the
+    /// same SipHash the SST filters use.
+    fn positions(prefix: &[u8]) -> [usize; 4] {
+        use std::hash::Hasher;
+        let mut h1 = siphasher::sip::SipHasher13::new_with_keys(0x51a7_edb1, 0);
+        h1.write(prefix);
+        let a = h1.finish();
+        let mut h2 = siphasher::sip::SipHasher13::new_with_keys(0x0be5_11e5, 1);
+        h2.write(prefix);
+        let b = h2.finish();
+        let mask = (1u64 << Self::BITS_LOG2) - 1;
+        [
+            (a & mask) as usize,
+            ((a >> 32) & mask) as usize,
+            (b & mask) as usize,
+            ((b >> 32) & mask) as usize,
+        ]
+    }
+
+    fn insert(&self, key: &[u8]) {
+        if key.len() < PREFIX_BLOOM_LEN {
+            return;
+        }
+        for pos in Self::positions(&key[..PREFIX_BLOOM_LEN]) {
+            self.words[pos / 64].fetch_or(1u64 << (pos % 64), std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// True if a key starting with `prefix` might be present. Only valid
+    /// for prefixes of at least [`PREFIX_BLOOM_LEN`] bytes.
+    pub(crate) fn might_contain_prefix(&self, prefix: &[u8]) -> bool {
+        debug_assert!(prefix.len() >= PREFIX_BLOOM_LEN);
+        Self::positions(&prefix[..PREFIX_BLOOM_LEN])
+            .iter()
+            .all(|&pos| {
+                self.words[pos / 64].load(std::sync::atomic::Ordering::Relaxed)
+                    & (1u64 << (pos % 64))
+                    != 0
+            })
+    }
+}
+
 pub(crate) struct KVTable {
     map: Arc<SkipMap<SequencedKey, RowEntry>>,
+    /// See [`PrefixBloom`]; probed by point-prefix scans to skip this
+    /// table when it cannot contain the prefix.
+    pub(crate) prefix_bloom: PrefixBloom,
     durable: WatchableOnceCell<Result<(), SlateDBError>>,
     entries_size_in_bytes: AtomicUsize,
     /// this corresponds to the timestamp of the most recent
@@ -341,6 +414,7 @@ impl KVTable {
     pub(crate) fn new() -> Self {
         Self {
             map: Arc::new(SkipMap::new()),
+            prefix_bloom: PrefixBloom::new(),
             entries_size_in_bytes: AtomicUsize::new(0),
             durable: WatchableOnceCell::new(),
             last_tick: AtomicI64::new(i64::MIN),
@@ -418,6 +492,7 @@ impl KVTable {
     }
 
     pub(crate) fn put(&self, row: RowEntry) {
+        self.prefix_bloom.insert(&row.key);
         let internal_key = SequencedKey::new(row.key.clone(), row.seq);
         let previous_size = Cell::new(None);
 
