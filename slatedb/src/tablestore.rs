@@ -142,6 +142,18 @@ impl TableStore {
         bytes.div_ceil(self.sst_format.block_size)
     }
 
+    /// The prefix extractor configured on this store's filter policies, if
+    /// any. Used to build memtable prefix blooms that agree with the SST
+    /// filters on what a key's logical prefix is.
+    pub(crate) fn prefix_extractor(
+        &self,
+    ) -> Option<Arc<dyn crate::prefix_extractor::PrefixExtractor>> {
+        self.sst_format
+            .filter_policies
+            .iter()
+            .find_map(|policy| policy.prefix_extractor())
+    }
+
     pub(crate) async fn last_seen_wal_id(&self) -> Result<u64, SlateDBError> {
         let wal_ssts = self.list_wal_ssts(..).await?;
         let last_wal_id = wal_ssts.last().map(|md| md.id.unwrap_wal_id());

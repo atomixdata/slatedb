@@ -828,6 +828,9 @@ pub(crate) struct DbState {
     /// don't overwrite each other's swap. Held only across the
     /// `load -> mutate -> store` sequence; never across awaits.
     writer: parking_lot::Mutex<()>,
+    /// Extractor handed to each new memtable's prefix bloom; shared with
+    /// the SST filter policy so memtable gating and SST filters agree.
+    prefix_extractor: Option<Arc<dyn crate::prefix_extractor::PrefixExtractor>>,
 }
 
 // represents the state that is mutated by creating a new copy with the mutations
@@ -879,13 +882,23 @@ impl DbStateReader for DbStateView {
 
 impl DbState {
     pub(crate) fn new(manifest: DirtyObject<Manifest>) -> Self {
+        Self::new_with_prefix_extractor(manifest, None)
+    }
+
+    pub(crate) fn new_with_prefix_extractor(
+        manifest: DirtyObject<Manifest>,
+        prefix_extractor: Option<Arc<dyn crate::prefix_extractor::PrefixExtractor>>,
+    ) -> Self {
         Self {
             state: arc_swap::ArcSwap::from_pointee(COWDbState {
-                memtable: Arc::new(WritableKVTable::new()),
+                memtable: Arc::new(WritableKVTable::new_with_prefix_extractor(
+                    prefix_extractor.clone(),
+                )),
                 imm_memtable: VecDeque::new(),
                 manifest,
             }),
             writer: parking_lot::Mutex::new(()),
+            prefix_extractor,
         }
     }
 
@@ -906,8 +919,12 @@ impl DbState {
 
     pub(crate) fn freeze_memtable(&self, recent_flushed_wal_id: u64) {
         self.modify(|cow| {
-            let old_memtable =
-                std::mem::replace(&mut cow.memtable, Arc::new(WritableKVTable::new()));
+            let old_memtable = std::mem::replace(
+                &mut cow.memtable,
+                Arc::new(WritableKVTable::new_with_prefix_extractor(
+                    self.prefix_extractor.clone(),
+                )),
+            );
             cow.imm_memtable
                 .push_front(Arc::new(ImmutableMemtable::from_arc(
                     old_memtable.table().clone(),

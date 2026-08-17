@@ -42,6 +42,13 @@ pub trait FilterPolicy: Send + Sync {
     /// This is a hint used by the SST builder to reserve buffer space before
     /// the filter is built. It does not need to be exact.
     fn estimate_size(&self, num_keys: usize) -> usize;
+
+    /// The prefix extractor this policy hashes with, if any. The memtable
+    /// prefix bloom reuses it so memtable gating and SST filters agree on
+    /// what a key's logical prefix is.
+    fn prefix_extractor(&self) -> Option<Arc<dyn PrefixExtractor>> {
+        None
+    }
 }
 
 /// Accumulator for entries during SST construction that produces a [`Filter`].
@@ -274,6 +281,10 @@ impl FilterPolicy for BloomFilterPolicy {
     fn estimate_size(&self, num_keys: usize) -> usize {
         let num_keys = u32::try_from(num_keys).expect("num_keys should fit in u32");
         BloomFilter::estimate_encoded_size(num_keys, self.bits_per_key)
+    }
+
+    fn prefix_extractor(&self) -> Option<Arc<dyn PrefixExtractor>> {
+        self.prefix_extractor.clone()
     }
 }
 

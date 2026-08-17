@@ -167,7 +167,10 @@ impl DbInner {
         ));
 
         // state are mostly manifest, including IMM, L0, etc.
-        let state = Arc::new(DbState::new(manifest));
+        let state = Arc::new(DbState::new_with_prefix_extractor(
+            manifest,
+            table_store.prefix_extractor(),
+        ));
 
         let db_stats = DbStats::new(&recorder);
         let wal_enabled = DbInner::wal_enabled_in_options(&settings);

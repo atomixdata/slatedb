@@ -255,8 +255,7 @@ impl FencedIndexKeySpace<'_> {
                         std::cmp::Ordering::Greater => false,
                         std::cmp::Ordering::Equal => {
                             let (off, len) = offsets[mid];
-                            let fence_suffix =
-                                &self.data[off as usize + lcp..(off + len) as usize];
+                            let fence_suffix = &self.data[off as usize + lcp..(off + len) as usize];
                             if inclusive {
                                 fence_suffix <= suffix
                             } else {

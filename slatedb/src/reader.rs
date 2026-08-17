@@ -165,19 +165,17 @@ impl Reader {
             memtables.push_back(memtable.table());
         }
         // Point-prefix scans gate each memtable on its prefix bloom: a
-        // negative probe proves no stored key shares the prefix's first
-        // PREFIX_BLOOM_LEN bytes, so the skiplist search (a
-        // multi-microsecond pointer chase on large memtables) is skipped.
-        // Correct under concurrency: entries inserted after the probe are
-        // newer than the scan's sequence snapshot and invisible anyway.
-        let bloom_prefix = sst_iter_options
-            .prefix
-            .as_ref()
-            .filter(|p| p.len() >= crate::mem_table::PREFIX_BLOOM_LEN);
+        // negative probe proves no stored key in the table has the scan
+        // prefix as its extracted logical prefix, so the skiplist search
+        // (a multi-microsecond pointer chase on large memtables) is
+        // skipped. Correct under concurrency: entries inserted after the
+        // probe are newer than the scan's sequence snapshot and invisible
+        // anyway.
+        let bloom_prefix = sst_iter_options.prefix.as_ref();
         let mem_iters = memtables
             .iter()
             .filter(|table| match bloom_prefix {
-                Some(prefix) => table.prefix_bloom.might_contain_prefix(prefix),
+                Some(prefix) => table.may_match_prefix(prefix),
                 None => true,
             })
             .map(|table| {

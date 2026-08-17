@@ -16,6 +16,7 @@ use parking_lot::Mutex;
 
 use crate::error::SlateDBError;
 use crate::iter::{IterationOrder, RowEntryIterator};
+use crate::prefix_extractor::{PrefixExtractor, PrefixTarget};
 use crate::seq_tracker::{SequenceTracker, TrackedSeq};
 use crate::types::RowEntry;
 use crate::utils::{WatchableOnceCell, WatchableOnceCellReader};
@@ -88,19 +89,18 @@ impl<T: RangeBounds<Bytes>> From<T> for KVTableInternalKeyRange {
     }
 }
 
-/// Number of leading key bytes indexed by [`PrefixBloom`]. A query
-/// prefix at least this long can be gated: a negative probe proves no
-/// stored key shares its first `PREFIX_BLOOM_LEN` bytes, so no key can
-/// start with the full prefix. Shorter query prefixes bypass the gate,
-/// and keys shorter than this can never match a gated prefix, so they
-/// are simply not indexed.
-pub(crate) const PREFIX_BLOOM_LEN: usize = 12;
-
-/// Lock-free bloom filter over the first [`PREFIX_BLOOM_LEN`] bytes of
+/// Lock-free bloom filter over the extractor-derived logical prefix of
 /// every inserted key. Point-prefix scans probe it to skip the skiplist
 /// search on memtables that cannot contain the prefix - on uniform
 /// workloads that search is a multi-microsecond pointer chase paid by
 /// nearly every read for a ~0.1% hit rate.
+///
+/// The prefix comes from the same [`PrefixExtractor`] the SST bloom
+/// filters hash with, so a point lookup's scan prefix (an exact logical
+/// key) maps to exactly the bits its stored versions set. A fixed-length
+/// byte prefix does not work here: on keyspaces with a common literal
+/// prefix, the leading bytes carry too little entropy and the filter
+/// saturates to all-positive.
 pub(crate) struct PrefixBloom {
     /// 2^23 bits = 1 MiB per memtable.
     words: Box<[std::sync::atomic::AtomicU64]>,
@@ -135,26 +135,19 @@ impl PrefixBloom {
         ]
     }
 
-    fn insert(&self, key: &[u8]) {
-        if key.len() < PREFIX_BLOOM_LEN {
-            return;
-        }
-        for pos in Self::positions(&key[..PREFIX_BLOOM_LEN]) {
+    fn insert(&self, prefix: &[u8]) {
+        for pos in Self::positions(prefix) {
             self.words[pos / 64].fetch_or(1u64 << (pos % 64), std::sync::atomic::Ordering::Relaxed);
         }
     }
 
-    /// True if a key starting with `prefix` might be present. Only valid
-    /// for prefixes of at least [`PREFIX_BLOOM_LEN`] bytes.
-    pub(crate) fn might_contain_prefix(&self, prefix: &[u8]) -> bool {
-        debug_assert!(prefix.len() >= PREFIX_BLOOM_LEN);
-        Self::positions(&prefix[..PREFIX_BLOOM_LEN])
-            .iter()
-            .all(|&pos| {
-                self.words[pos / 64].load(std::sync::atomic::Ordering::Relaxed)
-                    & (1u64 << (pos % 64))
-                    != 0
-            })
+    /// True if a key whose extracted prefix equals `prefix` might be
+    /// present. Both sides must use the same extractor.
+    fn might_contain_prefix(&self, prefix: &[u8]) -> bool {
+        Self::positions(prefix).iter().all(|&pos| {
+            self.words[pos / 64].load(std::sync::atomic::Ordering::Relaxed) & (1u64 << (pos % 64))
+                != 0
+        })
     }
 }
 
@@ -162,7 +155,11 @@ pub(crate) struct KVTable {
     map: Arc<SkipMap<SequencedKey, RowEntry>>,
     /// See [`PrefixBloom`]; probed by point-prefix scans to skip this
     /// table when it cannot contain the prefix.
-    pub(crate) prefix_bloom: PrefixBloom,
+    prefix_bloom: PrefixBloom,
+    /// Extractor defining the logical prefix indexed by `prefix_bloom`;
+    /// shared with the SST filter policy. `None` disables gating for
+    /// this table (every probe answers "might contain").
+    prefix_extractor: Option<Arc<dyn PrefixExtractor>>,
     durable: WatchableOnceCell<Result<(), SlateDBError>>,
     entries_size_in_bytes: AtomicUsize,
     /// this corresponds to the timestamp of the most recent
@@ -196,8 +193,14 @@ pub(crate) struct WritableKVTable {
 
 impl WritableKVTable {
     pub(crate) fn new() -> Self {
+        Self::new_with_prefix_extractor(None)
+    }
+
+    pub(crate) fn new_with_prefix_extractor(
+        prefix_extractor: Option<Arc<dyn PrefixExtractor>>,
+    ) -> Self {
         Self {
-            table: Arc::new(KVTable::new()),
+            table: Arc::new(KVTable::new_with_prefix_extractor(prefix_extractor)),
         }
     }
 
@@ -399,7 +402,8 @@ impl ImmutableMemtable {
     /// number greater than the given `seq`. [`ImmutableMemtable::recent_flushed_wal_id`]
     /// remains the same.
     pub(crate) fn filter_after_seq(&self, seq: u64) -> Self {
-        let new_table = WritableKVTable::new();
+        let new_table =
+            WritableKVTable::new_with_prefix_extractor(self.table.prefix_extractor.clone());
         let mut table_iter = self.table.iter();
         while let Some(entry) = table_iter.next_sync() {
             if entry.seq > seq {
@@ -412,9 +416,16 @@ impl ImmutableMemtable {
 
 impl KVTable {
     pub(crate) fn new() -> Self {
+        Self::new_with_prefix_extractor(None)
+    }
+
+    pub(crate) fn new_with_prefix_extractor(
+        prefix_extractor: Option<Arc<dyn PrefixExtractor>>,
+    ) -> Self {
         Self {
             map: Arc::new(SkipMap::new()),
             prefix_bloom: PrefixBloom::new(),
+            prefix_extractor,
             entries_size_in_bytes: AtomicUsize::new(0),
             durable: WatchableOnceCell::new(),
             last_tick: AtomicI64::new(i64::MIN),
@@ -491,8 +502,40 @@ impl KVTable {
         iterator
     }
 
+    /// Point-prefix gate: false proves no stored key in this table has
+    /// `prefix` as its extracted logical prefix, letting readers skip the
+    /// skiplist search entirely. True means "might contain" (including
+    /// whenever gating does not apply: no extractor, or the extractor
+    /// declines the prefix).
+    ///
+    /// Soundness relies on the extractor's contract: a scan prefix it
+    /// accepts (`Prefix -> Some`) must only ever match stored keys it also
+    /// indexes (`Point -> Some`) and whose extracted prefix equals the
+    /// scan prefix. `UserKeyPrefixExtractor`-style extractors satisfy this
+    /// by construction (versioned keys strip to exactly the scan prefix;
+    /// unindexed system keys live in a disjoint namespace no user scan
+    /// prefix can reach).
+    pub(crate) fn may_match_prefix(&self, prefix: &Bytes) -> bool {
+        let Some(extractor) = &self.prefix_extractor else {
+            return true;
+        };
+        let Some(len) = extractor.prefix_len(&PrefixTarget::Prefix(prefix.clone())) else {
+            return true;
+        };
+        if len > prefix.len() {
+            return true;
+        }
+        self.prefix_bloom.might_contain_prefix(&prefix[..len])
+    }
+
     pub(crate) fn put(&self, row: RowEntry) {
-        self.prefix_bloom.insert(&row.key);
+        if let Some(extractor) = &self.prefix_extractor {
+            if let Some(len) = extractor.prefix_len(&PrefixTarget::Point(row.key.clone())) {
+                if len <= row.key.len() {
+                    self.prefix_bloom.insert(&row.key[..len]);
+                }
+            }
+        }
         let internal_key = SequencedKey::new(row.key.clone(), row.seq);
         let previous_size = Cell::new(None);
 
@@ -558,6 +601,50 @@ mod tests {
     use crate::{proptest_util, test_utils};
     use rstest::rstest;
     use tokio::runtime::Runtime;
+
+    /// Splits `key\0suffix` at the first zero byte, keeping the separator
+    /// in the prefix; declines targets with no separator.
+    struct SeparatorExtractor;
+
+    impl PrefixExtractor for SeparatorExtractor {
+        fn name(&self) -> &str {
+            "test.separator"
+        }
+
+        fn prefix_len(&self, target: &PrefixTarget) -> Option<usize> {
+            let bytes = match target {
+                PrefixTarget::Point(key) => key,
+                PrefixTarget::Prefix(prefix) => prefix,
+            };
+            bytes.iter().position(|&b| b == 0).map(|pos| pos + 1)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_may_match_prefix() {
+        let table = WritableKVTable::new_with_prefix_extractor(Some(Arc::new(SeparatorExtractor)));
+        table.put(RowEntry::new_value(b"alpha\x00v1", b"value1", 1));
+        table.put(RowEntry::new_value(b"beta\x00v1", b"value2", 2));
+        // No separator: not indexed, and its unextractable shape can never
+        // be reached by an extractable scan prefix.
+        table.put(RowEntry::new_value(b"nosep", b"value3", 3));
+
+        let table = table.table();
+        assert!(table.may_match_prefix(&Bytes::from_static(b"alpha\x00")));
+        assert!(table.may_match_prefix(&Bytes::from_static(b"beta\x00")));
+        assert!(!table.may_match_prefix(&Bytes::from_static(b"gamma\x00")));
+        // Extractor declines (no separator): gate passes conservatively.
+        assert!(table.may_match_prefix(&Bytes::from_static(b"alp")));
+    }
+
+    #[tokio::test]
+    async fn test_may_match_prefix_without_extractor() {
+        let table = WritableKVTable::new();
+        table.put(RowEntry::new_value(b"alpha\x00v1", b"value1", 1));
+        assert!(table
+            .table()
+            .may_match_prefix(&Bytes::from_static(b"zeta\x00")));
+    }
 
     #[tokio::test]
     async fn test_memtable_iter() {
