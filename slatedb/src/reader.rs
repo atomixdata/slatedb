@@ -439,37 +439,40 @@ impl Reader {
             // without constructing an iterator at all. Views without
             // pinned filters fall through to the normal path, whose
             // FilterIterator fetches and pins them for later reads.
+            // Compute the covering views once; the bloom pre-check and the
+            // iterator construction below share the same set.
+            let covering = sr.clone_tables_covering_range(range);
+            if covering.is_empty() {
+                continue 'runs;
+            }
             if let Some(query) = &bloom_query {
-                let covering = sr.tables_covering_range(range.clone());
-                if !covering.is_empty() {
-                    let mut all_pinned = true;
-                    let mut any_match = false;
-                    for view in &covering {
-                        match view.pinned_filters.get() {
-                            Some(filters) => {
-                                if crate::sst_iter::prefix_filters_match(
-                                    filters,
-                                    query,
-                                    Some(&self.db_stats),
-                                ) {
-                                    any_match = true;
-                                    break;
-                                }
-                            }
-                            None => {
-                                all_pinned = false;
+                let mut all_pinned = true;
+                let mut any_match = false;
+                for view in &covering {
+                    match view.pinned_filters.get() {
+                        Some(filters) => {
+                            if crate::sst_iter::prefix_filters_match(
+                                filters,
+                                query,
+                                Some(&self.db_stats),
+                            ) {
+                                any_match = true;
                                 break;
                             }
                         }
-                    }
-                    if all_pinned && !any_match {
-                        continue 'runs;
+                        None => {
+                            all_pinned = false;
+                            break;
+                        }
                     }
                 }
+                if all_pinned && !any_match {
+                    continue 'runs;
+                }
             }
-            let iter = SortedRunIterator::new_owned(
+            let iter = SortedRunIterator::new_from_covering(
+                covering,
                 range.clone(),
-                sr.clone(),
                 self.table_store.clone(),
                 sst_iter_options.clone(),
                 Some(self.db_stats.clone()),

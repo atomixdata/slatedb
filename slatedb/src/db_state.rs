@@ -801,6 +801,15 @@ impl SortedRun {
         &self.sst_views[matching_range]
     }
 
+    /// Owned covering views for `range`, without consuming the run. Lets
+    /// the read path compute the covering set once and hand it to both the
+    /// bloom pre-check and the iterator, instead of recomputing per
+    /// consumer.
+    pub(crate) fn clone_tables_covering_range(&self, range: &BytesRange) -> VecDeque<SsTableView> {
+        let matching_range = self.table_idx_covering_range(range);
+        self.sst_views[matching_range].iter().cloned().collect()
+    }
+
     pub(crate) fn into_tables_covering_range(self, range: &BytesRange) -> VecDeque<SsTableView> {
         let matching_range = self.table_idx_covering_range(range);
         // `sst_views` is shared behind an `Arc`, so we clone only the few

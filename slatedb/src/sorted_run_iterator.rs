@@ -97,6 +97,19 @@ impl<'a> SortedRunIterator<'a> {
     ) -> Result<Self, SlateDBError> {
         let range = BytesRange::from(range);
         let tables = sorted_run.into_tables_covering_range(&range);
+        Self::new_from_covering(tables, range, table_store, sst_iter_options, db_stats).await
+    }
+
+    /// Builds an iterator from an already-computed covering view set,
+    /// letting callers that needed the covering views anyway (e.g. for a
+    /// bloom pre-check) avoid recomputing them here.
+    pub(crate) async fn new_from_covering(
+        tables: VecDeque<SsTableView>,
+        range: BytesRange,
+        table_store: Arc<TableStore>,
+        sst_iter_options: SstIteratorOptions,
+        db_stats: Option<DbStats>,
+    ) -> Result<Self, SlateDBError> {
         let view = SortedRunView::Owned(tables, range);
         SortedRunIterator::new(view, table_store, sst_iter_options, db_stats).await
     }
