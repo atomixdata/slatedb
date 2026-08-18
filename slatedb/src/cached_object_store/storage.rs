@@ -96,6 +96,13 @@ pub trait LocalCacheEntry: Send + Sync + std::fmt::Debug + 'static {
 
     async fn read_head(&self) -> object_store::Result<Option<(ObjectMeta, Attributes)>>;
 
+    /// Warms the file-handle cache for this entry by opening its on-disk head
+    /// and part files, and returns the cached head metadata if present. Used at
+    /// startup to preload handles for SSTs that are already on disk, so the
+    /// first reads after a restart do not pay an `open` per file. Best-effort:
+    /// handles that fail to open are skipped; a missing head returns `None`.
+    async fn warm(&self) -> object_store::Result<Option<(ObjectMeta, Attributes)>>;
+
     /// Deletes this cache entry from the associated cache on the best effort
     /// basis. If some error happens during the deletion, it's logged instead
     /// of being reported to the caller.
