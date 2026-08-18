@@ -77,6 +77,15 @@ impl ReadTrace {
         self.read_span.clone()
     }
 
+    /// Whether tracing is on for this read.
+    ///
+    /// When it is off, callers await the future directly instead of wrapping
+    /// it in `Instrumented`, whose per-poll enter/exit is measurable on the
+    /// read path.
+    pub(crate) fn is_enabled(&self) -> bool {
+        self.tracing_options.is_some()
+    }
+
     pub(crate) fn new_memtable_span(&self) -> tracing::Span {
         if let Some(tracing_options) = self.tracing_options.as_ref() {
             tracing::debug_span!(
@@ -359,7 +368,11 @@ impl Reader {
             max_seq,
             read_trace.clone(),
         );
-        read.instrument(read_trace.read_span()).await
+        if read_trace.is_enabled() {
+            read.instrument(read_trace.read_span()).await
+        } else {
+            read.await
+        }
     }
 
     async fn get_key_value_with_options_inner<K: AsRef<[u8]>>(
@@ -445,7 +458,11 @@ impl Reader {
     ) -> Result<DbIterator, SlateDBError> {
         let read_trace = Self::read_trace(options.tracing_options.as_ref());
         let read = self.scan_with_options_inner(range, options, ctx, read_trace.clone());
-        read.instrument(read_trace.read_span()).await
+        if read_trace.is_enabled() {
+            read.instrument(read_trace.read_span()).await
+        } else {
+            read.await
+        }
     }
 
     async fn scan_with_options_inner(
@@ -528,7 +545,11 @@ impl Reader {
             db_state,
             read_trace.clone(),
         );
-        read.instrument(read_trace.read_span()).await
+        if read_trace.is_enabled() {
+            read.instrument(read_trace.read_span()).await
+        } else {
+            read.await
+        }
     }
 
     async fn scan_prefix_by_recency_with_options_inner(

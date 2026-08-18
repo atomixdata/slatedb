@@ -40,11 +40,30 @@ use async_trait::async_trait;
 use std::sync::Arc;
 use sysinfo::{CpuRefreshKind, System};
 
+/// Which entry a [`FoyerCache`] evicts when it is full.
+///
+/// Declared here rather than re-exporting foyer's config types, so the
+/// choice is part of SlateDB's own API.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FoyerEvictionPolicy {
+    /// Evict the least recently used entry.
+    #[default]
+    Lru,
+    /// Evict in insertion order, ignoring reads.
+    ///
+    /// A read is only a lookup: there is no recency list to update under
+    /// the shard lock, which makes hits cheaper than under [`Self::Lru`].
+    /// Worth choosing for a cache sized to hold its whole working set,
+    /// where the policy never actually has to pick a victim.
+    Fifo,
+}
+
 /// The options for the Foyer cache.
 #[derive(Clone, Copy, Debug)]
 pub struct FoyerCacheOptions {
     pub max_capacity: u64,
     pub shards: usize,
+    pub eviction_policy: FoyerEvictionPolicy,
 }
 
 impl Default for FoyerCacheOptions {
@@ -56,6 +75,7 @@ impl Default for FoyerCacheOptions {
                 sys.refresh_cpu_specifics(CpuRefreshKind::nothing());
                 sys.cpus().len()
             },
+            eviction_policy: FoyerEvictionPolicy::default(),
         }
     }
 }
@@ -85,11 +105,16 @@ impl FoyerCache {
     }
 
     pub fn new_with_opts(options: FoyerCacheOptions) -> Self {
-        let cache = foyer::CacheBuilder::new(options.max_capacity as _)
+        let builder = foyer::CacheBuilder::new(options.max_capacity as _)
             .with_weighter(|_, v: &CachedEntry| v.size())
-            .with_shards(options.shards)
-            .build();
-        Self { inner: cache }
+            .with_shards(options.shards);
+        let builder = match options.eviction_policy {
+            FoyerEvictionPolicy::Lru => builder.with_eviction_config(foyer::LruConfig::default()),
+            FoyerEvictionPolicy::Fifo => builder.with_eviction_config(foyer::FifoConfig::default()),
+        };
+        Self {
+            inner: builder.build(),
+        }
     }
 }
 
