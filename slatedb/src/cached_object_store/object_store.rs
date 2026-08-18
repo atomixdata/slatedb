@@ -1,3 +1,4 @@
+use crate::cached_object_store::head_cache::HeadCache;
 use crate::cached_object_store::policy::{
     CachePutConfig, DefaultGetPolicy, DefaultPutPolicy, GetAction, GetPolicy, HeadAction,
     PutAction, PutPolicy,
@@ -69,6 +70,9 @@ pub struct CachedObjectStore {
     // Deduplicates concurrent fetches of the same part after a cache miss.
     // Keyed on (path, part_id) so multiple readers needing the same part share one fetch.
     part_flights: SingleFlight<(Path, PartID), Bytes>,
+    // In-memory HEAD cache in front of the on-disk head cache. Populated on
+    // writes and read-through fills; serves HEAD requests without disk I/O.
+    head_cache: Arc<HeadCache>,
 }
 
 impl CachedObjectStore {
@@ -116,6 +120,7 @@ impl CachedObjectStore {
             head_flights: SingleFlight::new(),
             prefetch_flights: SingleFlight::new(),
             part_flights: SingleFlight::new(),
+            head_cache: Arc::new(HeadCache::new()),
         }))
     }
 
@@ -222,13 +227,23 @@ impl CachedObjectStore {
         }
 
         // Second pass: load the selected files in bounded parallelism and cache
-        // them, then warm the file-handle cache for each. The handles are warmed
-        // even when the file was already on disk, so a restart against a warm
-        // disk cache still primes the descriptors.
+        // them, then warm the file-handle cache and the in-memory head cache for
+        // each. Both are warmed even when the file was already on disk, so a
+        // restart against a warm disk cache still primes the in-memory tiers.
         let degree_of_parallelism = 32;
         let _result = build_concurrent(files_to_load.into_iter(), degree_of_parallelism, |path| {
             let this = self.clone();
             async move {
+                // An in-memory head recorded by an uncached write would make
+                // maybe_prefetch_range take its fast path and skip fetching,
+                // leaving no parts on disk. Preload's job is to materialize the
+                // parts, so drop the in-memory head when the disk entry is
+                // missing.
+                let entry = this.cache_storage.entry(&path, this.part_size_bytes);
+                if !matches!(entry.read_head().await, Ok(Some(_))) {
+                    this.head_cache.remove(&path);
+                }
+
                 // Ensure the object's parts are on disk (a no-op if already cached).
                 if let Err(e) = this
                     .maybe_prefetch_range(&path, GetOptions::default())
@@ -241,10 +256,16 @@ impl CachedObjectStore {
                     return Ok(None); // best-effort: skip errors
                 }
 
-                // Open (and cache) the head and part file handles.
-                let entry = this.cache_storage.entry(&path, this.part_size_bytes);
-                if let Err(e) = entry.warm().await {
-                    warn!("Failed to warm file handles [path={}, error={:?}]", path, e);
+                // Open (and cache) the head and part file handles, and prime the
+                // in-memory head from the on-disk head the warm pass read.
+                match entry.warm().await {
+                    Ok(Some((meta, attributes))) => {
+                        this.head_cache.insert(&path, meta, attributes);
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        warn!("Failed to warm caches [path={}, error={:?}]", path, e);
+                    }
                 }
                 Ok(Some(()))
             }
@@ -259,6 +280,16 @@ impl CachedObjectStore {
         location: &Path,
         admit_on_miss: bool,
     ) -> object_store::Result<GetResult> {
+        // In-memory head cache: skips both the on-disk head read and the
+        // upstream HEAD round trip.
+        if let Some(head) = self.head_cache.get(location) {
+            return Ok(head_only_get_result(
+                head.meta.clone(),
+                head.attributes.clone(),
+                Extensions::new(),
+            ));
+        }
+
         let entry = self.cache_storage.entry(location, self.part_size_bytes);
         if let Ok(Some((meta, attributes))) = entry.read_head().await {
             return Ok(head_only_get_result(meta, attributes, Extensions::new()));
@@ -347,17 +378,26 @@ impl CachedObjectStore {
         payload: PutPayload,
         opts: PutOptions,
     ) -> object_store::Result<PutResult> {
-        // The per-call tag decides whether this write is cached.
+        // The per-call tag decides whether the payload is cached on disk. The
+        // in-memory head is populated on every write regardless — it is cheap
+        // and lets later HEADs skip the upstream round trip even for objects
+        // whose payload we don't cache.
         let tag = ObjectStoreCallTag::from_extensions(&opts.extensions);
-        if self.put_policy.put_action(tag.as_ref()) == PutAction::Skip {
-            // Write directly to upstream without caching the payload.
-            return self.object_store.put_opts(location, payload, opts).await;
-        }
+        let cache_payload = self.put_policy.put_action(tag.as_ref()) != PutAction::Skip;
 
         // Capture the size and attributes before payload/opts are consumed: they
-        // go into the head we write below.
+        // go into the head we record below.
         let payload_size = payload.content_length() as u64;
         let attributes = opts.attributes.clone();
+
+        if !cache_payload {
+            // Write directly to upstream without caching the payload, but still
+            // record the head in memory.
+            let result = self.object_store.put_opts(location, payload, opts).await?;
+            let meta = build_head(location, payload_size, &result);
+            self.head_cache.insert(location, meta, attributes);
+            return Ok(result);
+        }
 
         // First, write to the upstream object store.
         let result = self
@@ -376,6 +416,8 @@ impl CachedObjectStore {
         // head with the known size and attributes.
         let meta = build_head(location, payload_size, &result);
         entry.save_head((&meta, &attributes)).await.ok();
+        // Populate the in-memory head cache so subsequent HEADs skip disk I/O.
+        self.head_cache.insert(location, meta, attributes);
 
         Ok(result)
     }
@@ -391,15 +433,35 @@ impl CachedObjectStore {
         location: &Path,
         mut opts: GetOptions,
     ) -> object_store::Result<PrefetchedHead> {
+        // Fast path: an in-memory head (populated by preload's `warm()` and by
+        // writes) lets a read skip the on-disk head entirely - no
+        // spawn_blocking, no file-handle lock, no JSON parse. An in-memory head
+        // does not by itself prove every part is on disk, but `read_part` falls
+        // back to the object store for any absent part, so trusting it here
+        // stays correct while avoiding the per-read head read that otherwise
+        // dominates the miss path once head files fall out of the OS page cache.
+        if let Some(head) = self.head_cache.get(location) {
+            return Ok(PrefetchedHead {
+                meta: head.meta.clone(),
+                attributes: head.attributes.clone(),
+                extensions: Extensions::new(),
+                head_source: ReadResultSource::Disk,
+            });
+        }
+
         let entry = self.cache_storage.entry(location, self.part_size_bytes);
         match entry.read_head().await {
             Ok(Some((meta, attrs))) => {
+                // Prime the in-memory head so later reads take the fast path
+                // above instead of re-reading and re-parsing the on-disk head.
+                self.head_cache
+                    .insert(location, meta.clone(), attrs.clone());
                 return Ok(PrefetchedHead {
                     meta,
                     attributes: attrs,
                     extensions: Extensions::new(),
                     head_source: ReadResultSource::Disk,
-                })
+                });
             }
             Ok(None) => {}
             Err(e) => {
@@ -915,6 +977,7 @@ impl ObjectStore for CachedObjectStore {
             location.clone(),
             self.part_size_bytes,
             attributes,
+            Arc::clone(&self.head_cache),
         )))
     }
 
@@ -937,13 +1000,18 @@ impl ObjectStore for CachedObjectStore {
     ) -> BoxStream<'static, object_store::Result<Path>> {
         let cache_storage = self.cache_storage.clone();
         let part_size_bytes = self.part_size_bytes;
+        let head_cache = self.head_cache.clone();
 
         self.object_store
             .delete_stream(locations)
             .then(move |result| {
                 let cache_storage = cache_storage.clone();
+                let head_cache = head_cache.clone();
                 async move {
                     if let Ok(ref location) = result {
+                        // Evict the in-memory head first so a concurrent reader
+                        // can't pick up stale metadata for a deleted object.
+                        head_cache.remove(location);
                         let entry = cache_storage.entry(location, part_size_bytes);
                         entry.delete().await;
                     }
@@ -975,7 +1043,12 @@ impl ObjectStore for CachedObjectStore {
         to: &Path,
         options: CopyOptions,
     ) -> object_store::Result<()> {
-        self.object_store.copy_opts(from, to, options).await
+        let result = self.object_store.copy_opts(from, to, options).await;
+        if result.is_ok() {
+            // The destination now holds different content; drop any stale head.
+            self.head_cache.remove(to);
+        }
+        result
     }
 
     async fn rename_opts(
@@ -984,7 +1057,13 @@ impl ObjectStore for CachedObjectStore {
         to: &Path,
         options: RenameOptions,
     ) -> object_store::Result<()> {
-        self.object_store.rename_opts(from, to, options).await
+        let result = self.object_store.rename_opts(from, to, options).await;
+        if result.is_ok() {
+            // `from` no longer exists and `to` holds new content.
+            self.head_cache.remove(from);
+            self.head_cache.remove(to);
+        }
+        result
     }
 }
 
@@ -1017,6 +1096,9 @@ struct CachingMultipartUpload {
     total_len: u64,
     /// Attributes from the upload options, echoed into the committed head.
     attributes: Attributes,
+    /// In-memory head cache to populate on commit, shared with the owning
+    /// [`CachedObjectStore`].
+    head_cache: Arc<HeadCache>,
 }
 
 impl CachingMultipartUpload {
@@ -1026,6 +1108,7 @@ impl CachingMultipartUpload {
         cache_location: Path,
         part_size: usize,
         attributes: Attributes,
+        head_cache: Arc<HeadCache>,
     ) -> Self {
         Self {
             inner,
@@ -1036,6 +1119,7 @@ impl CachingMultipartUpload {
             next_part: 0,
             total_len: 0,
             attributes,
+            head_cache,
         }
     }
 }
@@ -1105,6 +1189,10 @@ impl MultipartUpload for CachingMultipartUpload {
         // serve from the cache instead of doing an upstream HEAD and re-prefetch.
         let meta = build_head(&self.cache_location, self.total_len, &result);
         entry.save_head((&meta, &self.attributes)).await.ok();
+        // Publish the head to the in-memory cache too, so the first reader
+        // skips the on-disk head read and any upstream HEAD.
+        self.head_cache
+            .insert(&self.cache_location, meta, self.attributes.clone());
         Ok(result)
     }
 
@@ -1237,7 +1325,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_load_files_to_cache_warms_file_handles() {
+    async fn test_load_files_to_cache_warms_head_and_handle_caches() {
         let location = Path::from("warm-sst");
         // Object spanning multiple parts at a 1024-byte part size.
         let payload = Bytes::from(vec![3_u8; 4096]);
@@ -1267,6 +1355,8 @@ mod tests {
         )
         .unwrap();
 
+        // Nothing warm before the preload.
+        assert!(cached_store.head_cache.get(&location).is_none());
         assert_eq!(fs_storage.file_handle_cache_population(), 0);
 
         cached_store
@@ -1274,11 +1364,64 @@ mod tests {
             .await
             .unwrap();
 
+        // In-memory head cache populated with the correct size.
+        let head = cached_store
+            .head_cache
+            .get(&location)
+            .expect("head cache should be warmed");
+        assert_eq!(head.meta.size, 4096);
         // File-handle cache warmed: the head file plus 4 part files.
         assert!(
             fs_storage.file_handle_cache_population() >= 5,
             "expected head + 4 parts warmed, got {}",
             fs_storage.file_handle_cache_population()
+        );
+
+        // Already-on-disk path: drop the in-memory head, preload again, and it
+        // must be re-warmed from the on-disk head without an upstream fetch.
+        cached_store.head_cache.remove(&location);
+        cached_store
+            .load_files_to_cache(vec![location.clone()], usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            cached_store
+                .head_cache
+                .get(&location)
+                .expect("head cache re-warmed from disk")
+                .meta
+                .size,
+            4096
+        );
+    }
+
+    #[tokio::test]
+    async fn test_head_cache_populated_on_write_and_evicted_on_delete() {
+        let location = Path::from("head-cache-obj");
+        let object_store = Arc::new(object_store::memory::InMemory::new());
+        let cached_store = new_cached_store(object_store);
+
+        // Nothing cached before the write.
+        assert!(cached_store.head_cache.get(&location).is_none());
+
+        // Writing through the cached store populates the in-memory head.
+        let payload = PutPayload::from_bytes(Bytes::from(vec![9_u8; 4096]));
+        cached_store.put(&location, payload).await.unwrap();
+        let head = cached_store
+            .head_cache
+            .get(&location)
+            .expect("write should populate the in-memory head cache");
+        assert_eq!(head.meta.size, 4096);
+
+        // A HEAD served from the in-memory cache returns the correct size.
+        let head = cached_store.head(&location).await.unwrap();
+        assert_eq!(head.size, 4096);
+
+        // Deleting the object evicts the in-memory head.
+        cached_store.delete(&location).await.unwrap();
+        assert!(
+            cached_store.head_cache.get(&location).is_none(),
+            "delete should evict the in-memory head"
         );
     }
 
