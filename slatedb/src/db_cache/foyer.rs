@@ -37,11 +37,30 @@ use async_trait::async_trait;
 use std::sync::Arc;
 use sysinfo::{CpuRefreshKind, System};
 
+/// Which entry a [`FoyerCache`] evicts when it is full.
+///
+/// Declared here rather than re-exporting foyer's config types, so the
+/// choice is part of SlateDB's own API.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FoyerEvictionPolicy {
+    /// Evict the least recently used entry.
+    #[default]
+    Lru,
+    /// Evict in insertion order, ignoring reads.
+    ///
+    /// A read is only a lookup: there is no recency list to update under
+    /// the shard lock, which makes hits cheaper than under [`Self::Lru`].
+    /// Worth choosing for a cache sized to hold its whole working set,
+    /// where the policy never actually has to pick a victim.
+    Fifo,
+}
+
 /// The options for the Foyer cache.
 #[derive(Clone, Copy, Debug)]
 pub struct FoyerCacheOptions {
     pub max_capacity: u64,
     pub shards: usize,
+    pub eviction_policy: FoyerEvictionPolicy,
 }
 
 impl Default for FoyerCacheOptions {
@@ -53,6 +72,7 @@ impl Default for FoyerCacheOptions {
                 sys.refresh_cpu_specifics(CpuRefreshKind::nothing());
                 sys.cpus().len()
             },
+            eviction_policy: FoyerEvictionPolicy::default(),
         }
     }
 }
@@ -82,11 +102,16 @@ impl FoyerCache {
     }
 
     pub fn new_with_opts(options: FoyerCacheOptions) -> Self {
-        let cache = foyer::CacheBuilder::new(options.max_capacity as _)
+        let builder = foyer::CacheBuilder::new(options.max_capacity as _)
             .with_weighter(|_, v: &CachedEntry| v.size())
-            .with_shards(options.shards)
-            .build();
-        Self { inner: cache }
+            .with_shards(options.shards);
+        let builder = match options.eviction_policy {
+            FoyerEvictionPolicy::Lru => builder.with_eviction_config(foyer::LruConfig::default()),
+            FoyerEvictionPolicy::Fifo => builder.with_eviction_config(foyer::FifoConfig::default()),
+        };
+        Self {
+            inner: builder.build(),
+        }
     }
 }
 
@@ -180,5 +205,47 @@ impl FoyerCache {
             Ok(entry) => Ok(entry.value().clone()),
             Err(err) => Err(SlateDBError::FoyerError(Arc::new(err)).into()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::format::block::Block;
+    use bytes::Bytes;
+    use rstest::rstest;
+
+    fn block_entry() -> CachedEntry {
+        CachedEntry::with_block(Arc::new(Block {
+            data: Bytes::from_static(b"block"),
+            offsets: vec![0],
+        }))
+    }
+
+    /// Both policies serve what they store; the option only decides which
+    /// entry leaves once the cache is full.
+    #[rstest]
+    #[case(FoyerEvictionPolicy::Lru)]
+    #[case(FoyerEvictionPolicy::Fifo)]
+    #[tokio::test]
+    async fn test_new_with_opts_eviction_policy(#[case] eviction_policy: FoyerEvictionPolicy) {
+        let cache = FoyerCache::new_with_opts(FoyerCacheOptions {
+            eviction_policy,
+            shards: 2,
+            ..Default::default()
+        });
+        let key = CachedKey::from((crate::db_state::SsTableId::Wal(1), 0u64));
+
+        cache.insert(key.clone(), block_entry()).await;
+
+        assert!(cache.get_block(&key).await.unwrap().is_some());
+    }
+
+    #[test]
+    fn test_foyer_cache_options_default_eviction_policy() {
+        assert_eq!(
+            FoyerCacheOptions::default().eviction_policy,
+            FoyerEvictionPolicy::Lru
+        );
     }
 }
