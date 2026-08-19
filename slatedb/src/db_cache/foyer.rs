@@ -34,7 +34,11 @@
 use crate::db_cache::{CacheLoader, CachedEntry, CachedKey, DbCache, DEFAULT_MAX_CAPACITY};
 use crate::error::SlateDBError;
 use async_trait::async_trait;
+use slatedb_common::metrics::{
+    HistogramFn, MetricsRecorder, MetricsRecorderHelper, LATENCY_BOUNDARIES,
+};
 use std::sync::Arc;
+use std::time::Instant;
 use sysinfo::{CpuRefreshKind, System};
 
 /// Which entry a [`FoyerCache`] evicts when it is full.
@@ -77,6 +81,41 @@ impl Default for FoyerCacheOptions {
     }
 }
 
+/// Name of the histogram timing a cache lookup that does not load.
+pub const CACHE_GET_DURATION: &str = "slatedb.db_cache.get_duration";
+/// Name of the histogram timing a lookup that may load through the loader.
+pub const CACHE_FETCH_DURATION: &str = "slatedb.db_cache.fetch_duration";
+
+/// Latency histograms for [`FoyerCache`].
+///
+/// Separating the two paths matters under concurrency: `get` is a pure
+/// in-memory lookup, while `fetch` may run the loader or, when another task
+/// is already loading the same key, wait on that task's result. Time that
+/// shows up only in `fetch` is time spent coalescing, not reading.
+#[derive(Clone)]
+struct FoyerCacheStats {
+    get_duration: Arc<dyn HistogramFn>,
+    fetch_duration: Arc<dyn HistogramFn>,
+}
+
+impl FoyerCacheStats {
+    fn new(recorder: &MetricsRecorderHelper) -> Self {
+        Self {
+            get_duration: recorder
+                .histogram(CACHE_GET_DURATION, LATENCY_BOUNDARIES)
+                .description("Latency of an in-memory cache lookup, in seconds")
+                .register(),
+            fetch_duration: recorder
+                .histogram(CACHE_FETCH_DURATION, LATENCY_BOUNDARIES)
+                .description(
+                    "Latency of a cache lookup including loading or waiting on \
+                     a concurrent load, in seconds",
+                )
+                .register(),
+        }
+    }
+}
+
 /// A cache implementation using the Foyer library.
 ///
 /// This struct wraps a Foyer cache, providing an in-memory caching solution
@@ -94,6 +133,7 @@ impl Default for FoyerCacheOptions {
 /// It uses a custom weigher to account for the size of cached blocks.
 pub struct FoyerCache {
     inner: foyer::Cache<CachedKey, CachedEntry>,
+    stats: FoyerCacheStats,
 }
 
 impl FoyerCache {
@@ -102,6 +142,21 @@ impl FoyerCache {
     }
 
     pub fn new_with_opts(options: FoyerCacheOptions) -> Self {
+        Self::new_with_opts_and_recorder(options, MetricsRecorderHelper::noop())
+    }
+
+    /// Builds a cache that reports its latencies to `recorder`.
+    pub fn with_recorder(options: FoyerCacheOptions, recorder: Arc<dyn MetricsRecorder>) -> Self {
+        Self::new_with_opts_and_recorder(
+            options,
+            MetricsRecorderHelper::new(recorder, Default::default()),
+        )
+    }
+
+    fn new_with_opts_and_recorder(
+        options: FoyerCacheOptions,
+        recorder: MetricsRecorderHelper,
+    ) -> Self {
         let builder = foyer::CacheBuilder::new(options.max_capacity as _)
             .with_weighter(|_, v: &CachedEntry| v.size())
             .with_shards(options.shards);
@@ -111,7 +166,18 @@ impl FoyerCache {
         };
         Self {
             inner: builder.build(),
+            stats: FoyerCacheStats::new(&recorder),
         }
+    }
+
+    /// Times an in-memory lookup with no loader involved.
+    fn timed_get(&self, key: &CachedKey) -> Option<CachedEntry> {
+        let started = Instant::now();
+        let entry = self.inner.get(key).map(|entry| entry.value().clone());
+        self.stats
+            .get_duration
+            .record(started.elapsed().as_secs_f64());
+        entry
     }
 }
 
@@ -124,19 +190,19 @@ impl Default for FoyerCache {
 #[async_trait]
 impl DbCache for FoyerCache {
     async fn get_block(&self, key: &CachedKey) -> Result<Option<CachedEntry>, crate::Error> {
-        Ok(self.inner.get(key).map(|entry| entry.value().clone()))
+        Ok(self.timed_get(key))
     }
 
     async fn get_index(&self, key: &CachedKey) -> Result<Option<CachedEntry>, crate::Error> {
-        Ok(self.inner.get(key).map(|entry| entry.value().clone()))
+        Ok(self.timed_get(key))
     }
 
     async fn get_filter(&self, key: &CachedKey) -> Result<Option<CachedEntry>, crate::Error> {
-        Ok(self.inner.get(key).map(|entry| entry.value().clone()))
+        Ok(self.timed_get(key))
     }
 
     async fn get_stats(&self, key: &CachedKey) -> Result<Option<CachedEntry>, crate::Error> {
-        Ok(self.inner.get(key).map(|entry| entry.value().clone()))
+        Ok(self.timed_get(key))
     }
 
     async fn insert(&self, key: CachedKey, value: CachedEntry) {
@@ -198,10 +264,15 @@ impl FoyerCache {
         key: CachedKey,
         loader: CacheLoader,
     ) -> Result<CachedEntry, crate::Error> {
+        let started = Instant::now();
         let fetch = self
             .inner
             .get_or_fetch(&key, move || async move { loader().await });
-        match fetch.await {
+        let result = fetch.await;
+        self.stats
+            .fetch_duration
+            .record(started.elapsed().as_secs_f64());
+        match result {
             Ok(entry) => Ok(entry.value().clone()),
             Err(err) => Err(SlateDBError::FoyerError(Arc::new(err)).into()),
         }

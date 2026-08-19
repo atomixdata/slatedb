@@ -1,4 +1,6 @@
-use slatedb_common::metrics::{CounterFn, GaugeFn, MetricsRecorderHelper};
+use slatedb_common::metrics::{
+    CounterFn, GaugeFn, HistogramFn, MetricsRecorderHelper, LATENCY_BOUNDARIES,
+};
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
@@ -9,6 +11,7 @@ macro_rules! oscache_stat_name {
 }
 
 pub const PART_HIT_COUNT: &str = oscache_stat_name!("part_hit_count");
+pub const PART_DISK_READ_DURATION: &str = oscache_stat_name!("part_disk_read_duration");
 pub const PART_ACCESS_COUNT: &str = oscache_stat_name!("part_access_count");
 pub const CACHE_KEYS: &str = oscache_stat_name!("cache_keys");
 pub const CACHE_BYTES: &str = oscache_stat_name!("cache_bytes");
@@ -18,6 +21,10 @@ pub const EVICTED_BYTES: &str = oscache_stat_name!("evicted_bytes");
 #[derive(Clone)]
 pub struct CachedObjectStoreStats {
     pub(super) object_store_cache_part_hits: Arc<dyn CounterFn>,
+    /// Latency of serving a part from the local disk cache, covering only
+    /// reads that hit. A miss falls through to the object store and is
+    /// timed by the object store's own request metrics instead.
+    pub(super) object_store_cache_part_disk_read_duration: Arc<dyn HistogramFn>,
     pub(super) object_store_cache_part_access: Arc<dyn CounterFn>,
     pub(super) object_store_cache_keys: Arc<dyn GaugeFn>,
     pub(super) object_store_cache_bytes: Arc<dyn GaugeFn>,
@@ -29,6 +36,7 @@ impl Debug for CachedObjectStoreStats {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CachedObjectStoreStats")
             .field("object_store_cache_part_hits", &"<counter>")
+            .field("object_store_cache_part_disk_read_duration", &"<histogram>")
             .field("object_store_cache_part_access", &"<counter>")
             .field("object_store_cache_keys", &"<gauge>")
             .field("object_store_cache_bytes", &"<gauge>")
@@ -42,6 +50,10 @@ impl CachedObjectStoreStats {
     pub(crate) fn new(recorder: &MetricsRecorderHelper) -> Self {
         Self {
             object_store_cache_part_hits: recorder.counter(PART_HIT_COUNT).register(),
+            object_store_cache_part_disk_read_duration: recorder
+                .histogram(PART_DISK_READ_DURATION, LATENCY_BOUNDARIES)
+                .description("Latency of a disk cache part read that hit, in seconds")
+                .register(),
             object_store_cache_part_access: recorder.counter(PART_ACCESS_COUNT).register(),
             object_store_cache_keys: recorder.gauge(CACHE_KEYS).register(),
             object_store_cache_bytes: recorder.gauge(CACHE_BYTES).register(),

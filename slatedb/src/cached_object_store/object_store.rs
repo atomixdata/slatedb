@@ -627,7 +627,12 @@ impl CachedObjectStore {
         Box::pin(async move {
             let entry = this.cache_storage.entry(&location, this.part_size_bytes);
             if !force_refresh {
-                if let Ok(Some(bytes)) = entry.read_part(part_id, range_in_part.clone()).await {
+                let started = std::time::Instant::now();
+                let read = entry.read_part(part_id, range_in_part.clone()).await;
+                if let Ok(Some(bytes)) = read {
+                    this.stats
+                        .object_store_cache_part_disk_read_duration
+                        .record(started.elapsed().as_secs_f64());
                     return Ok((bytes, ReadResultSource::Disk));
                 }
             }
