@@ -8,6 +8,8 @@ macro_rules! oscache_stat_name {
     };
 }
 
+pub const HEAD_HIT_COUNT: &str = oscache_stat_name!("head_hit_count");
+pub const HEAD_ACCESS_COUNT: &str = oscache_stat_name!("head_access_count");
 pub const PART_HIT_COUNT: &str = oscache_stat_name!("part_hit_count");
 pub const PART_ACCESS_COUNT: &str = oscache_stat_name!("part_access_count");
 pub const CACHE_KEYS: &str = oscache_stat_name!("cache_keys");
@@ -17,6 +19,14 @@ pub const EVICTED_BYTES: &str = oscache_stat_name!("evicted_bytes");
 
 #[derive(Clone)]
 pub struct CachedObjectStoreStats {
+    /// Head-metadata lookups that were served locally. A head fetch is the
+    /// first thing `cached_get_opts` does for any read, so on a miss it falls
+    /// through to an upstream HEAD with multi-second tail latency. The gap
+    /// between `head_access_count` and `head_hit_count` is the count of those
+    /// round-trips, and it is not visible in the part counters: heads and
+    /// parts go through separate code paths.
+    pub(super) object_store_cache_head_hits: Arc<dyn CounterFn>,
+    pub(super) object_store_cache_head_access: Arc<dyn CounterFn>,
     pub(super) object_store_cache_part_hits: Arc<dyn CounterFn>,
     pub(super) object_store_cache_part_access: Arc<dyn CounterFn>,
     pub(super) object_store_cache_keys: Arc<dyn GaugeFn>,
@@ -28,6 +38,8 @@ pub struct CachedObjectStoreStats {
 impl Debug for CachedObjectStoreStats {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CachedObjectStoreStats")
+            .field("object_store_cache_head_hits", &"<counter>")
+            .field("object_store_cache_head_access", &"<counter>")
             .field("object_store_cache_part_hits", &"<counter>")
             .field("object_store_cache_part_access", &"<counter>")
             .field("object_store_cache_keys", &"<gauge>")
@@ -41,6 +53,8 @@ impl Debug for CachedObjectStoreStats {
 impl CachedObjectStoreStats {
     pub(crate) fn new(recorder: &MetricsRecorderHelper) -> Self {
         Self {
+            object_store_cache_head_hits: recorder.counter(HEAD_HIT_COUNT).register(),
+            object_store_cache_head_access: recorder.counter(HEAD_ACCESS_COUNT).register(),
             object_store_cache_part_hits: recorder.counter(PART_HIT_COUNT).register(),
             object_store_cache_part_access: recorder.counter(PART_ACCESS_COUNT).register(),
             object_store_cache_keys: recorder.gauge(CACHE_KEYS).register(),
