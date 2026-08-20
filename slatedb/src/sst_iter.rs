@@ -11,7 +11,7 @@ use tokio::task::JoinHandle;
 
 use crate::block_iterator::DataBlockIterator;
 use crate::bytes_range::BytesRange;
-use crate::db_state::{SsTableId, SsTableView};
+use crate::db_state::{SsTableHandle, SsTableId, SsTableView};
 use crate::db_stats::DbStats;
 use crate::error::SlateDBError;
 use crate::filter_policy::{FilterContext, FilterQuery, NamedFilter};
@@ -26,8 +26,35 @@ use crate::{
     utils::panic_string,
 };
 
+/// Everything needed to fetch a run of blocks, held until the fetch runs.
+struct BlockFetch {
+    table: SsTableHandle,
+    table_store: Arc<TableStore>,
+    index: Arc<SsTableIndexOwned>,
+    blocks: Range<usize>,
+    cache_blocks: bool,
+}
+
+impl BlockFetch {
+    async fn run(self) -> Result<VecDeque<Arc<Block>>, SlateDBError> {
+        self.table_store
+            .read_blocks_using_index(&self.table, self.index, self.blocks, self.cache_blocks)
+            .await
+    }
+}
+
 enum FetchTask {
+    /// A fetch running on its own task, so it makes progress while this
+    /// iterator is busy with an earlier block.
     InFlight(JoinHandle<Result<VecDeque<Arc<Block>>, SlateDBError>>),
+    /// A fetch that has not started, and runs on this iterator's own task.
+    ///
+    /// Used when only one fetch may be outstanding: nothing else can consume
+    /// blocks while it runs, so it is awaited immediately after being created.
+    /// Spawning it would add two scheduling hops to that await, one to start
+    /// the task and one to wake this iterator when it finishes, and buy no
+    /// overlap in return.
+    Pending(BlockFetch),
     Finished(VecDeque<Arc<Block>>),
 }
 
@@ -374,6 +401,8 @@ impl<'a> InternalSstIterator<'a> {
         let Some(index) = self.index.as_ref() else {
             return;
         };
+        // Only worth a task when a fetch can overlap with something else.
+        let prefetching = self.options.max_fetch_tasks > 1;
 
         match self.options.order {
             IterationOrder::Ascending => {
@@ -391,17 +420,15 @@ impl<'a> InternalSstIterator<'a> {
                     let blocks_end = self.next_block_idx_to_fetch + blocks_to_fetch;
                     let index = index.clone();
                     let cache_blocks = self.options.cache_blocks;
+                    let fetch = BlockFetch {
+                        table,
+                        table_store,
+                        index,
+                        blocks: blocks_start..blocks_end,
+                        cache_blocks,
+                    };
                     self.fetch_tasks
-                        .push_back(FetchTask::InFlight(tokio::spawn(async move {
-                            table_store
-                                .read_blocks_using_index(
-                                    &table,
-                                    index,
-                                    blocks_start..blocks_end,
-                                    cache_blocks,
-                                )
-                                .await
-                        })));
+                        .push_back(Self::fetch_task(fetch, prefetching));
                     self.next_block_idx_to_fetch = blocks_end;
                 }
             }
@@ -420,20 +447,27 @@ impl<'a> InternalSstIterator<'a> {
                     let blocks_start = blocks_end - blocks_to_fetch;
                     let index = index.clone();
                     let cache_blocks = self.options.cache_blocks;
+                    let fetch = BlockFetch {
+                        table,
+                        table_store,
+                        index,
+                        blocks: blocks_start..blocks_end,
+                        cache_blocks,
+                    };
                     self.fetch_tasks
-                        .push_back(FetchTask::InFlight(tokio::spawn(async move {
-                            table_store
-                                .read_blocks_using_index(
-                                    &table,
-                                    index,
-                                    blocks_start..blocks_end,
-                                    cache_blocks,
-                                )
-                                .await
-                        })));
+                        .push_back(Self::fetch_task(fetch, prefetching));
                     self.next_block_idx_to_fetch = blocks_start;
                 }
             }
+        }
+    }
+
+    /// Wraps a fetch so it either runs on its own task or on this one.
+    fn fetch_task(fetch: BlockFetch, prefetching: bool) -> FetchTask {
+        if prefetching {
+            FetchTask::InFlight(tokio::spawn(fetch.run()))
+        } else {
+            FetchTask::Pending(fetch)
         }
     }
 
@@ -457,6 +491,14 @@ impl<'a> InternalSstIterator<'a> {
                             .await
                             .map_err(|join_err| block_fetch_join_error(join_err, sst_id))??;
                         *fetch_task = FetchTask::Finished(blocks);
+                    }
+                    FetchTask::Pending(_) => {
+                        let FetchTask::Pending(fetch) =
+                            std::mem::replace(fetch_task, FetchTask::Finished(VecDeque::new()))
+                        else {
+                            unreachable!("just matched Pending")
+                        };
+                        *fetch_task = FetchTask::Finished(fetch.run().await?);
                     }
                     FetchTask::Finished(blocks) => {
                         // For descending order, pop from back; for ascending, pop from front
@@ -1090,7 +1132,7 @@ mod tests {
     use crate::db_cache::test_utils::TestCache;
     use crate::db_cache::DbCache;
     use crate::db_cache::SplitCache;
-    use crate::db_state::{SsTableId, SsTableView};
+    use crate::db_state::{SsTableHandle, SsTableId, SsTableView};
     use crate::db_stats::DbStats;
     use crate::filter_policy::{BloomFilterPolicy, FilterQuery};
     use crate::format::sst::SsTableFormat;
@@ -2857,14 +2899,19 @@ mod tests {
 
         // Initialization walks `advance_block` -> `next_iter(true)` ->
         // `spawn_fetches`, so the first fetch is spawned onto - and cancelled
-        // by - the dead runtime while its context is entered.
+        // by - the dead runtime while its context is entered. More than one
+        // fetch task has to be allowed for a task to exist at all: a single
+        // outstanding fetch runs on the caller instead of being spawned.
         let result = {
             let _guard = dead_handle.enter();
             SstIterator::new_owned_initialized(
                 ..,
                 sst,
                 table_store.clone(),
-                SstIteratorOptions::default(),
+                SstIteratorOptions {
+                    max_fetch_tasks: 2,
+                    ..SstIteratorOptions::default()
+                },
             )
             .await
         };
