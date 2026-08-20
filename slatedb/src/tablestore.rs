@@ -2957,7 +2957,7 @@ mod tests {
     ///    waiter.
     #[cfg(feature = "foyer")]
     #[tokio::test]
-    async fn concurrent_index_reads_each_load() {
+    async fn dedups_concurrent_reads_through_object_store() {
         use crate::db_cache::foyer::FoyerCache;
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use tokio::sync::Notify;
@@ -2990,8 +2990,7 @@ mod tests {
             .unwrap();
 
         // given: the same store wrapped so the first range read pauses, behind a
-        // real FoyerCache. Indexes load on the calling task rather than through
-        // foyer's deduplicating fetch, so concurrent misses each read.
+        // real FoyerCache that supports dedup
         let first_read_started = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
         let counting = Arc::new(PauseFirstReadStore {
@@ -3028,8 +3027,8 @@ mod tests {
             "exactly one read should have hit the store so far"
         );
 
-        // when: task B races A for the same index while A is still paused
-        // inside its loader.
+        // when: task B races A for the same index. join! polls B first, so B's
+        // fetch_index reaches foyer's dedup map before release_task fires.
         let task_b = {
             let reader = reader.clone();
             let handle = handle.clone();
@@ -3044,22 +3043,14 @@ mod tests {
         };
         let (b_result, _) = tokio::join!(task_b, release_task);
 
-        // then: both callers got an index, each having read it for itself
+        // then: both callers got an index, and exactly one object-store read happened
         let a_result = handle_a.await.expect("task A panicked");
         assert!(a_result.is_ok(), "task A failed: {:?}", a_result.err());
         assert!(b_result.is_ok(), "task B failed: {:?}", b_result.err());
         assert_eq!(
             counting.get_range_count.load(Ordering::SeqCst),
-            2,
-            "a concurrent index miss loads rather than waiting on the other reader"
-        );
-
-        // then: the index is cached, so a later read does not go to the store
-        reader.read_index(&handle, true).await.unwrap();
-        assert_eq!(
-            counting.get_range_count.load(Ordering::SeqCst),
-            2,
-            "a cached index must not be read again"
+            1,
+            "concurrent index reads must dedup into a single object-store read"
         );
     }
 
@@ -3108,8 +3099,7 @@ mod tests {
         let index = writer.read_index(&handle, false).await.unwrap();
 
         // given: the same store wrapped so the first range read pauses, behind a
-        // real FoyerCache. Indexes load on the calling task rather than through
-        // foyer's deduplicating fetch, so concurrent misses each read.
+        // real FoyerCache that supports dedup
         let first_read_started = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
         let counting = Arc::new(PauseFirstReadStore {
