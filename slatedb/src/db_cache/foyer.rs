@@ -235,7 +235,7 @@ impl DbCache for FoyerCache {
         key: CachedKey,
         loader: CacheLoader,
     ) -> Result<CachedEntry, crate::Error> {
-        self.dedup_fetch(key, loader).await
+        self.load_inline(key, loader).await
     }
 
     async fn fetch_filter(
@@ -243,7 +243,7 @@ impl DbCache for FoyerCache {
         key: CachedKey,
         loader: CacheLoader,
     ) -> Result<CachedEntry, crate::Error> {
-        self.dedup_fetch(key, loader).await
+        self.load_inline(key, loader).await
     }
 
     async fn fetch_stats(
@@ -256,6 +256,38 @@ impl DbCache for FoyerCache {
 }
 
 impl FoyerCache {
+    /// Loads on the calling task, without deduplicating concurrent loads.
+    ///
+    /// Deduplication is not free: foyer spawns a task to run the load and
+    /// hands every other caller a waiter, so a miss costs a spawn and a wake
+    /// on top of the load. That is a good trade for entries that are read
+    /// once and evicted, and a poor one for indexes and filters, which are
+    /// meant to stay resident. Their misses are rare enough that collapsing
+    /// concurrent ones saves little, while the scheduling hops are paid on
+    /// every miss.
+    async fn load_inline(
+        &self,
+        key: CachedKey,
+        loader: CacheLoader,
+    ) -> Result<CachedEntry, crate::Error> {
+        let started = Instant::now();
+        let entry = match self.timed_get(&key) {
+            Some(entry) => entry,
+            None => {
+                // Concurrent misses for the same key each load it and the
+                // last insert wins. The duplicated work is one read of an
+                // entry that is about to be resident anyway.
+                let entry = loader().await?;
+                self.inner.insert(key, entry.clone());
+                entry
+            }
+        };
+        self.stats
+            .fetch_duration
+            .record(started.elapsed().as_secs_f64());
+        Ok(entry)
+    }
+
     /// Use foyer's `Cache::get_or_fetch`, which deduplicates concurrent loads for the same key.
     ///
     /// Loader errors round-trip via anyhow's source chain on the foyer error. Foyer wraps them
