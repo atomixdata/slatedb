@@ -6,6 +6,7 @@ pub use storage_fs::FsCacheStorage;
 pub mod stats;
 
 mod head_cache;
+mod io_pool;
 mod object_store;
 pub(crate) mod policy;
 mod storage;
