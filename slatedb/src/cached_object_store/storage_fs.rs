@@ -158,6 +158,7 @@ pub struct FsCacheStorage {
     evictor: Option<Arc<FsCacheEvictor>>,
     rand: Arc<DbRand>,
     file_handle_cache: FileHandleCache,
+    stats: Arc<CachedObjectStoreStats>,
 }
 
 impl FsCacheStorage {
@@ -176,7 +177,7 @@ impl FsCacheStorage {
                 root_folder.clone(),
                 max_cache_size_bytes,
                 scan_interval,
-                stats,
+                stats.clone(),
                 system_clock,
                 rand.clone(),
                 file_handle_cache.clone(),
@@ -188,6 +189,7 @@ impl FsCacheStorage {
             evictor,
             rand,
             file_handle_cache,
+            stats,
         }
     }
 
@@ -207,6 +209,7 @@ impl LocalCacheStorage for FsCacheStorage {
             part_size,
             rand: self.rand.clone(),
             file_handle_cache: self.file_handle_cache.clone(),
+            stats: self.stats.clone(),
         })
     }
 
@@ -231,6 +234,7 @@ pub(crate) struct FsCacheEntry {
     evictor: Option<Arc<FsCacheEvictor>>,
     rand: Arc<DbRand>,
     file_handle_cache: FileHandleCache,
+    stats: Arc<CachedObjectStoreStats>,
 }
 
 impl FsCacheEntry {
@@ -359,8 +363,21 @@ impl LocalCacheEntry for FsCacheEntry {
         // see https://github.com/slatedb/slatedb/pull/1342
         let file_cache = self.file_handle_cache.clone();
         let this_part_path = part_path.clone();
+        let stats = self.stats.clone();
+        // Monotonic elapsed time, not a wall-clock timestamp; see
+        // instrumented_object_store.rs for the same exemption.
+        #[allow(clippy::disallowed_types, clippy::disallowed_methods)]
+        let submitted = std::time::Instant::now();
         #[allow(clippy::disallowed_methods)]
         let result = tokio::task::spawn_blocking(move || {
+            // Charged before anything else runs, so it isolates the wait for
+            // a pool thread from the work itself.
+            stats
+                .object_store_cache_part_read_queue_duration
+                .record(submitted.elapsed().as_secs_f64());
+            #[allow(clippy::disallowed_types, clippy::disallowed_methods)]
+            let exec_started = std::time::Instant::now();
+
             let file = match file_cache.get_or_open(&this_part_path) {
                 Ok(Some(f)) => f,
                 Ok(None) => return Ok(None),
@@ -370,8 +387,16 @@ impl LocalCacheEntry for FsCacheEntry {
             // Use positional I/O (pread) — no seek required, and safe for
             // concurrent readers sharing the same Arc<File>.
             let mut buffer = vec![0; range_in_part.len()];
+            #[allow(clippy::disallowed_types, clippy::disallowed_methods)]
+            let pread_started = std::time::Instant::now();
             read_exact_at_offset(file.file(), &mut buffer, range_in_part.start as u64)
                 .map_err(wrap_io_err)?;
+            stats
+                .object_store_cache_part_read_pread_duration
+                .record(pread_started.elapsed().as_secs_f64());
+            stats
+                .object_store_cache_part_read_exec_duration
+                .record(exec_started.elapsed().as_secs_f64());
             Ok(Some(Bytes::from(buffer)))
         })
         .await
