@@ -632,9 +632,6 @@ impl CachedObjectStore {
         Box::pin(async move {
             let entry = this.cache_storage.entry(&location, this.part_size_bytes);
             if !force_refresh {
-                // Monotonic elapsed time, not a wall-clock timestamp; see
-                // instrumented_object_store.rs for the same exemption.
-                #[allow(clippy::disallowed_types, clippy::disallowed_methods)]
                 let started = std::time::Instant::now();
                 let read = entry.read_part(part_id, range_in_part.clone()).await;
                 if let Ok(Some(bytes)) = read {
