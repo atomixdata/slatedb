@@ -1,4 +1,3 @@
-use crate::cached_object_store::io_pool::IoPool;
 use crate::cached_object_store::stats::CachedObjectStoreStats;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
@@ -160,7 +159,6 @@ pub struct FsCacheStorage {
     rand: Arc<DbRand>,
     file_handle_cache: FileHandleCache,
     stats: Arc<CachedObjectStoreStats>,
-    io_pool: IoPool,
 }
 
 impl FsCacheStorage {
@@ -192,7 +190,6 @@ impl FsCacheStorage {
             rand,
             file_handle_cache,
             stats,
-            io_pool: IoPool::with_default_size(),
         }
     }
 
@@ -213,7 +210,6 @@ impl LocalCacheStorage for FsCacheStorage {
             rand: self.rand.clone(),
             file_handle_cache: self.file_handle_cache.clone(),
             stats: self.stats.clone(),
-            io_pool: self.io_pool.clone(),
         })
     }
 
@@ -239,7 +235,6 @@ pub(crate) struct FsCacheEntry {
     rand: Arc<DbRand>,
     file_handle_cache: FileHandleCache,
     stats: Arc<CachedObjectStoreStats>,
-    io_pool: IoPool,
 }
 
 impl FsCacheEntry {
@@ -258,14 +253,12 @@ impl FsCacheEntry {
             }
         }
 
-        // Synchronous I/O on a dedicated pool thread rather than the tokio
-        // async APIs, which on Linux dispatch each call through
-        // `spawn_blocking` anyway (see
-        // https://github.com/slatedb/slatedb/pull/1342). The pool is this
-        // cache's own rather than the runtime's shared one: submitting to the
-        // shared pool takes a process-wide mutex, and when many connections
-        // wake at once every runtime worker contends on it, which costs more
-        // than the read.
+        // Spawn a blocking task and do synchronous I/O rather than use the tokio async apis.
+        // Under the hood, on linux systems , tokio itself spawns a blocking task for each call to
+        // drive i/o since it hasn't yet adopted the native fully async i/o api (io_uring). Each
+        // blocking task adds overhead, so its better to just batch all the calls into a single
+        // blocking task.
+        // see https://github.com/slatedb/slatedb/pull/1342
         let invalidate_path = path.clone();
         #[allow(clippy::disallowed_methods)]
         tokio::task::spawn_blocking(move || {
@@ -362,14 +355,12 @@ impl LocalCacheEntry for FsCacheEntry {
             self.part_size,
         );
 
-        // Synchronous I/O on a dedicated pool thread rather than the tokio
-        // async APIs, which on Linux dispatch each call through
-        // `spawn_blocking` anyway (see
-        // https://github.com/slatedb/slatedb/pull/1342). The pool is this
-        // cache's own rather than the runtime's shared one: submitting to the
-        // shared pool takes a process-wide mutex, and when many connections
-        // wake at once every runtime worker contends on it, which costs more
-        // than the read.
+        // Spawn a blocking task and do synchronous I/O rather than use the tokio async apis.
+        // Under the hood, on linux systems , tokio itself spawns a blocking task for each call to
+        // drive i/o since it hasn't yet adopted the native fully async i/o api (io_uring). Each
+        // blocking task adds overhead, so its better to just batch all the calls into a single
+        // blocking task.
+        // see https://github.com/slatedb/slatedb/pull/1342
         let file_cache = self.file_handle_cache.clone();
         let this_part_path = part_path.clone();
         let stats = self.stats.clone();
@@ -377,47 +368,43 @@ impl LocalCacheEntry for FsCacheEntry {
         // instrumented_object_store.rs for the same exemption.
         #[allow(clippy::disallowed_types, clippy::disallowed_methods)]
         let submitted = std::time::Instant::now();
-        let result = self
-            .io_pool
-            .run(move || {
-                // Charged before anything else runs, so it isolates the wait for
-                // a pool thread from the work itself.
-                stats
-                    .object_store_cache_part_read_queue_duration
-                    .record(submitted.elapsed().as_secs_f64());
-                #[allow(clippy::disallowed_types, clippy::disallowed_methods)]
-                let exec_started = std::time::Instant::now();
+        #[allow(clippy::disallowed_methods)]
+        let result = tokio::task::spawn_blocking(move || {
+            // Charged before anything else runs, so it isolates the wait for
+            // a pool thread from the work itself.
+            stats
+                .object_store_cache_part_read_queue_duration
+                .record(submitted.elapsed().as_secs_f64());
+            #[allow(clippy::disallowed_types, clippy::disallowed_methods)]
+            let exec_started = std::time::Instant::now();
 
-                #[allow(clippy::disallowed_types, clippy::disallowed_methods)]
-                let file = match file_cache.get_or_open(&this_part_path) {
-                    Ok(Some(f)) => f,
-                    Ok(None) => return Ok((None, std::time::Instant::now())),
-                    Err(err) => return Err(wrap_io_err(err)),
-                };
+            #[allow(clippy::disallowed_types, clippy::disallowed_methods)]
+            let file = match file_cache.get_or_open(&this_part_path) {
+                Ok(Some(f)) => f,
+                Ok(None) => return Ok((None, std::time::Instant::now())),
+                Err(err) => return Err(wrap_io_err(err)),
+            };
 
-                // Use positional I/O (pread) — no seek required, and safe for
-                // concurrent readers sharing the same Arc<File>.
-                let mut buffer = vec![0; range_in_part.len()];
-                #[allow(clippy::disallowed_types, clippy::disallowed_methods)]
-                let pread_started = std::time::Instant::now();
-                read_exact_at_offset(file.file(), &mut buffer, range_in_part.start as u64)
-                    .map_err(wrap_io_err)?;
-                stats
-                    .object_store_cache_part_read_pread_duration
-                    .record(pread_started.elapsed().as_secs_f64());
-                stats
-                    .object_store_cache_part_read_exec_duration
-                    .record(exec_started.elapsed().as_secs_f64());
-                // Handed back so the caller can charge the wake-up separately;
-                // everything after this point is scheduling, not I/O.
-                #[allow(clippy::disallowed_types, clippy::disallowed_methods)]
-                Ok((Some(Bytes::from(buffer)), std::time::Instant::now()))
-            })
-            .await
-            .map_err(|error| object_store::Error::Generic {
-                store: "FsCacheStorage",
-                source: Box::new(error),
-            })??;
+            // Use positional I/O (pread) — no seek required, and safe for
+            // concurrent readers sharing the same Arc<File>.
+            let mut buffer = vec![0; range_in_part.len()];
+            #[allow(clippy::disallowed_types, clippy::disallowed_methods)]
+            let pread_started = std::time::Instant::now();
+            read_exact_at_offset(file.file(), &mut buffer, range_in_part.start as u64)
+                .map_err(wrap_io_err)?;
+            stats
+                .object_store_cache_part_read_pread_duration
+                .record(pread_started.elapsed().as_secs_f64());
+            stats
+                .object_store_cache_part_read_exec_duration
+                .record(exec_started.elapsed().as_secs_f64());
+            // Handed back so the caller can charge the wake-up separately;
+            // everything after this point is scheduling, not I/O.
+            #[allow(clippy::disallowed_types, clippy::disallowed_methods)]
+            Ok((Some(Bytes::from(buffer)), std::time::Instant::now()))
+        })
+        .await
+        .map_err(wrap_io_err)??;
         let (result, completed_at) = result;
         self.stats
             .object_store_cache_part_read_wake_duration
@@ -523,31 +510,30 @@ impl LocalCacheEntry for FsCacheEntry {
         // blocking task.
         let file_cache = self.file_handle_cache.clone();
         let this_head_path = head_path.clone();
-        let result = self
-            .io_pool
-            .run(move || {
-                let file = match file_cache.get_or_open(&this_head_path) {
-                    Ok(Some(f)) => f,
-                    Ok(None) => return Ok(None),
-                    Err(err) => return Err(wrap_io_err(err)),
-                };
+        #[allow(clippy::disallowed_methods)]
+        let result = tokio::task::spawn_blocking(move || {
+            let file = match file_cache.get_or_open(&this_head_path) {
+                Ok(Some(f)) => f,
+                Ok(None) => return Ok(None),
+                Err(err) => return Err(wrap_io_err(err)),
+            };
 
-                let metadata = file.file().metadata().map_err(wrap_io_err)?;
-                let head_size_bytes = metadata.len() as usize;
+            let metadata = file.file().metadata().map_err(wrap_io_err)?;
+            let head_size_bytes = metadata.len() as usize;
 
-                // Use positional read from offset 0 to read the entire file.
-                let mut buffer = vec![0u8; head_size_bytes];
-                read_exact_at_offset(file.file(), &mut buffer, 0).map_err(wrap_io_err)?;
+            // Use positional read from offset 0 to read the entire file.
+            let mut buffer = vec![0u8; head_size_bytes];
+            read_exact_at_offset(file.file(), &mut buffer, 0).map_err(wrap_io_err)?;
 
-                let content = String::from_utf8(buffer).map_err(|e| {
-                    wrap_io_err(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-                })?;
+            let content = String::from_utf8(buffer).map_err(|e| {
+                wrap_io_err(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+            })?;
 
-                let head: LocalCacheHead = serde_json::from_str(&content).map_err(wrap_io_err)?;
-                Ok(Some((head.meta(), head.attributes(), head_size_bytes)))
-            })
-            .await
-            .map_err(wrap_io_err)??;
+            let head: LocalCacheHead = serde_json::from_str(&content).map_err(wrap_io_err)?;
+            Ok(Some((head.meta(), head.attributes(), head_size_bytes)))
+        })
+        .await
+        .map_err(wrap_io_err)??;
 
         if let Some((meta, attributes, head_size_bytes)) = result {
             // track the head access for evictor
