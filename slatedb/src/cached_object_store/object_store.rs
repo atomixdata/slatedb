@@ -280,9 +280,12 @@ impl CachedObjectStore {
         location: &Path,
         admit_on_miss: bool,
     ) -> object_store::Result<GetResult> {
+        self.stats.object_store_cache_head_access.increment(1);
+
         // In-memory head cache: skips both the on-disk head read and the
         // upstream HEAD round trip.
         if let Some(head) = self.head_cache.get(location) {
+            self.stats.object_store_cache_head_hits.increment(1);
             return Ok(head_only_get_result(
                 head.meta.clone(),
                 head.attributes.clone(),
@@ -292,6 +295,8 @@ impl CachedObjectStore {
 
         let entry = self.cache_storage.entry(location, self.part_size_bytes);
         if let Ok(Some((meta, attributes))) = entry.read_head().await {
+            // Served from the on-disk head, so still no upstream request.
+            self.stats.object_store_cache_head_hits.increment(1);
             return Ok(head_only_get_result(meta, attributes, Extensions::new()));
         }
 
