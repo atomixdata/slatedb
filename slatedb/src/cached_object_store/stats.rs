@@ -15,6 +15,7 @@ pub const PART_DISK_READ_DURATION: &str = oscache_stat_name!("part_disk_read_dur
 pub const PART_READ_QUEUE_DURATION: &str = oscache_stat_name!("part_read_queue_duration");
 pub const PART_READ_EXEC_DURATION: &str = oscache_stat_name!("part_read_exec_duration");
 pub const PART_READ_PREAD_DURATION: &str = oscache_stat_name!("part_read_pread_duration");
+pub const PART_READ_WAKE_DURATION: &str = oscache_stat_name!("part_read_wake_duration");
 pub const PART_ACCESS_COUNT: &str = oscache_stat_name!("part_access_count");
 pub const CACHE_KEYS: &str = oscache_stat_name!("cache_keys");
 pub const CACHE_BYTES: &str = oscache_stat_name!("cache_bytes");
@@ -40,6 +41,11 @@ pub struct CachedObjectStoreStats {
     /// Time in the positional read syscall alone, with no cache lookup or
     /// scheduling included. This is the floor: what the device actually costs.
     pub(super) object_store_cache_part_read_pread_duration: Arc<dyn HistogramFn>,
+    /// Time between the blocking closure returning and the awaiting task
+    /// running again. The read is already complete for this whole interval,
+    /// so it is pure scheduling delay: the cost of waking a task from a
+    /// blocking-pool thread and getting a runtime worker to poll it.
+    pub(super) object_store_cache_part_read_wake_duration: Arc<dyn HistogramFn>,
     pub(super) object_store_cache_part_access: Arc<dyn CounterFn>,
     pub(super) object_store_cache_keys: Arc<dyn GaugeFn>,
     pub(super) object_store_cache_bytes: Arc<dyn GaugeFn>,
@@ -89,6 +95,13 @@ impl CachedObjectStoreStats {
             object_store_cache_part_read_pread_duration: recorder
                 .histogram(PART_READ_PREAD_DURATION, LATENCY_BOUNDARIES)
                 .description("Time in the positional read syscall alone, in seconds")
+                .register(),
+            object_store_cache_part_read_wake_duration: recorder
+                .histogram(PART_READ_WAKE_DURATION, LATENCY_BOUNDARIES)
+                .description(
+                    "Time from the blocking read completing to the awaiting task \
+                     being polled, in seconds",
+                )
                 .register(),
             object_store_cache_part_access: recorder.counter(PART_ACCESS_COUNT).register(),
             object_store_cache_keys: recorder.gauge(CACHE_KEYS).register(),

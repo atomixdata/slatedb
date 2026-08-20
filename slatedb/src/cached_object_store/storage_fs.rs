@@ -378,9 +378,10 @@ impl LocalCacheEntry for FsCacheEntry {
             #[allow(clippy::disallowed_types, clippy::disallowed_methods)]
             let exec_started = std::time::Instant::now();
 
+            #[allow(clippy::disallowed_types, clippy::disallowed_methods)]
             let file = match file_cache.get_or_open(&this_part_path) {
                 Ok(Some(f)) => f,
-                Ok(None) => return Ok(None),
+                Ok(None) => return Ok((None, std::time::Instant::now())),
                 Err(err) => return Err(wrap_io_err(err)),
             };
 
@@ -397,10 +398,17 @@ impl LocalCacheEntry for FsCacheEntry {
             stats
                 .object_store_cache_part_read_exec_duration
                 .record(exec_started.elapsed().as_secs_f64());
-            Ok(Some(Bytes::from(buffer)))
+            // Handed back so the caller can charge the wake-up separately;
+            // everything after this point is scheduling, not I/O.
+            #[allow(clippy::disallowed_types, clippy::disallowed_methods)]
+            Ok((Some(Bytes::from(buffer)), std::time::Instant::now()))
         })
         .await
         .map_err(wrap_io_err)??;
+        let (result, completed_at) = result;
+        self.stats
+            .object_store_cache_part_read_wake_duration
+            .record(completed_at.elapsed().as_secs_f64());
 
         // track the part access for evictor
         if result.is_some() {
