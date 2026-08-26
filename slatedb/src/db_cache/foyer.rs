@@ -31,10 +31,6 @@
 //! ```
 //!
 
-// `Instant` is intentionally used here for monotonic elapsed-time measurement.
-// SlateDB's clock abstraction is for wall-clock timestamps, not request timing.
-#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
-
 use crate::db_cache::{CacheLoader, CachedEntry, CachedKey, DbCache, DEFAULT_MAX_CAPACITY};
 use crate::error::SlateDBError;
 use async_trait::async_trait;
