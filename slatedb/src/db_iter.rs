@@ -1,15 +1,21 @@
 use crate::batch::WriteBatchIterator;
 use crate::bytes_range::BytesRange;
+use crate::db_state::{SortedRun, SsTableView};
+use crate::db_stats::DbStats;
 use crate::error::SlateDBError;
 use crate::filter_iterator::FilterIterator;
 use crate::iter::{EmptyIterator, IterationOrder, RowEntryIterator};
 use crate::manifest::LsmTreeState;
+use crate::mem_table::KVTable;
 use crate::merge_iterator::MergeIterator;
 use crate::merge_operator::{
     MergeOperatorIterator, MergeOperatorRequiredIterator, MergeOperatorType,
 };
-use crate::reader::ReadTrace;
+use crate::reader::{ReadTrace, SstTraceLevel};
 use crate::segment_iterator::{build_l0_point_iters, build_sr_point_iters, SegmentScanContext};
+use crate::sorted_run_iterator::SortedRunIterator;
+use crate::sst_iter::{FilterEvaluator, SstIterator, SstIteratorOptions, SstTracingContext};
+use crate::tablestore::TableStore;
 use crate::types::{KeyValue, RowEntry, ValueDeletable};
 
 use async_trait::async_trait;
@@ -18,6 +24,7 @@ use futures::stream::{self, BoxStream, StreamExt};
 use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::ops::RangeBounds;
+use std::sync::Arc;
 use tracing::Instrument;
 
 /// [`DbIteratorRangeTracker`] records the *requested* scan range of a
@@ -464,18 +471,138 @@ where
     }
 }
 
+/// A source of a recency scan. It is turned into an iterator only when the
+/// walk reaches it, and only after a cheap probe says it may hold the prefix.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum RecencySource {
+    MemTable(Arc<KVTable>),
+    L0(SsTableView),
+    SortedRun(SortedRun),
+}
+
+/// What a recency scan needs to materialize a [`RecencySource`].
+pub(crate) struct RecencySourceContext {
+    pub(crate) table_store: Arc<TableStore>,
+    pub(crate) db_stats: DbStats,
+    pub(crate) range: BytesRange,
+    pub(crate) prefix: Bytes,
+    pub(crate) sst_iter_options: SstIteratorOptions,
+    pub(crate) max_seq: Option<u64>,
+    pub(crate) read_trace: ReadTrace,
+}
+
+impl RecencySourceContext {
+    /// Probes an SST's filters without building an iterator. Returns the
+    /// evaluator when the SST may hold the prefix, so the iterator built from
+    /// it does not read the filters a second time.
+    async fn probe_sst(
+        &self,
+        view: &SsTableView,
+        level: &SstTraceLevel,
+    ) -> Result<Option<FilterEvaluator>, SlateDBError> {
+        let mut evaluator = FilterEvaluator::new_prefix(
+            self.prefix.clone(),
+            self.sst_iter_options.filter_context.clone(),
+            Some(self.db_stats.clone()),
+        );
+        let filters = self
+            .table_store
+            .read_filters(
+                &view.sst,
+                self.sst_iter_options.cache_metadata,
+                self.sst_iter_options.segment.clone(),
+                &self.read_trace,
+                Some(level),
+            )
+            .await?;
+        evaluator.evaluate(&filters, view.sst.id, Some(level), &self.read_trace);
+        Ok((!evaluator.is_filtered_out()).then_some(evaluator))
+    }
+
+    /// Builds the iterator for `source`, or `None` when the source cannot
+    /// hold the prefix. The returned iterator is not yet initialized.
+    async fn materialize(
+        &self,
+        source: RecencySource,
+    ) -> Result<Option<Box<dyn RowEntryIterator + 'static>>, SlateDBError> {
+        let iter: Box<dyn RowEntryIterator + 'static> = match source {
+            RecencySource::MemTable(table) => {
+                // One skiplist descent instead of a range iterator that
+                // descends twice for a prefix with no entries.
+                let contains_prefix = {
+                    let span = self.read_trace.new_memtable_span();
+                    let _guard = span.enter();
+                    table.contains_prefix(&self.prefix)
+                };
+                if !contains_prefix {
+                    return Ok(None);
+                }
+                Box::new(table.range(
+                    self.range.clone(),
+                    self.sst_iter_options.order,
+                    self.read_trace.clone(),
+                ))
+            }
+            RecencySource::L0(view) => {
+                let level = SstTraceLevel::L0;
+                let Some(evaluator) = self.probe_sst(&view, &level).await? else {
+                    return Ok(None);
+                };
+                let iter = SstIterator::new_owned_prefiltered(
+                    self.range.clone(),
+                    view,
+                    self.table_store.clone(),
+                    self.sst_iter_options.clone(),
+                    Some(SstTracingContext::new(level, self.read_trace.clone())),
+                    evaluator,
+                )?;
+                match iter {
+                    Some(iter) => Box::new(iter),
+                    None => return Ok(None),
+                }
+            }
+            RecencySource::SortedRun(sorted_run) => {
+                let level = SstTraceLevel::SortedRun(sorted_run.id);
+                // Dropping an SST whose filter is negative cannot split a
+                // key across the remaining SSTs: a key in two adjacent SSTs
+                // is in both filters.
+                let mut views = VecDeque::new();
+                for view in sorted_run.into_tables_covering_range(&self.range) {
+                    if self.probe_sst(&view, &level).await?.is_some() {
+                        views.push_back(view);
+                    }
+                }
+                if views.is_empty() {
+                    return Ok(None);
+                }
+                Box::new(
+                    SortedRunIterator::new_owned_views(
+                        views,
+                        self.range.clone(),
+                        self.table_store.clone(),
+                        self.sst_iter_options.clone(),
+                        Some(SstTracingContext::new(level, self.read_trace.clone())),
+                        Some(self.db_stats.clone()),
+                    )
+                    .await?,
+                )
+            }
+        };
+        Ok(Some(match self.max_seq {
+            Some(max_seq) => Box::new(FilterIterator::new_with_max_seq(iter, Some(max_seq))),
+            None => iter,
+        }))
+    }
+}
+
 /// See [`crate::Db::scan_prefix_by_recency`] for the full contract.
 pub struct DbRecencyIterator {
-    /// Source iterators ordered from most recent to least recent. The
-    /// front of the deque is the source currently being drained;
-    /// exhausted sources are popped off as the walk proceeds. Each
-    /// source has already been wrapped with the sequence-number filter
-    /// at construction time.
-    iters: VecDeque<Box<dyn RowEntryIterator + 'static>>,
-    /// Whether the current front-of-deque iterator has had `init`
-    /// called. Reset to false whenever the front is popped, so the
-    /// next source's `init` is invoked lazily on the next pull.
-    current_initialized: bool,
+    /// Sources ordered from most recent to least recent. The front is the
+    /// next source to materialize once `current` is exhausted.
+    sources: VecDeque<RecencySource>,
+    context: RecencySourceContext,
+    /// The initialized iterator of the source currently being drained.
+    current: Option<Box<dyn RowEntryIterator + 'static>>,
     /// Sticky error. Once any underlying `init` or `next` call fails,
     /// the error is stashed here and every subsequent `next_entry`
     /// returns it instead of advancing, since after a failure the
@@ -486,12 +613,14 @@ pub struct DbRecencyIterator {
 
 impl DbRecencyIterator {
     pub(crate) fn new(
-        iters: VecDeque<Box<dyn RowEntryIterator + 'static>>,
+        sources: VecDeque<RecencySource>,
+        context: RecencySourceContext,
         read_span: tracing::Span,
     ) -> Self {
         Self {
-            iters,
-            current_initialized: false,
+            sources,
+            context,
+            current: None,
             invalidated_error: None,
             read_span,
         }
@@ -515,33 +644,37 @@ impl DbRecencyIterator {
         }
 
         loop {
-            let Some(iter) = self.iters.front_mut() else {
+            if let Some(iter) = self.current.as_mut() {
+                let next = iter.next().await;
+                // Keep cached iteration cooperative.
+                tokio::task::coop::consume_budget().await;
+                match next {
+                    Ok(Some(entry)) => return Ok(Some(entry)),
+                    Ok(None) => self.current = None,
+                    Err(e) => return Err(self.invalidate(e)),
+                }
+                continue;
+            }
+
+            let Some(source) = self.sources.pop_front() else {
                 return Ok(None);
             };
-
-            if !self.current_initialized {
-                if let Err(e) = iter.init().await {
-                    self.invalidated_error = Some(e.clone());
-                    return Err(e.into());
+            match self.context.materialize(source).await {
+                Ok(Some(mut iter)) => {
+                    if let Err(e) = iter.init().await {
+                        return Err(self.invalidate(e));
+                    }
+                    self.current = Some(iter);
                 }
-                self.current_initialized = true;
-            }
-
-            let next = iter.next().await;
-            // Keep cached iteration cooperative.
-            tokio::task::coop::consume_budget().await;
-            match next {
-                Ok(Some(entry)) => return Ok(Some(entry)),
-                Ok(None) => {
-                    self.iters.pop_front();
-                    self.current_initialized = false;
-                }
-                Err(e) => {
-                    self.invalidated_error = Some(e.clone());
-                    return Err(e.into());
-                }
+                Ok(None) => {}
+                Err(e) => return Err(self.invalidate(e)),
             }
         }
+    }
+
+    fn invalidate(&mut self, error: SlateDBError) -> crate::Error {
+        self.invalidated_error = Some(error.clone());
+        error.into()
     }
 }
 

@@ -433,20 +433,18 @@ impl TableStore {
             // we intentionally don't re-insert there — `fetch_X` errors are almost
             // always the smuggled loader error (so the direct retry will also fail),
             // and on the rare foyer-machinery error an insert would likely fail too.
-            let fetch = if cache_blocks {
-                cache
+            // Hits are the common case, so look up first and build the
+            // loader (which clones the format and policies) only on a miss.
+            let fetch = match cache.get_filter(&cache_key).await {
+                Ok(Some(entry)) => Some(CacheFetch::hit(entry)),
+                _ if cache_blocks => cache
                     .fetch_filter(
                         cache_key.clone(),
                         self.read_loader(handle, CacheTarget::Filters, segment.clone()),
                     )
                     .await
-                    .ok()
-            } else {
-                cache
-                    .get_filter(&cache_key)
-                    .await
-                    .unwrap_or(None)
-                    .map(CacheFetch::hit)
+                    .ok(),
+                _ => None,
             };
             if let Some(CacheFetch { entry, lookup }) = fetch {
                 // Already decoded.

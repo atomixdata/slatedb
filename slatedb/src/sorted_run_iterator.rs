@@ -184,6 +184,26 @@ impl<'a> SortedRunIterator<'a> {
         .await
     }
 
+    /// Iterates `views`, a subset of one sorted run's SSTs in run order,
+    /// restricted to `range`.
+    pub(crate) async fn new_owned_views(
+        views: VecDeque<SsTableView>,
+        range: BytesRange,
+        table_store: Arc<TableStore>,
+        sst_iter_options: SstIteratorOptions,
+        sst_tracing_context: Option<SstTracingContext>,
+        db_stats: Option<DbStats>,
+    ) -> Result<Self, SlateDBError> {
+        SortedRunIterator::new(
+            SortedRunView::Owned(views, range),
+            table_store,
+            sst_iter_options,
+            sst_tracing_context,
+            db_stats,
+        )
+        .await
+    }
+
     #[allow(dead_code)]
     pub(crate) async fn new_owned_initialized<T: RangeBounds<Bytes>>(
         range: T,

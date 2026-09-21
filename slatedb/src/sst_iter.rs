@@ -187,7 +187,7 @@ enum FilterState {
     Negative,
 }
 
-struct FilterEvaluator {
+pub(crate) struct FilterEvaluator {
     query: FilterQuery,
     db_stats: Option<DbStats>,
     state: FilterState,
@@ -206,7 +206,7 @@ impl FilterEvaluator {
         }
     }
 
-    fn new_prefix(
+    pub(crate) fn new_prefix(
         prefix: Bytes,
         context: Option<FilterContext>,
         db_stats: Option<DbStats>,
@@ -240,7 +240,7 @@ impl FilterEvaluator {
     /// All filters must agree the query might match for the read to proceed.
     /// If any filter says the query is absent, the SST is skipped.
     /// If no filters are provided, the state is set to `NoFilter`.
-    fn evaluate(
+    pub(crate) fn evaluate(
         &mut self,
         filters: &[NamedFilter],
         sst_id: SsTableId,
@@ -314,8 +314,12 @@ impl FilterEvaluator {
         }
     }
 
-    fn is_filtered_out(&self) -> bool {
+    pub(crate) fn is_filtered_out(&self) -> bool {
         self.state == FilterState::Negative
+    }
+
+    fn is_checked(&self) -> bool {
+        self.state != FilterState::NotChecked
     }
 
     fn notify_key_found(&mut self, key: &[u8]) {
@@ -908,11 +912,15 @@ impl<'a> FilterIterator<'a> {
 impl RowEntryIterator for FilterIterator<'_> {
     async fn init(&mut self) -> Result<(), SlateDBError> {
         if !self.initialized {
-            let filters = self.read_filters().await?;
-            let sst_id = self.inner.view().table_as_ref().sst.id;
-            let read_trace = self.inner.read_trace();
-            self.filter
-                .evaluate(&filters, sst_id, self.inner.sst_level(), &read_trace);
+            // A caller that probed the filters before building this
+            // iterator passes the evaluated state in; do not read them again.
+            if !self.filter.is_checked() {
+                let filters = self.read_filters().await?;
+                let sst_id = self.inner.view().table_as_ref().sst.id;
+                let read_trace = self.inner.read_trace();
+                self.filter
+                    .evaluate(&filters, sst_id, self.inner.sst_level(), &read_trace);
+            }
 
             if self.is_filtered_out() {
                 return Ok(());
@@ -1037,6 +1045,23 @@ impl<'a> SstIterator<'a> {
         tracing_context: Option<SstTracingContext>,
     ) -> Result<Option<Self>, SlateDBError> {
         Self::new_owned_with_stats(range, table, table_store, options, tracing_context, None)
+    }
+
+    /// Like [`Self::new_owned_with_stats`], but with filters the caller has
+    /// already evaluated, so `init` skips the filter read.
+    pub(crate) fn new_owned_prefiltered<T: RangeBounds<Bytes>>(
+        range: T,
+        table: SsTableView,
+        table_store: Arc<TableStore>,
+        options: SstIteratorOptions,
+        tracing_context: Option<SstTracingContext>,
+        evaluator: FilterEvaluator,
+    ) -> Result<Option<Self>, SlateDBError> {
+        let internal =
+            InternalSstIterator::new_owned(range, table, table_store, options, tracing_context)?;
+        Ok(internal.map(|internal| Self {
+            delegate: SstIteratorDelegate::Filter(FilterIterator::new(internal, evaluator)),
+        }))
     }
 
     #[cfg(test)]
