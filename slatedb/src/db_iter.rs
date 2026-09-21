@@ -355,9 +355,6 @@ impl DbIterator {
     }
 
     pub(crate) async fn next_entry(&mut self) -> Result<Option<RowEntry>, SlateDBError> {
-        if self.read_span.is_none() {
-            return self.next_entry_inner().await;
-        }
         let read_span = self.read_span.clone();
         self.next_entry_inner().instrument(read_span).await
     }
@@ -502,9 +499,6 @@ impl DbRecencyIterator {
     /// operands are not filtered. See [`crate::Db::scan_prefix_by_recency`]
     /// for the full contract.
     pub async fn next_entry(&mut self) -> Result<Option<RowEntry>, crate::Error> {
-        if self.read_span.is_none() {
-            return self.next_entry_inner().await;
-        }
         let read_span = self.read_span.clone();
         self.next_entry_inner().instrument(read_span).await
     }
