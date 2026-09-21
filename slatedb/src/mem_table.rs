@@ -507,6 +507,16 @@ impl KVTable {
         self.range(range, IterationOrder::Ascending, ReadTrace::new(None))
     }
 
+    /// Whether any key in the table starts with `prefix`. One skiplist
+    /// descent, so a reader can skip the table without building a range
+    /// iterator.
+    pub(crate) fn contains_prefix(&self, prefix: &Bytes) -> bool {
+        let start = SequencedKey::new(prefix.clone(), u64::MAX);
+        self.map
+            .lower_bound(Bound::Included(&start))
+            .is_some_and(|entry| entry.key().user_key.starts_with(prefix))
+    }
+
     pub(crate) fn range<T: RangeBounds<Bytes>>(
         &self,
         range: T,
