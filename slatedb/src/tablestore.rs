@@ -412,6 +412,9 @@ impl TableStore {
         }
         let span = trace.new_read_filter_span(handle.id, sst_level);
         let read = self.read_filters_inner(handle, cache_blocks, segment, span.clone());
+        if span.is_none() {
+            return read.await;
+        }
         read.instrument(span).await
     }
 
@@ -534,6 +537,9 @@ impl TableStore {
     ) -> Result<Arc<SsTableIndexOwned>, SlateDBError> {
         let span = trace.new_read_index_span(handle.id, sst_level);
         let read = self.read_index_inner(handle, cache_blocks, segment, span.clone());
+        if span.is_none() {
+            return read.await;
+        }
         read.instrument(span).await
     }
 
