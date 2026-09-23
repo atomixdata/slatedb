@@ -50,7 +50,74 @@ pub(crate) const WRITE_BATCH_TASK_NAME: &str = "writer";
 pub(crate) type WriteBatchResult = Result<WriteHandle, SlateDBError>;
 
 /// Fewest rows worth handing to a separate memtable insert task.
-const MIN_ROWS_PER_INSERT_TASK: usize = 64;
+/// `SLATEDB_MIN_ROWS_PER_INSERT_TASK` overrides it.
+fn min_rows_per_insert_task() -> usize {
+    static VALUE: OnceLock<usize> = OnceLock::new();
+    *VALUE.get_or_init(|| env_usize("SLATEDB_MIN_ROWS_PER_INSERT_TASK", 8))
+}
+
+/// Debug counters for write grouping, logged about once a second when
+/// `SLATEDB_WRITE_GROUP_STATS=1`.
+mod group_stats {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use std::sync::OnceLock;
+    use std::time::Instant;
+
+    static GROUPS: AtomicU64 = AtomicU64::new(0);
+    static WRITES: AtomicU64 = AtomicU64::new(0);
+    static ROWS: AtomicU64 = AtomicU64::new(0);
+    static PARALLEL_GROUPS: AtomicU64 = AtomicU64::new(0);
+    static TASKS: AtomicU64 = AtomicU64::new(0);
+    static INSERT_NANOS: AtomicU64 = AtomicU64::new(0);
+    static LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
+
+    fn enabled() -> bool {
+        static VALUE: OnceLock<bool> = OnceLock::new();
+        *VALUE.get_or_init(|| std::env::var("SLATEDB_WRITE_GROUP_STATS").as_deref() == Ok("1"))
+    }
+
+    fn start() -> Instant {
+        static START: OnceLock<Instant> = OnceLock::new();
+        *START.get_or_init(Instant::now)
+    }
+
+    pub(super) fn record(writes: usize, rows: usize, tasks: usize, insert_nanos: u64) {
+        if !enabled() {
+            return;
+        }
+        GROUPS.fetch_add(1, Relaxed);
+        WRITES.fetch_add(writes as u64, Relaxed);
+        ROWS.fetch_add(rows as u64, Relaxed);
+        if tasks > 1 {
+            PARALLEL_GROUPS.fetch_add(1, Relaxed);
+        }
+        TASKS.fetch_add(tasks as u64, Relaxed);
+        INSERT_NANOS.fetch_add(insert_nanos, Relaxed);
+        let now_ms = start().elapsed().as_millis() as u64;
+        let last = LAST_LOG_MS.load(Relaxed);
+        if now_ms >= last + 1000
+            && LAST_LOG_MS
+                .compare_exchange(last, now_ms, Relaxed, Relaxed)
+                .is_ok()
+        {
+            let groups = GROUPS.swap(0, Relaxed).max(1);
+            let writes = WRITES.swap(0, Relaxed);
+            let rows = ROWS.swap(0, Relaxed);
+            let parallel = PARALLEL_GROUPS.swap(0, Relaxed);
+            let tasks = TASKS.swap(0, Relaxed);
+            let nanos = INSERT_NANOS.swap(0, Relaxed);
+            tracing::info!(
+                groups,
+                writes_per_group = writes as f64 / groups as f64,
+                rows_per_group = rows as f64 / groups as f64,
+                parallel_pct = 100.0 * parallel as f64 / groups as f64,
+                tasks_per_group = tasks as f64 / groups as f64,
+                insert_us_per_group = nanos as f64 / groups as f64 / 1000.0,
+                "write group stats"
+            );
+        }
+    }
+}
 
 /// Most queued writes the batch writer applies as one group.
 /// `SLATEDB_WRITE_GROUP_MAX=1` applies one write at a time.
@@ -63,7 +130,7 @@ fn write_group_max() -> usize {
 /// `SLATEDB_MEMTABLE_INSERT_TASKS=1` inserts on the writer alone.
 fn memtable_insert_tasks() -> usize {
     static VALUE: OnceLock<usize> = OnceLock::new();
-    *VALUE.get_or_init(|| env_usize("SLATEDB_MEMTABLE_INSERT_TASKS", 8))
+    *VALUE.get_or_init(|| env_usize("SLATEDB_MEMTABLE_INSERT_TASKS", 16))
 }
 
 #[allow(clippy::panic)]
@@ -463,12 +530,16 @@ impl DbInner {
             .iter_mut()
             .flat_map(|write| std::mem::take(&mut write.entries))
             .collect();
-        let tasks = memtable_insert_tasks();
-        if tasks <= 1 || rows.len() < 2 * MIN_ROWS_PER_INSERT_TASK {
+        let started = std::time::Instant::now();
+        let (writes, row_count) = (prepared.len(), rows.len());
+        let min_rows = min_rows_per_insert_task();
+        let tasks = memtable_insert_tasks().min(rows.len() / min_rows).max(1);
+        if tasks <= 1 {
             rows.into_iter().for_each(|row| table.put(row));
+            group_stats::record(writes, row_count, 1, started.elapsed().as_nanos() as u64);
             return;
         }
-        let chunk = rows.len().div_ceil(tasks).max(MIN_ROWS_PER_INSERT_TASK);
+        let chunk = rows.len().div_ceil(tasks);
         let mut handles = Vec::with_capacity(tasks);
         while rows.len() > chunk {
             let tail = rows.split_off(rows.len() - chunk);
@@ -481,6 +552,12 @@ impl DbInner {
         for handle in handles {
             handle.await.expect("memtable insert task panicked");
         }
+        group_stats::record(
+            writes,
+            row_count,
+            tasks,
+            started.elapsed().as_nanos() as u64,
+        );
     }
 
     /// Publishes a write whose rows are in the memtable: records it for conflict
