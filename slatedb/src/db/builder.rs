@@ -714,7 +714,10 @@ impl<P: Into<Path>> DbBuilder<P> {
         let tokio_handle = Handle::current();
         task_executor.add_handler(
             WRITE_BATCH_TASK_NAME.to_string(),
-            Box::new(WriteBatchEventHandler::new(inner.clone(), wal_writer)),
+            Box::new(
+                WriteBatchEventHandler::new(inner.clone(), wal_writer)
+                    .with_group_rx(write_rx.clone()),
+            ),
             write_rx,
             self.write_runtime.as_ref().unwrap_or(&tokio_handle),
         )?;

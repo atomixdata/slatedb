@@ -21,7 +21,7 @@ use crate::prefix_extractor::PrefixExtractor;
 use crate::reader::ReadTrace;
 use crate::seq_tracker::{SequenceTracker, TrackedSeq};
 use crate::types::RowEntry;
-use crate::utils::{WatchableOnceCell, WatchableOnceCellReader};
+use crate::utils::WatchableOnceCell;
 
 /// Memtable may contains multiple versions of a single user key, with a monotonically increasing sequence number.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -560,10 +560,6 @@ impl KVTable {
             self.entries_size_in_bytes
                 .fetch_add(row_size, Ordering::Relaxed);
         }
-    }
-
-    pub(crate) fn durable_watcher(&self) -> WatchableOnceCellReader<Result<(), SlateDBError>> {
-        self.durable.reader()
     }
 
     pub(crate) fn notify_durable(&self, result: Result<(), SlateDBError>) {

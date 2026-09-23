@@ -29,7 +29,7 @@ use async_trait::async_trait;
 use fail_parallel::fail_point;
 use futures::stream::BoxStream;
 use futures::{FutureExt, StreamExt};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tracing::instrument;
 
 use crate::config::WriteOptions;
@@ -38,7 +38,6 @@ use crate::db_transaction::DbTransaction;
 use crate::dispatcher::MessageHandler;
 use crate::mem_table::KVTable;
 use crate::types::RowEntry;
-use crate::utils::WatchableOnceCellReader;
 use crate::wal::{FlushResultFuture, WalWriter};
 use crate::{batch::WriteBatch, db::DbInner, db::WriteHandle, error::SlateDBError};
 use bytes::Bytes;
@@ -49,6 +48,44 @@ use tokio::sync::oneshot;
 pub(crate) const WRITE_BATCH_TASK_NAME: &str = "writer";
 
 pub(crate) type WriteBatchResult = Result<WriteHandle, SlateDBError>;
+
+/// Fewest rows worth handing to a separate memtable insert task.
+const MIN_ROWS_PER_INSERT_TASK: usize = 64;
+
+/// Most queued writes the batch writer applies as one group.
+/// `SLATEDB_WRITE_GROUP_MAX=1` applies one write at a time.
+fn write_group_max() -> usize {
+    static VALUE: OnceLock<usize> = OnceLock::new();
+    *VALUE.get_or_init(|| env_usize("SLATEDB_WRITE_GROUP_MAX", 256))
+}
+
+/// Tasks that insert a group's rows into the memtable.
+/// `SLATEDB_MEMTABLE_INSERT_TASKS=1` inserts on the writer alone.
+fn memtable_insert_tasks() -> usize {
+    static VALUE: OnceLock<usize> = OnceLock::new();
+    *VALUE.get_or_init(|| env_usize("SLATEDB_MEMTABLE_INSERT_TASKS", 8))
+}
+
+#[allow(clippy::panic)]
+fn env_usize(name: &str, default: usize) -> usize {
+    match std::env::var(name) {
+        Ok(value) => match value.parse::<usize>() {
+            Ok(parsed) if parsed >= 1 => parsed,
+            _ => panic!("{name} must be a positive integer, got {value:?}"),
+        },
+        Err(_) => default,
+    }
+}
+
+/// A write with its sequence number and WAL entry, whose rows are not yet in
+/// the memtable and whose sequence number is not yet visible to readers.
+struct PreparedWrite {
+    commit_seq: u64,
+    now: i64,
+    entries: Vec<RowEntry>,
+    touched_segments: BTreeSet<Bytes>,
+    entries_size: u64,
+}
 
 /// A message processed by the batch writer event loop.
 #[allow(clippy::large_enum_variant)]
@@ -99,6 +136,8 @@ impl std::fmt::Debug for BatchWriterMessage {
 pub(crate) struct WriteBatchEventHandler {
     db_inner: Arc<DbInner>,
     wal_writer: Option<Box<dyn WalWriter>>,
+    /// The writer's own queue, drained to apply queued writes as a group.
+    group_rx: Option<async_channel::Receiver<BatchWriterMessage>>,
 }
 
 impl WriteBatchEventHandler {
@@ -106,7 +145,134 @@ impl WriteBatchEventHandler {
         Self {
             db_inner,
             wal_writer,
+            group_rx: None,
         }
+    }
+
+    /// Lets the writer drain `rx` and apply the writes queued there as one group.
+    pub(crate) fn with_group_rx(mut self, rx: async_channel::Receiver<BatchWriterMessage>) -> Self {
+        self.group_rx = Some(rx);
+        self
+    }
+
+    /// Applies `first` together with the non-transactional writes queued behind
+    /// it. Each write gets its sequence number and WAL entry in queue order, the
+    /// group's rows go into the memtable in parallel, and only then do the
+    /// sequence numbers become visible, so readers never see a gap. A
+    /// transactional write is applied on its own, since its conflict check must
+    /// see every earlier write already tracked.
+    async fn handle_writes(&mut self, first: WriteBatchRequest) -> Result<(), SlateDBError> {
+        let mut group = vec![first];
+        let mut deferred = None;
+        if group[0].txn.is_none() {
+            if let Some(rx) = &self.group_rx {
+                let max = write_group_max();
+                while group.len() < max {
+                    match rx.try_recv() {
+                        Ok(BatchWriterMessage::WriteBatch(request)) if request.txn.is_none() => {
+                            group.push(request)
+                        }
+                        Ok(message) => {
+                            deferred = Some(message);
+                            break;
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
+        }
+        if group.len() == 1 {
+            let request = group.pop().expect("group has one write");
+            self.handle_one_write(request).await?;
+        } else {
+            self.handle_write_group(group).await?;
+        }
+        match deferred {
+            Some(message) => self.handle(message).await,
+            None => Ok(()),
+        }
+    }
+
+    async fn handle_one_write(&mut self, request: WriteBatchRequest) -> Result<(), SlateDBError> {
+        let WriteBatchRequest {
+            batch,
+            options,
+            done,
+            txn,
+        } = request;
+        let wal_writer = self.wal_writer.as_deref_mut();
+        let result = self
+            .db_inner
+            .write_batch(batch, &options, txn.as_ref(), wal_writer)
+            .await;
+        match result {
+            Ok(write_result) => {
+                let _ = done.send(write_result);
+                Ok(())
+            }
+            Err(error) => {
+                let _ = done.send(Err(error.clone()));
+                Err(error)
+            }
+        }
+    }
+
+    async fn handle_write_group(
+        &mut self,
+        group: Vec<WriteBatchRequest>,
+    ) -> Result<(), SlateDBError> {
+        let mut ready = Vec::with_capacity(group.len());
+        let mut prepared = Vec::with_capacity(group.len());
+        let mut requests = group.into_iter();
+        while let Some(request) = requests.next() {
+            let wal_writer = self.wal_writer.as_deref_mut();
+            match self
+                .db_inner
+                .prepare_write(&request.batch, &request.options, None, wal_writer)
+                .await
+            {
+                Ok(Ok(write)) => {
+                    prepared.push(write);
+                    ready.push(request);
+                }
+                Ok(Err(error)) => {
+                    let _ = request.done.send(Err(error));
+                }
+                Err(error) => {
+                    // A fatal error stops the writer, so fail everything still waiting.
+                    for request in ready.into_iter().chain(requests) {
+                        let _ = request.done.send(Err(error.clone()));
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        self.db_inner.insert_prepared(&mut prepared).await;
+        let mut handles = Vec::with_capacity(ready.len());
+        for (request, write) in ready.iter().zip(&prepared) {
+            match self.db_inner.finish_write(&request.batch, None, write) {
+                Ok(handle) => handles.push(handle),
+                Err(error) => {
+                    for request in ready {
+                        let _ = request.done.send(Err(error.clone()));
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        if let Err(error) = self
+            .db_inner
+            .maybe_freeze_current_memtable(self.wal_writer.as_deref())
+        {
+            for request in ready {
+                let _ = request.done.send(Err(error.clone()));
+            }
+            return Err(error);
+        }
+        for (request, handle) in ready.into_iter().zip(handles) {
+            let _ = request.done.send(Ok(handle));
+        }
+        Ok(())
     }
 }
 
@@ -114,28 +280,7 @@ impl WriteBatchEventHandler {
 impl MessageHandler<BatchWriterMessage> for WriteBatchEventHandler {
     async fn handle(&mut self, message: BatchWriterMessage) -> Result<(), SlateDBError> {
         match message {
-            BatchWriterMessage::WriteBatch(WriteBatchRequest {
-                batch,
-                options,
-                done,
-                txn,
-            }) => {
-                let wal_writer = self.wal_writer.as_deref_mut();
-                let result = self
-                    .db_inner
-                    .write_batch(batch, &options, txn.as_ref(), wal_writer)
-                    .await;
-                match result {
-                    Ok(write_result) => {
-                        let _ = done.send(write_result);
-                        Ok(())
-                    }
-                    Err(error) => {
-                        let _ = done.send(Err(error.clone()));
-                        Err(error)
-                    }
-                }
-            }
+            BatchWriterMessage::WriteBatch(request) => self.handle_writes(request).await,
             BatchWriterMessage::Flush(flush_msg) => {
                 let BatchWriterFlush {
                     freeze_memtable,
@@ -196,6 +341,30 @@ impl DbInner {
         txn: Option<&DbTransaction>,
         mut wal_writer: Option<&mut (dyn WalWriter + 'static)>,
     ) -> Result<WriteBatchResult, SlateDBError> {
+        let mut prepared = match self
+            .prepare_write(&batch, options, txn, wal_writer.as_deref_mut())
+            .await?
+        {
+            Ok(prepared) => prepared,
+            Err(error) => return Ok(Err(error)),
+        };
+        self.insert_prepared(std::slice::from_mut(&mut prepared))
+            .await;
+        let write_handle = self.finish_write(&batch, txn, &prepared)?;
+        // maybe freeze the memtable.
+        self.maybe_freeze_current_memtable(wal_writer.as_deref())?;
+        Ok(Ok(write_handle))
+    }
+
+    /// Assigns the batch its sequence number and appends it to the WAL. The rows
+    /// are not yet in the memtable and the sequence number is not yet visible.
+    async fn prepare_write(
+        &self,
+        batch: &WriteBatch,
+        options: &WriteOptions,
+        txn: Option<&DbTransaction>,
+        wal_writer: Option<&mut (dyn WalWriter + 'static)>,
+    ) -> Result<Result<PreparedWrite, SlateDBError>, SlateDBError> {
         let _options = options;
         #[cfg(not(dst))]
         let now = self.mono_clock.now().await?;
@@ -252,7 +421,7 @@ impl DbInner {
             return Ok(Err(error));
         }
 
-        if let Some(wal_writer) = wal_writer.as_mut() {
+        if let Some(wal_writer) = wal_writer {
             assert!(self.wal_enabled);
             // WAL entries must be appended to the wal buffer atomically. Otherwise,
             // the WAL buffer might flush the entries in the middle of the batch, which
@@ -262,14 +431,72 @@ impl DbInner {
             wal_writer.append(&entries).await?;
             // TODO: handle sync here, if sync is enabled, we can call `flush` here. let's put this
             // in another Pull Request.
-            self.write_entries_to_memtable(entries, touched_segments);
         } else {
             assert!(!self.wal_enabled);
-            self.write_entries_to_memtable(entries, touched_segments);
+        }
+        Ok(Ok(PreparedWrite {
+            commit_seq,
+            now,
+            entries,
+            touched_segments,
+            entries_size,
+        }))
+    }
+
+    /// Inserts prepared rows into the current memtable, spreading large groups
+    /// over several tasks. The batch writer is the only caller, and outside of
+    /// startup replay it is also the only code that freezes the memtable, so the
+    /// memtable cannot be frozen while the rows go in. The rows stay invisible
+    /// until [`Self::finish_write`] advances the committed sequence number.
+    async fn insert_prepared(&self, prepared: &mut [PreparedWrite]) {
+        let table = {
+            let guard = self.state.read();
+            let memtable = guard.memtable();
+            for write in prepared.iter_mut() {
+                let touched_segments = std::mem::take(&mut write.touched_segments);
+                self.status_manager.add_memtable_segments(&touched_segments);
+                memtable.record_touched_segments(touched_segments);
+            }
+            Arc::clone(memtable.table())
         };
+        let mut rows: Vec<RowEntry> = prepared
+            .iter_mut()
+            .flat_map(|write| std::mem::take(&mut write.entries))
+            .collect();
+        let tasks = memtable_insert_tasks();
+        if tasks <= 1 || rows.len() < 2 * MIN_ROWS_PER_INSERT_TASK {
+            rows.into_iter().for_each(|row| table.put(row));
+            return;
+        }
+        let chunk = rows.len().div_ceil(tasks).max(MIN_ROWS_PER_INSERT_TASK);
+        let mut handles = Vec::with_capacity(tasks);
+        while rows.len() > chunk {
+            let tail = rows.split_off(rows.len() - chunk);
+            let table = Arc::clone(&table);
+            handles.push(tokio::spawn(async move {
+                tail.into_iter().for_each(|row| table.put(row));
+            }));
+        }
+        rows.into_iter().for_each(|row| table.put(row));
+        for handle in handles {
+            handle.await.expect("memtable insert task panicked");
+        }
+    }
+
+    /// Publishes a write whose rows are in the memtable: records it for conflict
+    /// checks and advances the committed sequence number, making it visible.
+    fn finish_write(
+        &self,
+        batch: &WriteBatch,
+        txn: Option<&DbTransaction>,
+        prepared: &PreparedWrite,
+    ) -> Result<WriteHandle, SlateDBError> {
+        let commit_seq = prepared.commit_seq;
         // increment memtable_write_bytes by the size of the keys and values inserted into the memtable
         // after merge operators and overwrites are collapsed
-        self.db_stats.memtable_write_bytes.increment(entries_size);
+        self.db_stats
+            .memtable_write_bytes
+            .increment(prepared.entries_size);
 
         // insert a fail point to make it easier to test the case where the last_committed_seq is not updated.
         // this is useful for testing the case where the reader is not able to see the writes.
@@ -302,13 +529,11 @@ impl DbInner {
         // record the memtable sequence in the memtable's sequence tracker.
         self.record_memtable_sequence(commit_seq);
 
-        // maybe freeze the memtable.
-        self.maybe_freeze_current_memtable(wal_writer.as_deref())?;
-
-        let write_handle =
-            WriteHandle::new_with_waiter(commit_seq, now, self.status_manager.durability_waiter());
-
-        Ok(Ok(write_handle))
+        Ok(WriteHandle::new_with_waiter(
+            commit_seq,
+            prepared.now,
+            self.status_manager.durability_waiter(),
+        ))
     }
 
     fn maybe_freeze_current_memtable(
@@ -449,19 +674,6 @@ impl DbInner {
     /// the batch's touched-segment prefixes on it. Returns a durable
     /// watcher for the memtable. When no extractor is configured,
     /// `touched_segments` is empty and recording is a no-op.
-    fn write_entries_to_memtable(
-        &self,
-        entries: Vec<RowEntry>,
-        touched_segments: BTreeSet<Bytes>,
-    ) -> WatchableOnceCellReader<Result<(), SlateDBError>> {
-        let guard = self.state.read();
-        let memtable = guard.memtable();
-        self.status_manager.add_memtable_segments(&touched_segments);
-        memtable.record_touched_segments(touched_segments.clone());
-        entries.into_iter().for_each(|entry| memtable.put(entry));
-        memtable.table().durable_watcher()
-    }
-
     fn record_memtable_sequence(&self, seq: u64) {
         let ts = self.system_clock.now();
         let guard = self.state.read();
