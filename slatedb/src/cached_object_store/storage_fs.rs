@@ -67,20 +67,18 @@ impl FileHandleCache {
     /// Look up a cached file handle, or open the file and cache it.
     /// Returns `Ok(None)` if the file does not exist on disk.
     ///
-    /// No syscall runs while a shard is locked: the handle is cloned out
-    /// first, then validated, then reopened if needed. Holding a shard across
-    /// `fstat` or `open` would serialize every reader of that shard behind
-    /// the slowest one.
+    /// A hit runs no syscall. The cache does not check that a cached handle
+    /// still points to the file at `path`. Code that deletes or replaces a
+    /// cache file must call [`Self::invalidate`] after it.
+    ///
+    /// The `open` on a miss runs after the shard lock is released. If it ran
+    /// with the lock held, every reader of that shard would wait for it.
     fn get_or_open(
         &self,
         path: &std::path::Path,
     ) -> Result<Option<Arc<CachedFileHandle>>, std::io::Error> {
         if let Some(handle) = self.inner.get(path) {
-            if Self::is_valid(&handle, path) {
-                return Ok(Some(handle));
-            }
-            // Stale entry — drop it so the reopen below replaces it.
-            self.inner.remove(path);
+            return Ok(Some(handle));
         }
 
         let file = match std::fs::File::open(path) {
@@ -97,26 +95,6 @@ impl FileHandleCache {
         // the race costs a redundant open rather than correctness.
         self.inner.insert(path.to_path_buf(), handle.clone());
         Ok(Some(handle))
-    }
-
-    /// Check whether a cached file descriptor still refers to a live file.
-    ///
-    /// On Unix an unlinked file keeps its data accessible through open fds,
-    /// but `fstat` will report `nlink == 0`. This single in-kernel syscall is
-    /// much cheaper than a full `open` and lets us detect deleted or replaced
-    /// files without a TOCTOU-prone path `stat`.
-    ///
-    /// On non-Unix platforms (e.g. Windows), we fall back to checking whether
-    /// the path still exists on disk.
-    #[cfg(unix)]
-    fn is_valid(handle: &CachedFileHandle, _path: &std::path::Path) -> bool {
-        use std::os::unix::fs::MetadataExt;
-        handle.file().metadata().is_ok_and(|m| m.nlink() > 0)
-    }
-
-    #[cfg(not(unix))]
-    fn is_valid(_handle: &CachedFileHandle, path: &std::path::Path) -> bool {
-        path.exists()
     }
 
     /// Remove a cached handle, e.g. after eviction or after a write replaces
@@ -194,6 +172,13 @@ impl FsCacheStorage {
     #[cfg(test)]
     pub(crate) fn file_handle_cache_population(&self) -> usize {
         self.file_handle_cache.inner.len()
+    }
+
+    /// Deletes a cache file and removes its cached handle, as the evictor does.
+    #[cfg(test)]
+    pub(crate) fn remove_cache_file(&self, path: &std::path::Path) {
+        std::fs::remove_file(path).unwrap();
+        self.file_handle_cache.invalidate(path);
     }
 }
 

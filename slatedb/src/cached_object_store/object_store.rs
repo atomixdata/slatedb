@@ -1,4 +1,4 @@
-use crate::cached_object_store::head_cache::HeadCache;
+use crate::cached_object_store::head_cache::{HeadCache, DEFAULT_HEAD_CACHE_CAPACITY};
 use crate::cached_object_store::policy::{
     CachePutConfig, DefaultGetPolicy, DefaultPutPolicy, GetAction, GetPolicy, HeadAction,
     PutAction, PutPolicy,
@@ -120,7 +120,7 @@ impl CachedObjectStore {
             head_flights: SingleFlight::new(),
             prefetch_flights: SingleFlight::new(),
             part_flights: SingleFlight::new(),
-            head_cache: Arc::new(HeadCache::new()),
+            head_cache: Arc::new(HeadCache::new(DEFAULT_HEAD_CACHE_CAPACITY)),
         }))
     }
 
@@ -284,8 +284,8 @@ impl CachedObjectStore {
         // upstream HEAD round trip.
         if let Some(head) = self.head_cache.get(location) {
             return Ok(head_only_get_result(
-                head.meta.clone(),
-                head.attributes.clone(),
+                head.meta,
+                head.attributes,
                 Extensions::new(),
             ));
         }
@@ -442,8 +442,8 @@ impl CachedObjectStore {
         // dominates the miss path once head files fall out of the OS page cache.
         if let Some(head) = self.head_cache.get(location) {
             return Ok(PrefetchedHead {
-                meta: head.meta.clone(),
-                attributes: head.attributes.clone(),
+                meta: head.meta,
+                attributes: head.attributes,
                 extensions: Extensions::new(),
                 head_source: ReadResultSource::Disk,
             });
@@ -1479,7 +1479,7 @@ mod tests {
         let part_size = 1024;
         let cached_store = CachedObjectStore::new(
             object_store.clone(),
-            cache_storage,
+            cache_storage.clone(),
             part_size,
             CachePutConfig::default(),
             stats,
@@ -1518,7 +1518,7 @@ mod tests {
         // delete part 2, known_cache_size is still known
         let evict_part_path =
             FsCacheEntry::make_part_path(test_cache_folder.clone(), &location, 2, 1024);
-        std::fs::remove_file(evict_part_path).unwrap();
+        cache_storage.remove_cache_file(&evict_part_path);
         assert_eq!(entry.read_part(2, 0..part_size).await?, None);
         let cached_parts = entry.cached_parts().await?;
         assert_eq!(cached_parts, vec![0, 1, 3]);
@@ -1526,7 +1526,7 @@ mod tests {
         // delete part 3, known_cache_size become None
         let evict_part_path =
             FsCacheEntry::make_part_path(test_cache_folder.clone(), &location, 3, 1024);
-        std::fs::remove_file(evict_part_path).unwrap();
+        cache_storage.remove_cache_file(&evict_part_path);
         assert_eq!(entry.read_part(3, 0..part_size).await?, None);
         let cached_parts = entry.cached_parts().await?;
         assert_eq!(cached_parts, vec![0, 1]);
@@ -1562,7 +1562,7 @@ mod tests {
 
         let cached_store = CachedObjectStore::new(
             object_store,
-            cache_storage,
+            cache_storage.clone(),
             part_size,
             CachePutConfig::default(),
             stats,
@@ -1588,7 +1588,7 @@ mod tests {
 
         let evict_part_path =
             FsCacheEntry::make_part_path(test_cache_folder.clone(), &location, 2, part_size);
-        std::fs::remove_file(evict_part_path).unwrap();
+        cache_storage.remove_cache_file(&evict_part_path);
         assert_eq!(entry.read_part(2, 0..part_size).await?, None);
 
         let cached_parts = entry.cached_parts().await?;
@@ -2453,7 +2453,7 @@ mod tests {
             .unwrap();
         let part_path =
             FsCacheEntry::make_part_path(test_cache_folder.clone(), &location, 1, part_size);
-        std::fs::remove_file(&part_path).unwrap();
+        cache_storage.remove_cache_file(&part_path);
 
         // The backend truncates the next ranged body to 1 byte but reports
         // success, mimicking a response cut mid-body without a stream error.

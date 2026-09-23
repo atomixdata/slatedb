@@ -1,11 +1,12 @@
-use crossbeam_skiplist::SkipMap;
 use object_store::{path::Path, Attributes, ObjectMeta};
-use std::sync::Arc;
 
-/// A cached object head: the metadata returned by a HEAD request together with
-/// the object's attributes. Stored behind an `Arc` so a cache hit clones only a
-/// pointer rather than the underlying `ObjectMeta`/`Attributes`.
-#[derive(Debug)]
+/// The default maximum number of heads in a [`HeadCache`]. One entry uses a
+/// few hundred bytes, so a full cache uses tens of megabytes.
+pub(crate) const DEFAULT_HEAD_CACHE_CAPACITY: usize = 100_000;
+
+/// A cached object head. It holds the metadata that a HEAD request returns and
+/// the attributes of the object.
+#[derive(Debug, Clone)]
 pub(crate) struct CachedHead {
     pub(crate) meta: ObjectMeta,
     pub(crate) attributes: Attributes,
@@ -14,60 +15,52 @@ pub(crate) struct CachedHead {
 /// An in-memory cache of object heads (HEAD metadata) that sits in front of the
 /// on-disk head cache in [`super::CachedObjectStore`].
 ///
-/// It is populated on write paths (`cached_put_opts` after the on-disk
-/// `save_head` succeeds, and the multipart commit), by the startup preload
-/// (`warm()`), and by reads that fall through to a successful on-disk head read.
-/// Filling from the on-disk head stays coherent because that head is
-/// authoritative and entries are removed/overwritten on delete and
-/// rename/copy. A hit here skips both the on-disk head read (spawn_blocking +
-/// file-handle lock + JSON parse) and the upstream HEAD round trip.
+/// These paths put heads into the cache: the write paths (`cached_put_opts`
+/// and the multipart commit), the startup preload (`warm()`), and reads that
+/// find the head on disk. Delete, rename and copy remove the head of each
+/// object that they change. A hit skips the on-disk head read (spawn_blocking,
+/// file-handle lookup and JSON parse) and the upstream HEAD request.
 ///
-/// Entries are removed when the underlying object is deleted (or overwritten via
-/// rename/copy) so a later reader never sees stale metadata. There is no size
-/// bound: each entry is ~hundreds of bytes and the live SST working set is
-/// small, so the map stays in the low megabytes.
-///
-/// Backed by a lock-free [`SkipMap`] (the same structure the memtable uses):
-/// reads take no lock and never block concurrent writers, which is what this
-/// read-heavy, write-rare cache wants.
+/// The cache is a [`quick_cache::sync::Cache`] with a fixed maximum number of
+/// entries. The cache is split into shards, and a hit takes only a read lock on
+/// one shard. When the cache is full, it evicts heads that are used the least.
+/// An evicted head is not an error, because the next read gets the head from
+/// disk or from the object store.
 pub(crate) struct HeadCache {
-    entries: SkipMap<Path, Arc<CachedHead>>,
+    entries: quick_cache::sync::Cache<Path, CachedHead>,
 }
 
 impl std::fmt::Debug for HeadCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HeadCache")
             .field("len", &self.entries.len())
+            .field("cap", &self.entries.capacity())
             .finish()
     }
 }
 
 impl HeadCache {
-    pub(crate) fn new() -> Self {
+    /// Creates a cache that holds at most `max_entries` heads.
+    pub(crate) fn new(max_entries: usize) -> Self {
         Self {
-            entries: SkipMap::new(),
+            entries: quick_cache::sync::Cache::new(max_entries),
         }
     }
 
-    /// Returns the cached head for `location`, or `None` on a miss. Lock-free:
-    /// clones an `Arc` out of the map guard.
-    pub(crate) fn get(&self, location: &Path) -> Option<Arc<CachedHead>> {
-        self.entries
-            .get(location)
-            .map(|entry| entry.value().clone())
+    /// Returns a copy of the cached head for `location`, or `None` on a miss.
+    pub(crate) fn get(&self, location: &Path) -> Option<CachedHead> {
+        self.entries.get(location)
     }
 
-    /// Inserts (or overwrites) the head for `location`. Called from write paths
-    /// once the object is durable upstream, so the entry always reflects the
-    /// just-written content.
+    /// Inserts the head for `location`, or replaces the current head. The
+    /// write paths call it after the object is durable in the object store.
     pub(crate) fn insert(&self, location: &Path, meta: ObjectMeta, attributes: Attributes) {
         self.entries
-            .insert(location.clone(), Arc::new(CachedHead { meta, attributes }));
+            .insert(location.clone(), CachedHead { meta, attributes });
     }
 
-    /// Drops the head for `location`, if present. Called when the underlying
-    /// object is deleted or overwritten via rename/copy. Best-effort: the
-    /// absence of an entry is fine.
+    /// Removes the head for `location`. Delete, rename and copy call it. If
+    /// there is no head for `location`, it does nothing.
     pub(crate) fn remove(&self, location: &Path) {
         self.entries.remove(location);
     }
@@ -95,7 +88,7 @@ mod tests {
 
     #[test]
     fn test_insert_get_remove() {
-        let cache = HeadCache::new();
+        let cache = HeadCache::new(DEFAULT_HEAD_CACHE_CAPACITY);
         let path = Path::from("a/b/c");
         assert!(cache.get(&path).is_none());
 
@@ -109,7 +102,7 @@ mod tests {
 
     #[test]
     fn test_insert_overwrites_in_place() {
-        let cache = HeadCache::new();
+        let cache = HeadCache::new(DEFAULT_HEAD_CACHE_CAPACITY);
         let path = Path::from("k");
         cache.insert(&path, meta(&path, 1), Attributes::new());
         cache.insert(&path, meta(&path, 2), Attributes::new());
@@ -120,14 +113,15 @@ mod tests {
     #[test]
     fn test_concurrent_reads_during_writes() {
         use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
         use std::thread;
 
-        let cache = Arc::new(HeadCache::new());
+        let cache = Arc::new(HeadCache::new(DEFAULT_HEAD_CACHE_CAPACITY));
         let path = Path::from("hot");
         cache.insert(&path, meta(&path, 1), Attributes::new());
 
         let stop = Arc::new(AtomicBool::new(false));
-        // Readers spin on lock-free gets while a writer churns the entry.
+        // Readers call get in a loop while a writer replaces the entry.
         let readers: Vec<_> = (0..4)
             .map(|_| {
                 let cache = cache.clone();
@@ -150,5 +144,21 @@ mod tests {
         for r in readers {
             r.join().unwrap();
         }
+    }
+
+    #[test]
+    fn test_len_stays_within_capacity() {
+        let capacity = 100;
+        let cache = HeadCache::new(capacity);
+        for i in 0..(capacity * 10) {
+            let path = Path::from(format!("obj-{i}"));
+            cache.insert(&path, meta(&path, i as u64), Attributes::new());
+        }
+        assert!(
+            cache.len() <= capacity,
+            "len {} > {}",
+            cache.len(),
+            capacity
+        );
     }
 }
