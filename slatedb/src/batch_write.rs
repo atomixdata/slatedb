@@ -126,6 +126,13 @@ fn write_group_max() -> usize {
     *VALUE.get_or_init(|| env_usize("SLATEDB_WRITE_GROUP_MAX", 256))
 }
 
+/// Whether the writer starts the next group while the previous group's rows are
+/// still being inserted. `SLATEDB_WRITE_PIPELINE=0` finishes each group first.
+fn write_pipeline() -> bool {
+    static VALUE: OnceLock<bool> = OnceLock::new();
+    *VALUE.get_or_init(|| std::env::var("SLATEDB_WRITE_PIPELINE").as_deref() != Ok("0"))
+}
+
 /// Tasks that insert a group's rows into the memtable.
 /// `SLATEDB_MEMTABLE_INSERT_TASKS=1` inserts on the writer alone.
 fn memtable_insert_tasks() -> usize {
@@ -142,6 +149,23 @@ fn env_usize(name: &str, default: usize) -> usize {
         },
         Err(_) => default,
     }
+}
+
+/// Answers every request in the group with `error`.
+fn fail_group(requests: Vec<WriteBatchRequest>, error: &SlateDBError) {
+    for request in requests {
+        let _ = request.done.send(Err(error.clone()));
+    }
+}
+
+/// A group whose rows are being inserted by spawned tasks. Its writes become
+/// visible, and their callers are answered, in [`WriteBatchEventHandler::finish_group`].
+struct InFlightGroup {
+    requests: Vec<WriteBatchRequest>,
+    prepared: Vec<PreparedWrite>,
+    inserts: Vec<tokio::task::JoinHandle<()>>,
+    rows: usize,
+    started: std::time::Instant,
 }
 
 /// A write with its sequence number and WAL entry, whose rows are not yet in
@@ -205,6 +229,9 @@ pub(crate) struct WriteBatchEventHandler {
     wal_writer: Option<Box<dyn WalWriter>>,
     /// The writer's own queue, drained to apply queued writes as a group.
     group_rx: Option<async_channel::Receiver<BatchWriterMessage>>,
+    /// A message drained from `group_rx` that could not join the group. It is
+    /// handled next, before anything else is read from the queue.
+    stashed: Option<BatchWriterMessage>,
 }
 
 impl WriteBatchEventHandler {
@@ -213,6 +240,7 @@ impl WriteBatchEventHandler {
             db_inner,
             wal_writer,
             group_rx: None,
+            stashed: None,
         }
     }
 
@@ -222,42 +250,190 @@ impl WriteBatchEventHandler {
         self
     }
 
-    /// Applies `first` together with the non-transactional writes queued behind
-    /// it. Each write gets its sequence number and WAL entry in queue order, the
-    /// group's rows go into the memtable in parallel, and only then do the
-    /// sequence numbers become visible, so readers never see a gap. A
-    /// transactional write is applied on its own, since its conflict check must
-    /// see every earlier write already tracked.
+    /// Applies `first` and the writes queued behind it in groups. Each write
+    /// gets its sequence number (and WAL entry) in queue order, a group's rows
+    /// go into the memtable from parallel tasks, and a group's sequence numbers
+    /// become visible only once its rows are in, in group order, so readers
+    /// never see a gap. The writer prepares the next group while the previous
+    /// one inserts. The memtable is frozen only with nothing in flight, and a
+    /// transactional write is applied on its own, since its conflict check
+    /// must see every earlier write already tracked.
     async fn handle_writes(&mut self, first: WriteBatchRequest) -> Result<(), SlateDBError> {
-        let mut group = vec![first];
-        let mut deferred = None;
-        if group[0].txn.is_none() {
-            if let Some(rx) = &self.group_rx {
-                let max = write_group_max();
-                while group.len() < max {
-                    match rx.try_recv() {
-                        Ok(BatchWriterMessage::WriteBatch(request)) if request.txn.is_none() => {
-                            group.push(request)
+        let mut pending: Option<InFlightGroup> = None;
+        let mut next = Some(first);
+        while let Some(first) = next.take() {
+            let transactional = first.txn.is_some();
+            let should_freeze = match self
+                .db_inner
+                .memtable_should_freeze(self.wal_writer.as_deref())
+            {
+                Ok(should_freeze) => should_freeze,
+                Err(error) => {
+                    if let Some(group) = pending.take() {
+                        fail_group(group.requests, &error);
+                    }
+                    let _ = first.done.send(Err(error.clone()));
+                    return Err(error);
+                }
+            };
+            if transactional || should_freeze {
+                if let Some(group) = pending.take() {
+                    self.finish_group(group, true).await?;
+                }
+            }
+            if transactional {
+                self.handle_one_write(first).await?;
+            } else {
+                let group = self.collect_group(first);
+                let started = match self.start_group(group).await {
+                    Ok(started) => started,
+                    Err(error) => {
+                        if let Some(group) = pending.take() {
+                            fail_group(group.requests, &error);
                         }
-                        Ok(message) => {
-                            deferred = Some(message);
-                            break;
-                        }
-                        Err(_) => break,
+                        return Err(error);
+                    }
+                };
+                if let Some(group) = pending.take() {
+                    self.finish_group(group, false).await?;
+                }
+                pending = started;
+                if !write_pipeline() {
+                    if let Some(group) = pending.take() {
+                        self.finish_group(group, true).await?;
                     }
                 }
             }
+            let next_message = match self.stashed.take() {
+                Some(message) => Some(Ok(message)),
+                None => self.group_rx.as_ref().map(|rx| rx.try_recv()),
+            };
+            match next_message {
+                Some(Ok(BatchWriterMessage::WriteBatch(request))) => next = Some(request),
+                Some(Ok(message)) => {
+                    if let Some(group) = pending.take() {
+                        self.finish_group(group, true).await?;
+                    }
+                    return self.handle(message).await;
+                }
+                _ => {}
+            }
         }
-        if group.len() == 1 {
-            let request = group.pop().expect("group has one write");
-            self.handle_one_write(request).await?;
-        } else {
-            self.handle_write_group(group).await?;
+        if let Some(group) = pending.take() {
+            self.finish_group(group, true).await?;
         }
-        match deferred {
-            Some(message) => self.handle(message).await,
-            None => Ok(()),
+        Ok(())
+    }
+
+    /// `first` plus the non-transactional writes queued right behind it.
+    fn collect_group(&mut self, first: WriteBatchRequest) -> Vec<WriteBatchRequest> {
+        let mut group = vec![first];
+        let Some(rx) = self.group_rx.clone() else {
+            return group;
+        };
+        let max = write_group_max();
+        while group.len() < max {
+            match rx.try_recv() {
+                Ok(BatchWriterMessage::WriteBatch(request)) if request.txn.is_none() => {
+                    group.push(request)
+                }
+                Ok(message) => {
+                    self.stashed = Some(message);
+                    break;
+                }
+                Err(_) => break,
+            }
         }
+        group
+    }
+
+    /// Prepares the group's writes in order and spawns the tasks that insert
+    /// their rows. Returns `None` if every write in the group was rejected.
+    async fn start_group(
+        &mut self,
+        group: Vec<WriteBatchRequest>,
+    ) -> Result<Option<InFlightGroup>, SlateDBError> {
+        let started = std::time::Instant::now();
+        let mut ready = Vec::with_capacity(group.len());
+        let mut prepared = Vec::with_capacity(group.len());
+        let mut requests = group.into_iter();
+        while let Some(request) = requests.next() {
+            let wal_writer = self.wal_writer.as_deref_mut();
+            match self
+                .db_inner
+                .prepare_write(&request.batch, &request.options, None, wal_writer)
+                .await
+            {
+                Ok(Ok(write)) => {
+                    prepared.push(write);
+                    ready.push(request);
+                }
+                Ok(Err(error)) => {
+                    let _ = request.done.send(Err(error));
+                }
+                Err(error) => {
+                    // A fatal error stops the writer, so fail everything still waiting.
+                    let _ = request.done.send(Err(error.clone()));
+                    fail_group(ready.into_iter().chain(requests).collect(), &error);
+                    return Err(error);
+                }
+            }
+        }
+        if ready.is_empty() {
+            return Ok(None);
+        }
+        let rows = prepared.iter().map(|write| write.entries.len()).sum();
+        let inserts = self.db_inner.start_inserts(&mut prepared);
+        Ok(Some(InFlightGroup {
+            requests: ready,
+            prepared,
+            inserts,
+            rows,
+            started,
+        }))
+    }
+
+    /// Waits for the group's rows, makes its writes visible and answers them.
+    /// `may_freeze` is false while a later group is still inserting, since the
+    /// memtable must not be frozen under it.
+    async fn finish_group(
+        &mut self,
+        group: InFlightGroup,
+        may_freeze: bool,
+    ) -> Result<(), SlateDBError> {
+        let tasks = group.inserts.len().max(1);
+        for insert in group.inserts {
+            insert.await.expect("memtable insert task panicked");
+        }
+        group_stats::record(
+            group.requests.len(),
+            group.rows,
+            tasks,
+            group.started.elapsed().as_nanos() as u64,
+        );
+        let mut handles = Vec::with_capacity(group.requests.len());
+        for (request, write) in group.requests.iter().zip(&group.prepared) {
+            match self.db_inner.finish_write(&request.batch, None, write) {
+                Ok(handle) => handles.push(handle),
+                Err(error) => {
+                    fail_group(group.requests, &error);
+                    return Err(error);
+                }
+            }
+        }
+        if may_freeze {
+            if let Err(error) = self
+                .db_inner
+                .maybe_freeze_current_memtable(self.wal_writer.as_deref())
+            {
+                fail_group(group.requests, &error);
+                return Err(error);
+            }
+        }
+        for (request, handle) in group.requests.into_iter().zip(handles) {
+            let _ = request.done.send(Ok(handle));
+        }
+        Ok(())
     }
 
     async fn handle_one_write(&mut self, request: WriteBatchRequest) -> Result<(), SlateDBError> {
@@ -282,64 +458,6 @@ impl WriteBatchEventHandler {
                 Err(error)
             }
         }
-    }
-
-    async fn handle_write_group(
-        &mut self,
-        group: Vec<WriteBatchRequest>,
-    ) -> Result<(), SlateDBError> {
-        let mut ready = Vec::with_capacity(group.len());
-        let mut prepared = Vec::with_capacity(group.len());
-        let mut requests = group.into_iter();
-        while let Some(request) = requests.next() {
-            let wal_writer = self.wal_writer.as_deref_mut();
-            match self
-                .db_inner
-                .prepare_write(&request.batch, &request.options, None, wal_writer)
-                .await
-            {
-                Ok(Ok(write)) => {
-                    prepared.push(write);
-                    ready.push(request);
-                }
-                Ok(Err(error)) => {
-                    let _ = request.done.send(Err(error));
-                }
-                Err(error) => {
-                    // A fatal error stops the writer, so fail everything still waiting.
-                    for request in ready.into_iter().chain(requests) {
-                        let _ = request.done.send(Err(error.clone()));
-                    }
-                    return Err(error);
-                }
-            }
-        }
-        self.db_inner.insert_prepared(&mut prepared).await;
-        let mut handles = Vec::with_capacity(ready.len());
-        for (request, write) in ready.iter().zip(&prepared) {
-            match self.db_inner.finish_write(&request.batch, None, write) {
-                Ok(handle) => handles.push(handle),
-                Err(error) => {
-                    for request in ready {
-                        let _ = request.done.send(Err(error.clone()));
-                    }
-                    return Err(error);
-                }
-            }
-        }
-        if let Err(error) = self
-            .db_inner
-            .maybe_freeze_current_memtable(self.wal_writer.as_deref())
-        {
-            for request in ready {
-                let _ = request.done.send(Err(error.clone()));
-            }
-            return Err(error);
-        }
-        for (request, handle) in ready.into_iter().zip(handles) {
-            let _ = request.done.send(Ok(handle));
-        }
-        Ok(())
     }
 }
 
@@ -510,12 +628,20 @@ impl DbInner {
         }))
     }
 
-    /// Inserts prepared rows into the current memtable, spreading large groups
-    /// over several tasks. The batch writer is the only caller, and outside of
-    /// startup replay it is also the only code that freezes the memtable, so the
-    /// memtable cannot be frozen while the rows go in. The rows stay invisible
-    /// until [`Self::finish_write`] advances the committed sequence number.
+    /// Inserts one prepared write's rows into the current memtable and waits.
     async fn insert_prepared(&self, prepared: &mut [PreparedWrite]) {
+        for insert in self.start_inserts(prepared) {
+            insert.await.expect("memtable insert task panicked");
+        }
+    }
+
+    /// Starts inserting prepared rows into the current memtable from spawned
+    /// tasks and returns them; a small group is inserted inline and returns
+    /// none. The batch writer is the only caller, and outside of startup replay
+    /// it is also the only code that freezes the memtable, and it does so only
+    /// with no inserts in flight. The rows stay invisible until
+    /// [`Self::finish_write`] advances the committed sequence number.
+    fn start_inserts(&self, prepared: &mut [PreparedWrite]) -> Vec<tokio::task::JoinHandle<()>> {
         let table = {
             let guard = self.state.read();
             let memtable = guard.memtable();
@@ -530,34 +656,23 @@ impl DbInner {
             .iter_mut()
             .flat_map(|write| std::mem::take(&mut write.entries))
             .collect();
-        let started = std::time::Instant::now();
-        let (writes, row_count) = (prepared.len(), rows.len());
-        let min_rows = min_rows_per_insert_task();
-        let tasks = memtable_insert_tasks().min(rows.len() / min_rows).max(1);
+        let tasks = memtable_insert_tasks()
+            .min(rows.len() / min_rows_per_insert_task())
+            .max(1);
         if tasks <= 1 {
             rows.into_iter().for_each(|row| table.put(row));
-            group_stats::record(writes, row_count, 1, started.elapsed().as_nanos() as u64);
-            return;
+            return Vec::new();
         }
         let chunk = rows.len().div_ceil(tasks);
         let mut handles = Vec::with_capacity(tasks);
-        while rows.len() > chunk {
-            let tail = rows.split_off(rows.len() - chunk);
+        while !rows.is_empty() {
+            let tail = rows.split_off(rows.len().saturating_sub(chunk));
             let table = Arc::clone(&table);
             handles.push(tokio::spawn(async move {
                 tail.into_iter().for_each(|row| table.put(row));
             }));
         }
-        rows.into_iter().for_each(|row| table.put(row));
-        for handle in handles {
-            handle.await.expect("memtable insert task panicked");
-        }
-        group_stats::record(
-            writes,
-            row_count,
-            tasks,
-            started.elapsed().as_nanos() as u64,
-        );
+        handles
     }
 
     /// Publishes a write whose rows are in the memtable: records it for conflict
@@ -617,6 +732,20 @@ impl DbInner {
         &self,
         wal_writer: Option<&dyn WalWriter>,
     ) -> Result<(), SlateDBError> {
+        if !self.memtable_should_freeze(wal_writer)? {
+            return Ok(());
+        }
+        let replay_after_wal_id = self.wal_observer.status()?.last_flushed_wal_id;
+        let mut guard = self.state.write();
+        self.freeze_current_memtable_with_state_guard(&mut guard, replay_after_wal_id);
+        Ok(())
+    }
+
+    /// Whether the current memtable is due to be frozen.
+    fn memtable_should_freeze(
+        &self,
+        wal_writer: Option<&dyn WalWriter>,
+    ) -> Result<bool, SlateDBError> {
         // extract the information required to make a freeze decision under a read-lock first
         // so we don't call into `WalWriter` while holding a lock
         let (l0_sst_size_est, last_freeze_wal_id) = {
@@ -640,14 +769,7 @@ impl DbInner {
         let wal_should_flush_memtable = wal_writer
             .is_some_and(|wal_writer| wal_writer.should_flush_memtable(last_freeze_wal_id));
 
-        if !wal_should_flush_memtable && l0_sst_size_est < self.settings.l0_sst_size_bytes {
-            return Ok(());
-        }
-
-        let replay_after_wal_id = self.wal_observer.status()?.last_flushed_wal_id;
-        let mut guard = self.state.write();
-        self.freeze_current_memtable_with_state_guard(&mut guard, replay_after_wal_id);
-        Ok(())
+        Ok(wal_should_flush_memtable || l0_sst_size_est >= self.settings.l0_sst_size_bytes)
     }
 
     async fn flush_batch_writer(
