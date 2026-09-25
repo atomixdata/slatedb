@@ -590,17 +590,16 @@ impl TokioCompactionExecutorInner {
     }
 
     /// Executes a compaction job's subcompactions (RFC-0028), running every
-    /// range concurrently.
+    /// unfinished range concurrently.
     ///
     /// The plan is reported (and buffered by the worker for its next
     /// heartbeat to publish) before any range output is recorded against it;
     /// per-range output SSTs are then reported as they advance so an
-    /// interrupted compaction can resume at range granularity. Subcompactions
-    /// carry no persisted status, so every range is run: a range resumes from
-    /// the output recorded against it, and one that is already complete finds
-    /// nothing left to merge and finishes immediately. On the first range
-    /// failure the remaining subcompactions are aborted and the job fails;
-    /// progress recorded by then stays resumable.
+    /// interrupted compaction can resume at range granularity. Completed
+    /// ranges do not run again. Each other range resumes from the output
+    /// recorded against it. When the first range fails, the remaining
+    /// subcompactions are aborted and the job fails. Progress recorded by
+    /// then stays resumable.
     async fn execute_compaction_job(
         self: &Arc<Self>,
         id: Ulid,
@@ -621,9 +620,8 @@ impl TokioCompactionExecutorInner {
         // Per-range bytes-processed, summed into the job's progress total. Each
         // range folds its own resume offset into the values it reports (see
         // `start_bytes_processed` in `run_subcompaction_merge`), so a range's
-        // latest event is its full cumulative contribution across attempts —
-        // including a range that resumes already-complete, which reports its
-        // full estimated size up front.
+        // latest event is its full cumulative contribution across attempts.
+        // Completed ranges do not run, so they add nothing to the total.
         let mut bytes_processed_by_sub: Vec<u64> = vec![0; subcompaction_args.len()];
 
         // For a fresh job, report the plan immediately so the worker buffers
@@ -644,12 +642,19 @@ impl TokioCompactionExecutorInner {
             self.send_compaction_progress(id, 0, ctx.clone());
         }
 
+        let mut completed = ctx
+            .subcompactions()
+            .iter()
+            .map(|s| s.completed())
+            .collect::<Vec<_>>();
         let (sub_tx, mut sub_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut sub_tasks = Vec::new();
         for args in subcompaction_args {
-            // Each range runs as its own task, resuming from the output already
-            // recorded against it. A range whose output is already complete
-            // finds nothing left to merge and finishes immediately.
+            // A resumed job can have completed ranges. Their output is already
+            // stored, so they do not run again.
+            if completed[args.index] {
+                continue;
+            }
             let this = self.clone();
             let index = args.index;
             let sequence_tracker = sequence_tracker.clone();
@@ -696,7 +701,6 @@ impl TokioCompactionExecutorInner {
         }
         drop(sub_tx);
 
-        let mut completed = vec![false; num_subcompactions];
         let mut first_error: Option<SlateDBError> = None;
         while !completed.iter().all(|done| *done) {
             let Some(event) = sub_rx.recv().await else {
@@ -718,6 +722,7 @@ impl TokioCompactionExecutorInner {
                 SubcompactionEvent::Finished { index, result } => match result {
                     Ok(output_ssts) => {
                         ctx.set_output_ssts(index, output_ssts);
+                        ctx.mark_completed(index);
                         completed[index] = true;
                         let total_bytes = bytes_processed_by_sub.iter().sum();
                         self.send_compaction_progress(id, total_bytes, ctx.clone());
@@ -2099,8 +2104,7 @@ mod tests {
     /// Resuming from any persisted snapshot — the bare plan, a mid-flight
     /// state, or the fully-complete state — converges to the same merged output
     /// and reuses the output SSTs already recorded against each range. Resuming
-    /// a completed compaction does no merge work but still reports its full
-    /// processed size rather than regressing to zero.
+    /// a completed compaction runs no range and reports no progress.
     #[tokio::test(flavor = "multi_thread")]
     async fn should_resume_from_any_snapshot() {
         let (executor, table_store, rx) = subcompaction_env(
@@ -2165,9 +2169,7 @@ mod tests {
                 );
             }
 
-            // The fully-complete snapshot must do no merge work — the run is
-            // rebuilt purely from recorded output — yet still report its full
-            // processed size, never regressing to zero.
+            // A completed plan rebuilds its output without reading inputs or reporting new work.
             if index == snapshots.len() - 1 {
                 let recorded: usize = snapshot.iter().map(|s| s.output_ssts().len()).sum();
                 assert_eq!(
@@ -2176,8 +2178,8 @@ mod tests {
                     "resuming a completed compaction must not produce new SSTs"
                 );
                 assert!(
-                    !resume_bytes.is_empty() && resume_bytes.iter().all(|&b| b > 0),
-                    "resuming a completed compaction must never report zero bytes, got {resume_bytes:?}"
+                    resume_bytes.is_empty(),
+                    "completed ranges must not execute again: {resume_bytes:?}"
                 );
             }
         }
@@ -2433,6 +2435,37 @@ mod tests {
         // when/then: the persisted plan is returned verbatim.
         let planned = ctx.executor.inner.plan_compaction_job(args).await.unwrap();
         assert_eq!(planned.ctx.subcompactions(), &persisted);
+    }
+
+    /// A completed range does not run again, even when it has no output. The
+    /// only input SST was never written, so any read of it fails the job.
+    #[tokio::test]
+    async fn should_skip_completed_range_with_no_output() {
+        let ctx = TestContextBuilder::new("testdb-completed-range")
+            .build()
+            .await;
+        let missing = SsTableHandle::new(
+            SsTableId::from(Ulid::new()),
+            crate::format::sst::SST_FORMAT_VERSION_LATEST,
+            crate::db_state::SsTableInfo {
+                first_entry: Some(Bytes::from_static(b"a")),
+                last_entry: Some(Bytes::from_static(b"z")),
+                ..Default::default()
+            },
+        );
+        let args = job_with_subcompactions(
+            vec![SsTableView::identity(missing)],
+            vec![],
+            vec![Subcompaction::new(BytesRange::unbounded())
+                .with_status(crate::subcompaction::SubcompactionStatus::Completed)],
+        );
+        let output = ctx
+            .executor
+            .inner
+            .plan_and_execute_compaction_job(args)
+            .await
+            .unwrap();
+        assert!(output.sst_views().is_empty());
     }
 
     /// The planner reads the real input SST indexes and splits a sizable
