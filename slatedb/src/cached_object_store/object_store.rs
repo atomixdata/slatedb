@@ -1479,7 +1479,7 @@ mod tests {
         let part_size = 1024;
         let cached_store = CachedObjectStore::new(
             object_store.clone(),
-            cache_storage,
+            cache_storage.clone(),
             part_size,
             CachePutConfig::default(),
             stats,
@@ -1518,7 +1518,7 @@ mod tests {
         // delete part 2, known_cache_size is still known
         let evict_part_path =
             FsCacheEntry::make_part_path(test_cache_folder.clone(), &location, 2, 1024);
-        std::fs::remove_file(evict_part_path).unwrap();
+        cache_storage.remove_cached_file(&evict_part_path);
         assert_eq!(entry.read_part(2, 0..part_size).await?, None);
         let cached_parts = entry.cached_parts().await?;
         assert_eq!(cached_parts, vec![0, 1, 3]);
@@ -1526,7 +1526,7 @@ mod tests {
         // delete part 3, known_cache_size become None
         let evict_part_path =
             FsCacheEntry::make_part_path(test_cache_folder.clone(), &location, 3, 1024);
-        std::fs::remove_file(evict_part_path).unwrap();
+        cache_storage.remove_cached_file(&evict_part_path);
         assert_eq!(entry.read_part(3, 0..part_size).await?, None);
         let cached_parts = entry.cached_parts().await?;
         assert_eq!(cached_parts, vec![0, 1]);
@@ -1562,7 +1562,7 @@ mod tests {
 
         let cached_store = CachedObjectStore::new(
             object_store,
-            cache_storage,
+            cache_storage.clone(),
             part_size,
             CachePutConfig::default(),
             stats,
@@ -1588,7 +1588,7 @@ mod tests {
 
         let evict_part_path =
             FsCacheEntry::make_part_path(test_cache_folder.clone(), &location, 2, part_size);
-        std::fs::remove_file(evict_part_path).unwrap();
+        cache_storage.remove_cached_file(&evict_part_path);
         assert_eq!(entry.read_part(2, 0..part_size).await?, None);
 
         let cached_parts = entry.cached_parts().await?;
@@ -2453,7 +2453,7 @@ mod tests {
             .unwrap();
         let part_path =
             FsCacheEntry::make_part_path(test_cache_folder.clone(), &location, 1, part_size);
-        std::fs::remove_file(&part_path).unwrap();
+        cache_storage.remove_cached_file(&part_path);
 
         // The backend truncates the next ranged body to 1 byte but reports
         // success, mimicking a response cut mid-body without a stream error.

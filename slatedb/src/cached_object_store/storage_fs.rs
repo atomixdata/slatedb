@@ -99,6 +99,13 @@ impl FileHandleCache {
         Ok(Some(handle))
     }
 
+    /// Look up a cached file handle without opening the file or validating it.
+    /// Cached parts are immutable and their handles are invalidated when they
+    /// are deleted or rewritten, so a hit can be read directly.
+    fn get_cached(&self, path: &std::path::Path) -> Option<Arc<CachedFileHandle>> {
+        self.inner.get(path)
+    }
+
     /// Check whether a cached file descriptor still refers to a live file.
     ///
     /// On Unix an unlinked file keeps its data accessible through open fds,
@@ -194,6 +201,14 @@ impl FsCacheStorage {
     #[cfg(test)]
     pub(crate) fn file_handle_cache_population(&self) -> usize {
         self.file_handle_cache.inner.len()
+    }
+
+    /// Deletes a cached file the way the cache does: removes it from disk
+    /// and drops its cached handle.
+    #[cfg(test)]
+    pub(crate) fn remove_cached_file(&self, path: &std::path::Path) {
+        std::fs::remove_file(path).unwrap();
+        self.file_handle_cache.invalidate(path);
     }
 }
 
@@ -350,6 +365,22 @@ impl LocalCacheEntry for FsCacheEntry {
             part_number,
             self.part_size,
         );
+
+        // With the file already open, read inline. Cached parts are almost
+        // always in the page cache, so the `pread` takes microseconds, while
+        // `spawn_blocking` costs two thread handoffs and a trip through the
+        // blocking pool's global mutex, which dominates under load.
+        if let Some(file) = self.file_handle_cache.get_cached(&part_path) {
+            let mut buffer = vec![0; range_in_part.len()];
+            read_exact_at_offset(file.file(), &mut buffer, range_in_part.start as u64)
+                .map_err(wrap_io_err)?;
+            if let Some(evictor) = &self.evictor {
+                evictor
+                    .track_entry_accessed(part_path, EntryAccess::Read(self.part_size))
+                    .await;
+            }
+            return Ok(Some(Bytes::from(buffer)));
+        }
 
         // Spawn a blocking task and do synchronous I/O rather than use the tokio async apis.
         // Under the hood, on linux systems , tokio itself spawns a blocking task for each call to
