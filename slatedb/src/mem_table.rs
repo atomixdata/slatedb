@@ -1154,4 +1154,85 @@ mod tests {
         )
         .await;
     }
+
+    #[tokio::test]
+    async fn test_prune_overwritten_removes_next_older_version() {
+        let table = WritableKVTable::new();
+        table.put(RowEntry::new_value(b"key", b"v1", 1));
+        table.put(RowEntry::new_value(b"key", b"v2", 2));
+        table.put(RowEntry::new_value(b"other", b"x", 3));
+        table.put_and_record_overwritten(RowEntry::new_value(b"key", b"v3", 4));
+        table.put_and_record_overwritten(RowEntry::new_value(b"new", b"y", 5));
+
+        table.prune_overwritten(None);
+
+        // Only v2, the next older version of "key", is gone. v1 stays, and
+        // the other keys are untouched.
+        let metadata = table.metadata();
+        assert_eq!(metadata.entry_num, 4);
+        assert_eq!(
+            metadata.entries_size_in_bytes,
+            RowEntry::new_value(b"key", b"v1", 1).estimated_size()
+                + RowEntry::new_value(b"key", b"v3", 4).estimated_size()
+                + RowEntry::new_value(b"new", b"y", 5).estimated_size()
+                + RowEntry::new_value(b"other", b"x", 3).estimated_size()
+        );
+        let mut iter = table.table().iter();
+        assert_iterator(
+            &mut iter,
+            vec![
+                RowEntry::new_value(b"key", b"v3", 4),
+                RowEntry::new_value(b"key", b"v1", 1),
+                RowEntry::new_value(b"new", b"y", 5),
+                RowEntry::new_value(b"other", b"x", 3),
+            ],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_prune_overwritten_keeps_version_a_registered_reader_needs() {
+        let table = WritableKVTable::new();
+        table.put(RowEntry::new_value(b"key", b"v1", 1));
+        table.put_and_record_overwritten(RowEntry::new_value(b"key", b"v2", 2));
+
+        // A reader with bound 1 still needs seq 1.
+        table.prune_overwritten(Some(1));
+        assert_eq!(table.metadata().entry_num, 2);
+
+        // The kept version left the record, so a prune without a reader
+        // removes only seq 2, the version that the next write overwrote.
+        table.put_and_record_overwritten(RowEntry::new_value(b"key", b"v3", 3));
+        table.prune_overwritten(None);
+        let mut iter = table.table().iter();
+        assert_iterator(
+            &mut iter,
+            vec![
+                RowEntry::new_value(b"key", b"v3", 3),
+                RowEntry::new_value(b"key", b"v1", 1),
+            ],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_put_and_record_overwritten_tombstones() {
+        let table = WritableKVTable::new();
+        table.put(RowEntry::new_value(b"a", b"v1", 1));
+        table.put_and_record_overwritten(RowEntry::new_tombstone(b"a", 2));
+        table.put(RowEntry::new_tombstone(b"b", 3));
+        table.put_and_record_overwritten(RowEntry::new_value(b"b", b"v4", 4));
+
+        table.prune_overwritten(None);
+
+        let mut iter = table.table().iter();
+        assert_iterator(
+            &mut iter,
+            vec![
+                RowEntry::new_tombstone(b"a", 2),
+                RowEntry::new_value(b"b", b"v4", 4),
+            ],
+        )
+        .await;
+    }
 }
