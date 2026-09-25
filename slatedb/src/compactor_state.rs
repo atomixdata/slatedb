@@ -10,8 +10,11 @@ use ulid::Ulid;
 
 use crate::db_state::{SortedRun, SsTableHandle, SsTableView};
 use crate::error::SlateDBError;
+use crate::incremental_progress::IncrementalProgress;
 use crate::manifest::{Manifest, ManifestCore};
 use crate::subcompaction::Subcompaction;
+use slatedb_common::clock::SystemClock;
+use slatedb_common::DbRand;
 use slatedb_txn_obj::DirtyObject;
 
 /// Identifier for a compaction input source.
@@ -181,6 +184,12 @@ impl CompactionSpec {
     /// Returns true if this is a [`CompactionSpec::DrainSegment`] spec.
     pub fn is_drain(&self) -> bool {
         matches!(self, CompactionSpec::DrainSegment(_))
+    }
+
+    /// Returns whether this job reuses an input run as its destination.
+    pub(crate) fn reuses_input_run(&self) -> bool {
+        self.destination()
+            .is_some_and(|id| self.sources().contains(&SourceId::SortedRun(id)))
     }
 
     /// Returns true if any of the compaction sources are L0 SST views.
@@ -1008,6 +1017,30 @@ impl CompactorState {
         remote_manifest.value.core = merged;
         remote_manifest.value.prune_external_sst_ids();
         self.manifest = remote_manifest;
+    }
+
+    /// Applies the stored progress of `job` to the in-memory manifest.
+    ///
+    /// Cuts the durable intervals of `job` out of its input views and adds the
+    /// matching output views to its destination run. New views from split input views
+    /// get IDs from `rand` and `clock`. Parent SST IDs that no view uses anymore leave
+    /// `external_dbs`. Returns whether the manifest changed. The caller writes it.
+    ///
+    /// Returns `InvalidCompaction` and leaves the state unchanged if the segment or an
+    /// input run of `job` is missing from the manifest.
+    pub(crate) fn apply_incremental_progress(
+        &mut self,
+        job: &Compaction,
+        progress: &IncrementalProgress,
+        rand: &DbRand,
+        clock: &dyn SystemClock,
+    ) -> Result<bool, SlateDBError> {
+        let mut core = self.db_state().clone();
+        progress.apply_to_manifest(&mut core, job, rand, clock)?;
+        let changed = &core != self.db_state();
+        self.manifest.value.core = core;
+        self.manifest.value.prune_external_sst_ids();
+        Ok(changed)
     }
 
     /// Registers a newly proposed compaction in the compactor's local state.
