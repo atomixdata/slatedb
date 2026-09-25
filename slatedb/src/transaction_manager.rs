@@ -273,6 +273,16 @@ impl TransactionManager {
             .map(|state| state.started_seq)
             .min()
     }
+
+    /// The max started_seq of all active transactions.
+    pub(crate) fn max_active_seq(&self) -> Option<u64> {
+        let inner = self.inner.read();
+        inner
+            .active_txns
+            .values()
+            .map(|state| state.started_seq)
+            .max()
+    }
 }
 
 impl TransactionManagerInner {

@@ -299,6 +299,20 @@ impl DbInner {
             |_| { Err(SlateDBError::from(std::io::Error::other("oops"))) }
         );
 
+        // Any snapshot or transaction open before this point holds the old
+        // number as its bound, which hides the new rows, so it needs the old
+        // rows. `prune_overwritten` keeps the rows such readers need, but it can
+        // only see readers that opened before it looks. Prune after the commit
+        // so that a reader that opens later gets `commit_seq` as its bound and
+        // needs no old row.
+        if self.settings.memtable_prune_overwrites {
+            let max_registered_seq = self.max_registered_seq();
+            self.state
+                .read()
+                .memtable()
+                .prune_overwritten(max_registered_seq);
+        }
+
         // record the memtable sequence in the memtable's sequence tracker.
         self.record_memtable_sequence(commit_seq);
 
@@ -458,8 +472,26 @@ impl DbInner {
         let memtable = guard.memtable();
         self.status_manager.add_memtable_segments(&touched_segments);
         memtable.record_touched_segments(touched_segments.clone());
-        entries.into_iter().for_each(|entry| memtable.put(entry));
+        entries.into_iter().for_each(|entry| {
+            if self.settings.memtable_prune_overwrites {
+                memtable.put_and_record_overwritten(entry);
+            } else {
+                memtable.put(entry);
+            }
+        });
         memtable.table().durable_watcher()
+    }
+
+    /// The highest start sequence number of any open snapshot or transaction.
+    /// A version at or below it may still be needed and must be kept.
+    fn max_registered_seq(&self) -> Option<u64> {
+        [
+            self.snapshot_manager.max_active_seq(),
+            self.txn_manager.max_active_seq(),
+        ]
+        .into_iter()
+        .flatten()
+        .max()
     }
 
     fn record_memtable_sequence(&self, seq: u64) {
