@@ -62,6 +62,12 @@ impl SnapshotManager {
         let inner = self.inner.read();
         inner.active_snapshots.values().copied().min()
     }
+
+    /// The max started_seq of all active snapshots.
+    pub(crate) fn max_active_seq(&self) -> Option<u64> {
+        let inner = self.inner.read();
+        inner.active_snapshots.values().copied().max()
+    }
 }
 
 #[cfg(test)]

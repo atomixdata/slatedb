@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use crossbeam_skiplist::map::Range;
+use crossbeam_skiplist::map::{Entry, Range};
 use crossbeam_skiplist::SkipMap;
 use ouroboros::self_referencing;
 use std::sync::atomic::AtomicI64;
@@ -20,7 +20,7 @@ use crate::iter::{IterationOrder, RowEntryIterator};
 use crate::prefix_extractor::PrefixExtractor;
 use crate::reader::ReadTrace;
 use crate::seq_tracker::{SequenceTracker, TrackedSeq};
-use crate::types::RowEntry;
+use crate::types::{RowEntry, ValueDeletable};
 use crate::utils::{WatchableOnceCell, WatchableOnceCellReader};
 
 /// Memtable may contains multiple versions of a single user key, with a monotonically increasing sequence number.
@@ -110,6 +110,9 @@ pub(crate) struct KVTable {
     /// paths after the antichain check. Empty when no extractor is
     /// configured.
     touched_segments: Mutex<std::collections::BTreeSet<Bytes>>,
+    /// Key and sequence number of versions that a newer write of the same key
+    /// has overwritten.
+    overwritten_versions: Mutex<Vec<(Bytes, u64)>>,
 }
 
 pub(crate) struct KVTableMetadata {
@@ -142,6 +145,14 @@ impl WritableKVTable {
 
     pub(crate) fn put(&self, row: RowEntry) {
         self.table.put(row);
+    }
+
+    pub(crate) fn put_and_record_overwritten(&self, row: RowEntry) {
+        self.table.put_and_record_overwritten(row);
+    }
+
+    pub(crate) fn prune_overwritten(&self, max_registered_seq: Option<u64>) {
+        self.table.prune_overwritten(max_registered_seq);
     }
 
     pub(crate) fn metadata(&self) -> KVTableMetadata {
@@ -376,6 +387,7 @@ impl KVTable {
             first_seq: AtomicU64::new(u64::MAX),
             sequence_tracker: Mutex::new(SequenceTracker::new()),
             touched_segments: Mutex::new(std::collections::BTreeSet::new()),
+            overwritten_versions: Mutex::new(Vec::new()),
         }
     }
 
@@ -528,6 +540,45 @@ impl KVTable {
     }
 
     pub(crate) fn put(&self, row: RowEntry) {
+        let _ = self.put_inner(row);
+    }
+
+    /// Inserts `row` like [`KVTable::put`]. When `row` is a plain value or a
+    /// tombstone and the next older version of the same key exists, records
+    /// that version in [`KVTable::overwritten_versions`] for later pruning.
+    pub(crate) fn put_and_record_overwritten(&self, row: RowEntry) {
+        let new_is_merge = matches!(row.value, ValueDeletable::Merge(_));
+        let user_key = row.key.clone();
+        let entry = self.put_inner(row);
+
+        // A merge row does not overwrite the older version, so nothing to prune.
+        if new_is_merge {
+            return;
+        }
+
+        // Record the next older version of the same key for pruning.
+        if let Some(older) = entry.next().filter(|e| e.key().user_key == user_key) {
+            self.overwritten_versions
+                .lock()
+                .push((user_key, older.key().seq));
+        }
+    }
+
+    /// Drains [`KVTable::overwritten_versions`] and removes each version from
+    /// the table, unless its sequence number is less than or equal to the
+    /// given `max_registered_seq`.
+    pub(crate) fn prune_overwritten(&self, max_registered_seq: Option<u64>) {
+        let removed_bytes: usize = std::mem::take(&mut *self.overwritten_versions.lock())
+            .into_iter()
+            .filter(|(_, seq)| max_registered_seq.is_none_or(|bound| bound < *seq))
+            .filter_map(|(key, seq)| self.map.remove(&SequencedKey::new(key, seq)))
+            .map(|removed| removed.value().estimated_size())
+            .sum();
+        self.entries_size_in_bytes
+            .fetch_sub(removed_bytes, Ordering::Relaxed);
+    }
+
+    fn put_inner(&self, row: RowEntry) -> Entry<'_, SequencedKey, RowEntry> {
         let internal_key = SequencedKey::new(row.key.clone(), row.seq);
         let previous_size = Cell::new(None);
 
@@ -543,7 +594,7 @@ impl KVTable {
         self.first_seq.fetch_min(row.seq, SeqCst);
 
         let row_size = row.estimated_size();
-        self.map.compare_insert(internal_key, row, |previous_row| {
+        let entry = self.map.compare_insert(internal_key, row, |previous_row| {
             // Optimistically calculate the size of the previous value.
             // `compare_fn` might be called multiple times in case of concurrent
             // writes to the same key, so we use `Cell` to avoid subtracting
@@ -560,6 +611,7 @@ impl KVTable {
             self.entries_size_in_bytes
                 .fetch_add(row_size, Ordering::Relaxed);
         }
+        entry
     }
 
     pub(crate) fn durable_watcher(&self) -> WatchableOnceCellReader<Result<(), SlateDBError>> {
@@ -1098,6 +1150,87 @@ mod tests {
                 RowEntry::new_value(b"bbbb", b"new", 2),
                 RowEntry::new_value(b"bbbb", b"old", 1),
                 RowEntry::new_value(b"aaaa", b"v1", 0),
+            ],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_prune_overwritten_removes_next_older_version() {
+        let table = WritableKVTable::new();
+        table.put(RowEntry::new_value(b"key", b"v1", 1));
+        table.put(RowEntry::new_value(b"key", b"v2", 2));
+        table.put(RowEntry::new_value(b"other", b"x", 3));
+        table.put_and_record_overwritten(RowEntry::new_value(b"key", b"v3", 4));
+        table.put_and_record_overwritten(RowEntry::new_value(b"new", b"y", 5));
+
+        table.prune_overwritten(None);
+
+        // Only v2, the next older version of "key", is gone. v1 stays, and
+        // the other keys are untouched.
+        let metadata = table.metadata();
+        assert_eq!(metadata.entry_num, 4);
+        assert_eq!(
+            metadata.entries_size_in_bytes,
+            RowEntry::new_value(b"key", b"v1", 1).estimated_size()
+                + RowEntry::new_value(b"key", b"v3", 4).estimated_size()
+                + RowEntry::new_value(b"new", b"y", 5).estimated_size()
+                + RowEntry::new_value(b"other", b"x", 3).estimated_size()
+        );
+        let mut iter = table.table().iter();
+        assert_iterator(
+            &mut iter,
+            vec![
+                RowEntry::new_value(b"key", b"v3", 4),
+                RowEntry::new_value(b"key", b"v1", 1),
+                RowEntry::new_value(b"new", b"y", 5),
+                RowEntry::new_value(b"other", b"x", 3),
+            ],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_prune_overwritten_keeps_version_a_registered_reader_needs() {
+        let table = WritableKVTable::new();
+        table.put(RowEntry::new_value(b"key", b"v1", 1));
+        table.put_and_record_overwritten(RowEntry::new_value(b"key", b"v2", 2));
+
+        // A reader with bound 1 still needs seq 1.
+        table.prune_overwritten(Some(1));
+        assert_eq!(table.metadata().entry_num, 2);
+
+        // The kept version left the record, so a prune without a reader
+        // removes only seq 2, the version that the next write overwrote.
+        table.put_and_record_overwritten(RowEntry::new_value(b"key", b"v3", 3));
+        table.prune_overwritten(None);
+        let mut iter = table.table().iter();
+        assert_iterator(
+            &mut iter,
+            vec![
+                RowEntry::new_value(b"key", b"v3", 3),
+                RowEntry::new_value(b"key", b"v1", 1),
+            ],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_put_and_record_overwritten_tombstones() {
+        let table = WritableKVTable::new();
+        table.put(RowEntry::new_value(b"a", b"v1", 1));
+        table.put_and_record_overwritten(RowEntry::new_tombstone(b"a", 2));
+        table.put(RowEntry::new_tombstone(b"b", 3));
+        table.put_and_record_overwritten(RowEntry::new_value(b"b", b"v4", 4));
+
+        table.prune_overwritten(None);
+
+        let mut iter = table.table().iter();
+        assert_iterator(
+            &mut iter,
+            vec![
+                RowEntry::new_tombstone(b"a", 2),
+                RowEntry::new_value(b"b", b"v4", 4),
             ],
         )
         .await;

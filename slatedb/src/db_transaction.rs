@@ -2113,6 +2113,7 @@ mod tests {
             metric_level: MetricLevel::default(),
             default_ttl_millis: None,
             object_store_max_retries: None,
+            memtable_prune_overwrites: false,
             block_format: None,
         }
     }

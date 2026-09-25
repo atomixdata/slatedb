@@ -299,6 +299,20 @@ impl DbInner {
             |_| { Err(SlateDBError::from(std::io::Error::other("oops"))) }
         );
 
+        // Any snapshot or transaction open before this point holds the old
+        // number as its bound, which hides the new rows, so it needs the old
+        // rows. `prune_overwritten` keeps the rows such readers need, but it can
+        // only see readers that opened before it looks. Prune after the commit
+        // so that a reader that opens later gets `commit_seq` as its bound and
+        // needs no old row.
+        if self.settings.memtable_prune_overwrites {
+            let max_registered_seq = self.max_registered_seq();
+            self.state
+                .read()
+                .memtable()
+                .prune_overwritten(max_registered_seq);
+        }
+
         // record the memtable sequence in the memtable's sequence tracker.
         self.record_memtable_sequence(commit_seq);
 
@@ -458,8 +472,26 @@ impl DbInner {
         let memtable = guard.memtable();
         self.status_manager.add_memtable_segments(&touched_segments);
         memtable.record_touched_segments(touched_segments.clone());
-        entries.into_iter().for_each(|entry| memtable.put(entry));
+        entries.into_iter().for_each(|entry| {
+            if self.settings.memtable_prune_overwrites {
+                memtable.put_and_record_overwritten(entry);
+            } else {
+                memtable.put(entry);
+            }
+        });
         memtable.table().durable_watcher()
+    }
+
+    /// The highest start sequence number of any open snapshot or transaction.
+    /// A version at or below it may still be needed and must be kept.
+    fn max_registered_seq(&self) -> Option<u64> {
+        [
+            self.snapshot_manager.max_active_seq(),
+            self.txn_manager.max_active_seq(),
+        ]
+        .into_iter()
+        .flatten()
+        .max()
     }
 
     fn record_memtable_sequence(&self, seq: u64) {
@@ -513,7 +545,7 @@ mod tests {
     use crate::object_store::memory::InMemory;
     use crate::wal::test_utils::FakeWalWriter;
     use crate::wal::{WalError, WalObserver, WalStatus};
-    use crate::Db;
+    use crate::{Db, IsolationLevel};
 
     enum FailingWalOperation {
         Append,
@@ -970,6 +1002,81 @@ mod tests {
         ] {
             assert_eq!(db.get(k).await.unwrap().unwrap().as_ref(), v);
         }
+        db.close().await.unwrap();
+    }
+
+    fn prune_settings() -> crate::config::Settings {
+        crate::config::Settings {
+            memtable_prune_overwrites: true,
+            ..Default::default()
+        }
+    }
+
+    fn active_memtable_entry_num(db: &Db) -> usize {
+        db.inner
+            .state
+            .read()
+            .memtable()
+            .table()
+            .metadata()
+            .entry_num
+    }
+
+    #[tokio::test]
+    async fn test_memtable_prune_overwrites_keeps_one_row_per_key() {
+        let db = Db::builder(
+            "/tmp/test_memtable_prune_overwrites_keeps_one_row_per_key",
+            Arc::new(InMemory::new()),
+        )
+        .with_settings(prune_settings())
+        .build()
+        .await
+        .unwrap();
+
+        db.put(b"key", b"v1").await.unwrap();
+        db.put(b"key", b"v2").await.unwrap();
+        db.put(b"key", b"v3").await.unwrap();
+        db.put(b"other", b"x").await.unwrap();
+
+        assert_eq!(active_memtable_entry_num(&db), 2);
+        assert_eq!(db.get(b"key").await.unwrap().unwrap().as_ref(), b"v3");
+        assert_eq!(db.get(b"other").await.unwrap().unwrap().as_ref(), b"x");
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_memtable_prune_overwrites_keeps_version_for_open_snapshot_and_txn() {
+        let db = Db::builder(
+            "/tmp/test_memtable_prune_overwrites_keeps_version_for_open_snapshot_and_txn",
+            Arc::new(InMemory::new()),
+        )
+        .with_settings(prune_settings())
+        .build()
+        .await
+        .unwrap();
+
+        db.put(b"key", b"v1").await.unwrap();
+        let snapshot = db.snapshot().await.unwrap();
+        db.put(b"key", b"v2").await.unwrap();
+        assert_eq!(active_memtable_entry_num(&db), 2);
+        assert_eq!(snapshot.get(b"key").await.unwrap().unwrap().as_ref(), b"v1");
+        assert_eq!(db.get(b"key").await.unwrap().unwrap().as_ref(), b"v2");
+
+        // The write after the snapshot drops removes v2. v1 stays, because
+        // a put records only the next older version.
+        drop(snapshot);
+        db.put(b"key", b"v3").await.unwrap();
+        assert_eq!(active_memtable_entry_num(&db), 2);
+
+        let txn = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        db.put(b"key", b"v4").await.unwrap();
+        assert_eq!(active_memtable_entry_num(&db), 3);
+        assert_eq!(txn.get(b"key").await.unwrap().unwrap().as_ref(), b"v3");
+
+        drop(txn);
+        db.put(b"key", b"v5").await.unwrap();
+        assert_eq!(active_memtable_entry_num(&db), 3);
+        assert_eq!(db.get(b"key").await.unwrap().unwrap().as_ref(), b"v5");
         db.close().await.unwrap();
     }
 }
