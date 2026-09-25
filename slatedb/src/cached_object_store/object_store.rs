@@ -897,12 +897,6 @@ fn head_only_get_result(
     }
 }
 
-/// Builds a synthetic head to save on a write, from the upstream `PutResult`
-/// and the known object size.
-///
-/// The head is the cache entry's commit point: cached parts are not usable
-/// until a `read_head` succeeds, so writing it last (after the upstream write
-/// completes) publishes the entry.
 /// Removes the on-disk cache entry and the in-memory head for `location`.
 ///
 /// The on-disk entry is removed first. A reader that misses the in-memory
@@ -924,6 +918,12 @@ async fn remove_cached_object(
     head_cache.remove(location);
 }
 
+/// Builds a synthetic head to save on a write, from the upstream `PutResult`
+/// and the known object size.
+///
+/// The head is the cache entry's commit point: cached parts are not usable
+/// until a `read_head` succeeds, so writing it last (after the upstream write
+/// completes) publishes the entry.
 fn build_head(cache_location: &Path, size: u64, result: &PutResult) -> ObjectMeta {
     ObjectMeta {
         location: cache_location.clone(),
