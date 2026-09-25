@@ -94,6 +94,22 @@ impl FileHandleCache {
         // reference drops. Both callers hold a valid handle either way, so
         // the race costs a redundant open rather than correctness.
         self.inner.insert(path.to_path_buf(), handle.clone());
+
+        // A delete or a replace can run between the `open` and the `insert`.
+        // Its `invalidate` then runs before the `insert`, so the cache keeps a
+        // handle to an unlinked file.
+        // The fstat below runs after the `insert`. If the file is unlinked,
+        // remove the entry. If a later unlink runs, its `invalidate` runs after
+        // the `insert` and removes the entry.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let unlinked = handle.file.metadata().map_or(true, |m| m.nlink() == 0);
+            if unlinked {
+                self.invalidate(path);
+            }
+        }
+
         Ok(Some(handle))
     }
 

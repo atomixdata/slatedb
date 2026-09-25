@@ -383,14 +383,14 @@ impl CachedObjectStore {
         // and lets later HEADs skip the upstream round trip even for objects
         // whose payload we don't cache.
         let tag = ObjectStoreCallTag::from_extensions(&opts.extensions);
-        let cache_payload = self.put_policy.put_action(tag.as_ref()) != PutAction::Skip;
+        let cache_payload_to_disk = self.put_policy.put_action(tag.as_ref()) != PutAction::Skip;
 
         // Capture the size and attributes before payload/opts are consumed: they
         // go into the head we record below.
         let payload_size = payload.content_length() as u64;
         let attributes = opts.attributes.clone();
 
-        if !cache_payload {
+        if !cache_payload_to_disk {
             // Write directly to upstream without caching the payload, but still
             // record the head in memory.
             let result = self.object_store.put_opts(location, payload, opts).await?;
@@ -433,13 +433,6 @@ impl CachedObjectStore {
         location: &Path,
         mut opts: GetOptions,
     ) -> object_store::Result<PrefetchedHead> {
-        // Fast path: an in-memory head (populated by preload's `warm()` and by
-        // writes) lets a read skip the on-disk head entirely - no
-        // spawn_blocking, no file-handle lock, no JSON parse. An in-memory head
-        // does not by itself prove every part is on disk, but `read_part` falls
-        // back to the object store for any absent part, so trusting it here
-        // stays correct while avoiding the per-read head read that otherwise
-        // dominates the miss path once head files fall out of the OS page cache.
         if let Some(head) = self.head_cache.get(location) {
             return Ok(PrefetchedHead {
                 meta: head.meta,
