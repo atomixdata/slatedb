@@ -869,6 +869,14 @@ pub struct Settings {
     #[serde(default)]
     pub memtable_prune_overwrites: bool,
 
+    /// Flushes the WAL buffer when its estimated encoded size reaches this
+    /// many bytes. The timer in `flush_interval` and this cap race, and the
+    /// first one to fire flushes. `None` uses `l0_sst_size_bytes` as the cap.
+    ///
+    /// Default: None
+    #[serde(default)]
+    pub wal_buffer_bytes: Option<usize>,
+
     /// The block format for SST files. This is only available in tests
     /// to verify backward compatibility between V1 and V2 formats.
     #[cfg(test)]
@@ -908,7 +916,8 @@ impl std::fmt::Debug for Settings {
             .field("garbage_collector_options", &self.garbage_collector_options)
             .field("metric_level", &self.metric_level)
             .field("default_ttl_millis", &self.default_ttl_millis)
-            .field("memtable_prune_overwrites", &self.memtable_prune_overwrites);
+            .field("memtable_prune_overwrites", &self.memtable_prune_overwrites)
+            .field("wal_buffer_bytes", &self.wal_buffer_bytes);
         data.finish()
     }
 }
@@ -1141,6 +1150,7 @@ impl Default for Settings {
             default_ttl_millis: None,
             object_store_max_retries: None,
             memtable_prune_overwrites: false,
+            wal_buffer_bytes: None,
             #[cfg(test)]
             block_format: None,
         }
