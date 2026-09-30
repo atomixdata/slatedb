@@ -854,16 +854,11 @@ pub struct Settings {
     /// new write overwrites it. A key that is rewritten many times before a
     /// flush then costs one row of memory instead of one row per write.
     ///
-    /// A snapshot or transaction that is open when the batch commits keeps
-    /// every version it can read, because the removal runs after the commit
-    /// and skips versions at or below the highest open start sequence number.
-    /// A merge row removes nothing, because it combines with the rows below
-    /// it, so merge operands stay complete.
-    ///
-    /// Two kinds of readers are not protected. A plain get or scan that took
-    /// its sequence bound before the write and has not reached the memtable
-    /// yet can miss the key and fall through to an older source. A read with
-    /// [`DurabilityLevel::Remote`] does the same until the next WAL flush.
+    /// The removal does not protect readers. A snapshot, a transaction, a get
+    /// or scan in flight, or a read with [`DurabilityLevel::Remote`] whose
+    /// sequence bound is below the new row can no longer find the removed
+    /// version and reads an older source instead. Turn this on only when the
+    /// application keeps such reads away from the keys that it rewrites.
     ///
     /// Default: false
     #[serde(default)]
