@@ -460,7 +460,7 @@ impl DbInner {
         memtable.record_touched_segments(touched_segments.clone());
         entries.into_iter().for_each(|entry| {
             if self.settings.memtable_prune_overwrites {
-                memtable.put_and_remove_overwritten(entry);
+                memtable.put_and_prune_overwritten(entry);
             } else {
                 memtable.put(entry);
             }

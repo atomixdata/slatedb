@@ -854,9 +854,9 @@ pub struct Settings {
     /// new write overwrites it. A key that is rewritten many times before a
     /// flush then costs one row of memory instead of one row per write.
     ///
-    /// The removal does not protect readers. A snapshot, a transaction, a get
+    /// The pruning does not protect readers. A snapshot, a transaction, a get
     /// or scan in flight, or a read with [`DurabilityLevel::Remote`] whose
-    /// sequence bound is below the new row can no longer find the removed
+    /// sequence bound is below the new row can no longer find the pruned
     /// version and reads an older source instead. Turn this on only when the
     /// application keeps such reads away from the keys that it rewrites.
     ///

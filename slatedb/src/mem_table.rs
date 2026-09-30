@@ -144,8 +144,8 @@ impl WritableKVTable {
         self.table.put(row);
     }
 
-    pub(crate) fn put_and_remove_overwritten(&self, row: RowEntry) {
-        self.table.put_and_remove_overwritten(row);
+    pub(crate) fn put_and_prune_overwritten(&self, row: RowEntry) {
+        self.table.put_and_prune_overwritten(row);
     }
 
     pub(crate) fn metadata(&self) -> KVTableMetadata {
@@ -536,19 +536,19 @@ impl KVTable {
     }
 
     /// Inserts `row` like [`KVTable::put`]. When `row` is a plain value or a
-    /// tombstone and the next older version of the same key exists, removes
+    /// tombstone and the next older version of the same key exists, prunes
     /// that version.
-    pub(crate) fn put_and_remove_overwritten(&self, row: RowEntry) {
+    pub(crate) fn put_and_prune_overwritten(&self, row: RowEntry) {
         let new_is_merge = matches!(row.value, ValueDeletable::Merge(_));
         let user_key = row.key.clone();
         let entry = self.put_inner(row);
 
-        // A merge row does not overwrite the older version, so nothing to remove.
+        // A merge row does not overwrite the older version, so nothing to prune.
         if new_is_merge {
             return;
         }
 
-        // Remove the next older version of the same key.
+        // Prune the next older version of the same key.
         let Some(older) = entry.next().filter(|e| e.key().user_key == user_key) else {
             return;
         };
@@ -1136,13 +1136,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_put_and_remove_overwritten_removes_next_older_version() {
+    async fn test_put_and_prune_overwritten_prunes_next_older_version() {
         let table = WritableKVTable::new();
         table.put(RowEntry::new_value(b"key", b"v1", 1));
         table.put(RowEntry::new_value(b"key", b"v2", 2));
         table.put(RowEntry::new_value(b"other", b"x", 3));
-        table.put_and_remove_overwritten(RowEntry::new_value(b"key", b"v3", 4));
-        table.put_and_remove_overwritten(RowEntry::new_value(b"new", b"y", 5));
+        table.put_and_prune_overwritten(RowEntry::new_value(b"key", b"v3", 4));
+        table.put_and_prune_overwritten(RowEntry::new_value(b"new", b"y", 5));
 
         // Only v2, the next older version of "key", is gone. v1 stays, and
         // the other keys are untouched.
@@ -1169,12 +1169,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_put_and_remove_overwritten_tombstones() {
+    async fn test_put_and_prune_overwritten_tombstones() {
         let table = WritableKVTable::new();
         table.put(RowEntry::new_value(b"a", b"v1", 1));
-        table.put_and_remove_overwritten(RowEntry::new_tombstone(b"a", 2));
+        table.put_and_prune_overwritten(RowEntry::new_tombstone(b"a", 2));
         table.put(RowEntry::new_tombstone(b"b", 3));
-        table.put_and_remove_overwritten(RowEntry::new_value(b"b", b"v4", 4));
+        table.put_and_prune_overwritten(RowEntry::new_value(b"b", b"v4", 4));
 
         let mut iter = table.table().iter();
         assert_iterator(
