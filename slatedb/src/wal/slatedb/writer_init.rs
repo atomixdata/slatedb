@@ -32,7 +32,9 @@ impl SlateDbWalWriterInitOptions {
 impl From<&Settings> for SlateDbWalWriterInitOptions {
     fn from(settings: &Settings) -> Self {
         Self {
-            max_wal_bytes_size: settings.l0_sst_size_bytes,
+            max_wal_bytes_size: settings
+                .wal_buffer_bytes
+                .unwrap_or(settings.l0_sst_size_bytes),
             max_inflight_wal_uploads: settings.max_inflight_wal_uploads,
             max_wal_flushes_before_l0_flush: settings.max_wal_flushes_before_l0_flush,
             max_flush_interval: settings.flush_interval,
