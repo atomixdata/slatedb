@@ -7834,6 +7834,7 @@ mod tests {
             l0_sst_size_bytes,
             max_wal_flushes_before_l0_flush: 4096,
             wal_buffer_bytes: None,
+            wal_group_commit: false,
             compactor_options,
             compression_codec: None,
             object_store_cache_options: ObjectStoreCacheOptions::default(),

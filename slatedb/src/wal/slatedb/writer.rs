@@ -116,6 +116,7 @@ impl SlateDbWalWriter {
         max_wal_bytes_size: usize,
         max_wal_flushes_before_l0_flush: u64,
         max_flush_interval: Option<Duration>,
+        group_commit: bool,
         task_executor: Arc<MessageHandlerExecutor>,
     ) -> Result<Self, SlateDBError> {
         let current_wal = WalBuffer::new();
@@ -135,6 +136,7 @@ impl SlateDbWalWriter {
         let stats = Arc::new(WalBufferStats::new(recorder));
         let wal_flush_handler = WalFlushHandler {
             max_flush_interval,
+            group_commit,
             inner: inner.clone(),
             table_store: table_store.clone(),
             stats: stats.clone(),
@@ -466,6 +468,8 @@ impl Debug for WalFlushWork {
 
 struct WalFlushHandler {
     max_flush_interval: Option<Duration>,
+    /// Flush again as soon as a flush finishes if writes are buffered.
+    group_commit: bool,
     inner: Arc<parking_lot::RwLock<SlateDbWalWriterInner>>,
     table_store: Arc<WalTableStore>,
     stats: Arc<WalBufferStats>,
@@ -548,13 +552,20 @@ impl MessageHandler<WalFlushWork> for WalFlushHandler {
     async fn handle(&mut self, message: WalFlushWork) -> Result<(), SlateDBError> {
         match message {
             WalFlushWork::Flush { result_tx } => {
+                let result = self.do_flush().await;
                 if let Some(result_tx) = result_tx {
-                    let result = self.do_flush().await;
                     let _ = result_tx.send(result.clone().map_err(WalError::from));
-                    Ok(result?)
-                } else {
-                    Ok(self.do_flush().await?)
                 }
+                result?;
+                // Queue the next flush rather than looping here, so the
+                // dispatcher still checks for cancellation between flushes.
+                if self.group_commit {
+                    let inner = self.inner.read();
+                    if !inner.current_wal.is_empty() {
+                        let _ = inner.send_flush_msg(WalFlushWork::Flush { result_tx: None });
+                    }
+                }
+                Ok(())
             }
             WalFlushWork::Subscribe { listener } => {
                 // TODO: support multiple listeners. For now, the db listener is the only one
@@ -849,6 +860,7 @@ mod tests {
             1000,                 // max_wal_bytes_size
             4096,                 // max_wal_flushes_before_l0_flush
             Some(flush_interval), // max_flush_interval
+            false,                // group_commit
             task_executor.clone(),
         )
         .await

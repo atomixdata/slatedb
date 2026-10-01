@@ -21,6 +21,7 @@ pub(crate) struct SlateDbWalWriterInitOptions {
     max_wal_bytes_size: usize,
     max_wal_flushes_before_l0_flush: u64,
     max_flush_interval: Option<Duration>,
+    group_commit: bool,
 }
 
 impl From<&Settings> for SlateDbWalWriterInitOptions {
@@ -31,6 +32,7 @@ impl From<&Settings> for SlateDbWalWriterInitOptions {
                 .unwrap_or(settings.l0_sst_size_bytes),
             max_wal_flushes_before_l0_flush: settings.max_wal_flushes_before_l0_flush,
             max_flush_interval: settings.flush_interval,
+            group_commit: settings.wal_group_commit,
         }
     }
 }
@@ -42,6 +44,7 @@ pub(crate) struct SlateDbWalWriterInit {
     max_wal_bytes_size: usize,
     max_wal_flushes_before_l0_flush: u64,
     max_flush_interval: Option<Duration>,
+    group_commit: bool,
     empty_wal_id: u64,
     task_executor: Arc<MessageHandlerExecutor>,
     #[cfg_attr(not(test), allow(dead_code))]
@@ -70,6 +73,7 @@ impl SlateDbWalWriterInit {
             max_wal_bytes_size: options.max_wal_bytes_size,
             max_wal_flushes_before_l0_flush: options.max_wal_flushes_before_l0_flush,
             max_flush_interval: options.max_flush_interval,
+            group_commit: options.group_commit,
             empty_wal_id,
             task_executor,
             fp_tx,
@@ -135,6 +139,7 @@ impl wal::WriterInit for SlateDbWalWriterInit {
                     self.max_wal_bytes_size,
                     self.max_wal_flushes_before_l0_flush,
                     self.max_flush_interval,
+                    self.group_commit,
                     self.task_executor.clone(),
                 )
                 .await?;
