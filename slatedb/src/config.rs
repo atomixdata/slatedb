@@ -770,6 +770,15 @@ pub struct Settings {
     /// memtable will be frozen even if it has not reached `l0_sst_size_bytes`.
     pub max_wal_flushes_before_l0_flush: u64,
 
+    /// The number of bytes the current WAL buffers before it is flushed, even
+    /// if `flush_interval` has not elapsed. `None` uses `l0_sst_size_bytes`.
+    ///
+    /// With a short `flush_interval` the interval almost always flushes
+    /// first; this bounds how much a WAL holds when writes arrive faster than
+    /// it can flush.
+    #[serde(default)]
+    pub wal_buffer_bytes: Option<usize>,
+
     /// Defines the max total number of SSTs in L0 across the entire key space. Memtables
     /// will not be flushed if the total L0 count (including in-flight uploads) would exceed
     /// this value, until compaction can compact the ssts into compacted.
@@ -877,6 +886,7 @@ impl std::fmt::Debug for Settings {
                 "max_wal_flushes_before_l0_flush",
                 &self.max_wal_flushes_before_l0_flush,
             )
+            .field("wal_buffer_bytes", &self.wal_buffer_bytes)
             .field("l0_max_ssts", &self.l0_max_ssts)
             .field("l0_max_ssts_per_key", &self.l0_max_ssts_per_key)
             .field("l0_flush_parallelism", &self.l0_flush_parallelism)
@@ -1110,6 +1120,7 @@ impl Default for Settings {
             max_unflushed_bytes: 1_073_741_824,
             l0_sst_size_bytes: 64 * 1024 * 1024,
             max_wal_flushes_before_l0_flush: 4096,
+            wal_buffer_bytes: None,
             l0_max_ssts: 8,
             l0_max_ssts_per_key: 8,
             l0_flush_parallelism: 4,
