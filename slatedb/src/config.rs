@@ -850,6 +850,20 @@ pub struct Settings {
     #[serde(default)]
     pub object_store_max_retries: Option<u32>,
 
+    /// Removes the previous version of a key from the active memtable when a
+    /// new write overwrites it. A key that is rewritten many times before a
+    /// flush then costs one row of memory instead of one row per write.
+    ///
+    /// The pruning does not protect readers. A snapshot, a transaction, a get
+    /// or scan in flight, or a read with [`DurabilityLevel::Remote`] whose
+    /// sequence bound is below the new row can no longer find the pruned
+    /// version and reads an older source instead. Turn this on only when the
+    /// application keeps such reads away from the keys that it rewrites.
+    ///
+    /// Default: false
+    #[serde(default)]
+    pub memtable_prune_overwrites: bool,
+
     /// The block format for SST files. This is only available in tests
     /// to verify backward compatibility between V1 and V2 formats.
     #[cfg(test)]
@@ -888,7 +902,8 @@ impl std::fmt::Debug for Settings {
             )
             .field("garbage_collector_options", &self.garbage_collector_options)
             .field("metric_level", &self.metric_level)
-            .field("default_ttl_millis", &self.default_ttl_millis);
+            .field("default_ttl_millis", &self.default_ttl_millis)
+            .field("memtable_prune_overwrites", &self.memtable_prune_overwrites);
         data.finish()
     }
 }
@@ -1120,6 +1135,7 @@ impl Default for Settings {
             metric_level: MetricLevel::default(),
             default_ttl_millis: None,
             object_store_max_retries: None,
+            memtable_prune_overwrites: false,
             #[cfg(test)]
             block_format: None,
         }
