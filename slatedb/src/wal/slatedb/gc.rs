@@ -44,6 +44,8 @@ pub(crate) struct SlateDbWalGc {
     mode: WalGcMode,
     gc_filter: Option<Arc<dyn GcFilter>>,
     system_clock: Arc<dyn SystemClock>,
+    /// Caps deletions per second; `None` deletes as fast as possible.
+    deletes_per_second: Option<u32>,
 }
 
 impl std::fmt::Debug for SlateDbWalGc {
@@ -68,7 +70,14 @@ impl SlateDbWalGc {
             mode,
             gc_filter,
             system_clock,
+            deletes_per_second: None,
         }
+    }
+
+    /// Caps how many WAL objects are deleted per second.
+    pub(crate) fn with_deletes_per_second(mut self, deletes_per_second: Option<u32>) -> Self {
+        self.deletes_per_second = deletes_per_second.filter(|rate| *rate > 0);
+        self
     }
 
     fn is_wal_sst_eligible_for_deletion(
@@ -134,6 +143,30 @@ impl SlateDbWalGc {
             return;
         }
 
+        let Some(per_second) = self.deletes_per_second else {
+            self.delete_wal_ssts(sst_ids).await;
+            return;
+        };
+        // Delete in slices of a tenth of the per-second budget, waiting out the
+        // rest of each slice's share of a second before starting the next.
+        let slice_len = (per_second as usize / 10).max(1);
+        let slice = Duration::from_secs_f64(slice_len as f64 / f64::from(per_second));
+        let mut slice_start = self.system_clock.now();
+        for (index, chunk) in sst_ids.chunks(slice_len).enumerate() {
+            if index > 0 {
+                let elapsed = (self.system_clock.now() - slice_start)
+                    .to_std()
+                    .unwrap_or_default();
+                if let Some(remaining) = slice.checked_sub(elapsed) {
+                    self.system_clock.sleep(remaining).await;
+                }
+                slice_start = self.system_clock.now();
+            }
+            self.delete_wal_ssts(chunk.to_vec()).await;
+        }
+    }
+
+    async fn delete_wal_ssts(&self, sst_ids: Vec<WalFileId>) {
         futures::stream::iter(sst_ids)
             .for_each_concurrent(GC_DELETE_CONCURRENCY, |id| async move {
                 if let Err(e) = self.wal_store.delete_sst(id).await {
@@ -292,6 +325,42 @@ mod tests {
             .unwrap();
 
         assert_eq!(wal_ids(&wal_store).await, vec![1, 4]);
+    }
+
+    #[tokio::test]
+    async fn regular_mode_paces_deletes_per_second() {
+        let wal_store = build_wal_store();
+        let clock = Arc::new(MockSystemClock::new());
+        for wal_id in 1..=30 {
+            write_regular_wal(&wal_store, wal_id).await;
+        }
+        make_all_wals_older_than(&wal_store, &clock, Duration::ZERO).await;
+        // 100 per second deletes 10 at a time, then waits 100ms.
+        let collector = Arc::new(
+            build_collector(wal_store.clone(), clock.clone(), WalGcMode::Regular)
+                .with_deletes_per_second(Some(100)),
+        );
+        let collect = tokio::spawn({
+            let collector = collector.clone();
+            async move { collector.collect(vec![], Duration::ZERO, false).await }
+        });
+
+        async fn wait_for_remaining(wal_store: &WalTableStore, remaining: usize) {
+            while wal_ids(wal_store).await.len() != remaining {
+                tokio::task::yield_now().await;
+            }
+        }
+        for remaining in [20, 10] {
+            wait_for_remaining(&wal_store, remaining).await;
+            // The mock clock has not moved, so the next slice must not start.
+            for _ in 0..100 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(wal_ids(&wal_store).await.len(), remaining);
+            clock.set(clock.now().timestamp_millis() + 100);
+        }
+        collect.await.unwrap().unwrap();
+        assert!(wal_ids(&wal_store).await.is_empty());
     }
 
     #[tokio::test]

@@ -8618,6 +8618,7 @@ mod tests {
             metric_level: None,
             boundary_files_enabled: true,
             object_store_max_retries: None,
+            wal_deletes_per_second: None,
         };
 
         let gc = GarbageCollectorBuilder::new(path.clone(), object_store.clone())

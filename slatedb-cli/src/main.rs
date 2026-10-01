@@ -329,6 +329,7 @@ async fn exec_gc_once(
             metric_level: None,
             boundary_files_enabled,
             object_store_max_retries: None,
+            wal_deletes_per_second: None,
         },
         GcResource::Wal => GarbageCollectorOptions {
             manifest_options: None,
@@ -340,6 +341,7 @@ async fn exec_gc_once(
             metric_level: None,
             boundary_files_enabled,
             object_store_max_retries: None,
+            wal_deletes_per_second: None,
         },
         GcResource::WalFence => GarbageCollectorOptions {
             manifest_options: None,
@@ -351,6 +353,7 @@ async fn exec_gc_once(
             metric_level: None,
             boundary_files_enabled,
             object_store_max_retries: None,
+            wal_deletes_per_second: None,
         },
         GcResource::Compacted => GarbageCollectorOptions {
             manifest_options: None,
@@ -362,6 +365,7 @@ async fn exec_gc_once(
             metric_level: None,
             boundary_files_enabled,
             object_store_max_retries: None,
+            wal_deletes_per_second: None,
         },
         GcResource::Compactions => GarbageCollectorOptions {
             manifest_options: None,
@@ -373,6 +377,7 @@ async fn exec_gc_once(
             metric_level: None,
             boundary_files_enabled,
             object_store_max_retries: None,
+            wal_deletes_per_second: None,
         },
     };
     admin.run_gc_once(gc_opts).await?;
@@ -407,6 +412,7 @@ async fn schedule_gc(
         metric_level: None,
         boundary_files_enabled,
         object_store_max_retries: None,
+        wal_deletes_per_second: None,
     };
 
     admin

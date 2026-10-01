@@ -561,6 +561,7 @@ impl From<GarbageCollectorOptions> for slatedb::config::GarbageCollectorOptions 
             metric_level: None,
             boundary_files_enabled: !value.disable_boundary_files,
             object_store_max_retries: value.object_store_max_retries,
+            wal_deletes_per_second: None,
         }
     }
 }

@@ -250,13 +250,16 @@ impl GarbageCollector {
         ));
         let wal_gc_task = options.wal_options.map(|wal_options| {
             let wal_gc = wal_gc.unwrap_or_else(|| {
-                Arc::new(SlateDbWalGc::new(
-                    wal_store.clone(),
-                    stats.clone(),
-                    WalGcMode::Regular,
-                    gc_filter.clone(),
-                    system_clock.clone(),
-                ))
+                Arc::new(
+                    SlateDbWalGc::new(
+                        wal_store.clone(),
+                        stats.clone(),
+                        WalGcMode::Regular,
+                        gc_filter.clone(),
+                        system_clock.clone(),
+                    )
+                    .with_deletes_per_second(options.wal_deletes_per_second),
+                )
             });
             WalGcTask::new(
                 manifest_store.clone(),
@@ -267,13 +270,16 @@ impl GarbageCollector {
             )
         });
         let wal_fence_gc_task = options.wal_fence_options.map(|wal_fence_options| {
-            let wal_gc = Arc::new(SlateDbWalGc::new(
-                wal_store,
-                stats.clone(),
-                WalGcMode::Fence,
-                gc_filter.clone(),
-                system_clock.clone(),
-            ));
+            let wal_gc = Arc::new(
+                SlateDbWalGc::new(
+                    wal_store,
+                    stats.clone(),
+                    WalGcMode::Fence,
+                    gc_filter.clone(),
+                    system_clock.clone(),
+                )
+                .with_deletes_per_second(options.wal_deletes_per_second),
+            );
             WalGcTask::new(
                 manifest_store.clone(),
                 wal_gc,
@@ -1206,6 +1212,7 @@ mod tests {
             metric_level: None,
             boundary_files_enabled: true,
             object_store_max_retries: None,
+            wal_deletes_per_second: None,
         };
         let gc = GarbageCollector::new(
             manifest_store.clone(),
@@ -1277,6 +1284,7 @@ mod tests {
             metric_level: None,
             boundary_files_enabled: true,
             object_store_max_retries: None,
+            wal_deletes_per_second: None,
         };
         let recorder = Arc::new(DefaultMetricsRecorder::new());
         let helper = MetricsRecorderHelper::new(recorder.clone(), Default::default());
@@ -1347,6 +1355,7 @@ mod tests {
             metric_level: None,
             boundary_files_enabled: true,
             object_store_max_retries: None,
+            wal_deletes_per_second: None,
         };
         let gc = GarbageCollector::new(
             manifest_store.clone(),
@@ -1430,6 +1439,7 @@ mod tests {
             metric_level: None,
             boundary_files_enabled: true,
             object_store_max_retries: None,
+            wal_deletes_per_second: None,
         };
         let gc = GarbageCollector::new(
             manifest_store.clone(),
@@ -1916,6 +1926,7 @@ mod tests {
             metric_level: None,
             boundary_files_enabled: true,
             object_store_max_retries: None,
+            wal_deletes_per_second: None,
         };
 
         let gc = GarbageCollector::new(
@@ -1996,6 +2007,7 @@ mod tests {
             metric_level: None,
             boundary_files_enabled: true,
             object_store_max_retries: None,
+            wal_deletes_per_second: None,
         };
 
         let mut gc = GarbageCollector::new(
@@ -2071,6 +2083,7 @@ mod tests {
             metric_level: None,
             boundary_files_enabled: true,
             object_store_max_retries: None,
+            wal_deletes_per_second: None,
         };
 
         let gc = GarbageCollector::new(
@@ -2124,6 +2137,7 @@ mod tests {
             metric_level: None,
             boundary_files_enabled: true,
             object_store_max_retries: None,
+            wal_deletes_per_second: None,
         };
 
         let mut gc = GarbageCollector::new(
@@ -2181,6 +2195,7 @@ mod tests {
             metric_level: None,
             boundary_files_enabled: true,
             object_store_max_retries: None,
+            wal_deletes_per_second: None,
         };
 
         let gc = GarbageCollector::new(
@@ -2514,6 +2529,7 @@ mod tests {
             metric_level: None,
             boundary_files_enabled: true,
             object_store_max_retries: None,
+            wal_deletes_per_second: None,
         };
         let recorder = MetricsRecorderHelper::noop();
         let gc = GarbageCollector::new(
@@ -2617,6 +2633,7 @@ mod tests {
             metric_level: None,
             boundary_files_enabled: true,
             object_store_max_retries: None,
+            wal_deletes_per_second: None,
         };
         let recorder = Arc::new(DefaultMetricsRecorder::new());
         let helper = MetricsRecorderHelper::new(recorder.clone(), Default::default());
@@ -2751,6 +2768,7 @@ mod tests {
             metric_level: None,
             boundary_files_enabled: true,
             object_store_max_retries: None,
+            wal_deletes_per_second: None,
         };
         let recorder = MetricsRecorderHelper::noop();
         let gc = GarbageCollector::new(

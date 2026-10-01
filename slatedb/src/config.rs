@@ -1683,6 +1683,15 @@ pub struct GarbageCollectorOptions {
     /// operations. Defaults to unbounded retries.
     #[serde(default)]
     pub object_store_max_retries: Option<u32>,
+
+    /// The most WAL objects the garbage collector deletes per second. `None`
+    /// deletes them as fast as it can.
+    ///
+    /// A WAL that flushes often accumulates many small objects between runs.
+    /// Deleting them all at once can contend with WAL writes to the same
+    /// store, for example a local directory and its filesystem journal.
+    #[serde(default)]
+    pub wal_deletes_per_second: Option<u32>,
 }
 
 impl GarbageCollectorOptions {
@@ -1785,6 +1794,7 @@ impl Default for GarbageCollectorOptions {
             metric_level: None,
             boundary_files_enabled: true,
             object_store_max_retries: None,
+            wal_deletes_per_second: None,
         }
     }
 }
