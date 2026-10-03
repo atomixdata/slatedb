@@ -8,11 +8,12 @@ use std::fmt::Debug;
 use std::fs::TryLockError;
 use std::io;
 use std::ops::Range;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 
 /// A regular file in a [`Vfs::list`] result.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,13 +77,96 @@ pub trait VfsWriter: Debug + Send {
 /// An exclusive lock taken by [`Vfs::lock`]. Dropping it releases the lock.
 pub trait VfsLock: Debug + Send + Sync {}
 
+/// The default for [`StdVfs::with_max_open_files`].
+pub const DEFAULT_MAX_OPEN_FILES: usize = 4096;
+
 /// A [`Vfs`] backed by the standard filesystem through `tokio::fs`.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct StdVfs;
+///
+/// Range reads keep files open in a bounded cache, so a read of a file that is
+/// already open is one positional read on the blocking pool, without an open
+/// or a seek.
+#[derive(Clone)]
+pub struct StdVfs {
+    handles: Arc<quick_cache::sync::Cache<PathBuf, Arc<std::fs::File>>>,
+}
+
+impl Debug for StdVfs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StdVfs")
+            .field("open_files", &self.handles.len())
+            .finish()
+    }
+}
+
+impl Default for StdVfs {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl StdVfs {
     pub fn new() -> Self {
-        Self
+        Self::with_max_open_files(DEFAULT_MAX_OPEN_FILES)
+    }
+
+    /// Keeps at most `max_open_files` files open for range reads.
+    pub fn with_max_open_files(max_open_files: usize) -> Self {
+        Self {
+            handles: Arc::new(quick_cache::sync::Cache::new(max_open_files.max(1))),
+        }
+    }
+
+    /// Returns an open handle for `path`, opening and caching it on a miss.
+    ///
+    /// A handle cached for a file that is then replaced or removed would keep
+    /// reading the old contents, so `rename` and `remove` invalidate the paths
+    /// they change. If one of them runs between the `open` and the `insert`
+    /// below, its invalidation comes too early; the `fstat` after the insert
+    /// catches that case and drops the entry.
+    fn open_cached(&self, path: &Path) -> io::Result<Arc<std::fs::File>> {
+        if let Some(file) = self.handles.get(path) {
+            return Ok(file);
+        }
+        let file = Arc::new(std::fs::File::open(path)?);
+        self.handles.insert(path.to_path_buf(), file.clone());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if file.metadata().map_or(true, |m| m.nlink() == 0) {
+                self.handles.remove(path);
+            }
+        }
+        Ok(file)
+    }
+
+    fn invalidate(&self, path: &Path) {
+        self.handles.remove(path);
+    }
+}
+
+/// Reads exactly `buf.len()` bytes at `offset` without moving the file
+/// cursor, so readers can share one handle.
+fn read_exact_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        file.read_exact_at(buf, offset)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        let mut read = 0;
+        while read < buf.len() {
+            let n = file.seek_read(&mut buf[read..], offset + read as u64)?;
+            if n == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "failed to fill whole buffer",
+                ));
+            }
+            read += n;
+        }
+        Ok(())
     }
 }
 
@@ -138,11 +222,19 @@ impl Vfs for StdVfs {
     async fn read_range(&self, path: &Path, range: Range<u64>) -> io::Result<Bytes> {
         let len = usize::try_from(range.end.saturating_sub(range.start))
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "range is too large"))?;
-        let mut file = tokio::fs::File::open(path).await?;
-        file.seek(io::SeekFrom::Start(range.start)).await?;
-        let mut buf = vec![0; len];
-        file.read_exact(&mut buf).await?;
-        Ok(Bytes::from(buf))
+        let vfs = self.clone();
+        let path = path.to_path_buf();
+        // One trip to the blocking pool per read, like `tokio::fs`, but with
+        // the open skipped for cached files and no separate seek.
+        #[allow(clippy::disallowed_methods)]
+        tokio::task::spawn_blocking(move || {
+            let file = vfs.open_cached(&path)?;
+            let mut buf = vec![0; len];
+            read_exact_at(&file, &mut buf, range.start)?;
+            Ok(Bytes::from(buf))
+        })
+        .await
+        .map_err(io::Error::other)?
     }
 
     async fn read(&self, path: &Path) -> io::Result<Bytes> {
@@ -159,11 +251,16 @@ impl Vfs for StdVfs {
     }
 
     async fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
-        tokio::fs::rename(from, to).await
+        let result = tokio::fs::rename(from, to).await;
+        self.invalidate(from);
+        self.invalidate(to);
+        result
     }
 
     async fn remove(&self, path: &Path) -> io::Result<()> {
-        tokio::fs::remove_file(path).await
+        let result = tokio::fs::remove_file(path).await;
+        self.invalidate(path);
+        result
     }
 }
 
@@ -248,6 +345,32 @@ mod tests {
 
         vfs.remove(&b).await.unwrap();
         let err = vfs.remove(&b).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[tokio::test]
+    async fn should_not_read_replaced_or_removed_files_through_cached_handles() {
+        let dir = tempfile::tempdir().unwrap();
+        let vfs = StdVfs::new();
+        let (tmp, path) = (dir.path().join("tmp"), dir.path().join("a"));
+        let write = |path: PathBuf, contents: &'static str| {
+            let vfs = vfs.clone();
+            async move {
+                let mut writer = vfs.create(&path).await.unwrap();
+                writer.write(Bytes::from(contents)).await.unwrap();
+                writer.finish().await.unwrap();
+            }
+        };
+
+        write(path.clone(), "old").await;
+        assert_eq!(vfs.read_range(&path, 0..3).await.unwrap(), "old");
+
+        write(tmp.clone(), "new").await;
+        vfs.rename(&tmp, &path).await.unwrap();
+        assert_eq!(vfs.read_range(&path, 0..3).await.unwrap(), "new");
+
+        vfs.remove(&path).await.unwrap();
+        let err = vfs.read_range(&path, 0..3).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
     }
 

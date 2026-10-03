@@ -3358,6 +3358,7 @@ dependencies = [
  "md-5",
  "object_store",
  "parking_lot",
+ "quick_cache",
  "serde",
  "serde_json",
  "slatedb-common",

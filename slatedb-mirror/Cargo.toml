@@ -17,6 +17,7 @@ log = { workspace = true }
 md-5 = { workspace = true }
 object_store = { workspace = true }
 parking_lot = { workspace = true }
+quick_cache = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 slatedb-common = { workspace = true }
