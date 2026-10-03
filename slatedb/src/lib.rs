@@ -31,6 +31,7 @@ pub use fail_parallel;
 /// This is useful for users of the crate who want to use SlateDB
 /// without having to depend on the object store crate directly.
 pub use object_store;
+pub use slatedb_mirror;
 
 pub use batch::WriteBatch;
 pub use block_cache_policy::BlockCachePolicy;
@@ -67,6 +68,7 @@ pub use instrumented_object_store::stats as instrumented_object_store_stats;
 pub use iter::IterationOrder;
 pub use manifest::VersionedManifest;
 pub use merge_operator::{MergeOperator, MergeOperatorError};
+pub use mirror_policy::SlateDbMirrorPolicy;
 pub use ops::{DbCacheManagerOps, DbMetadataOps, DbReadOps, DbTransactionOps, DbWriteOps};
 pub use paths::PathResolver;
 pub use prefix_extractor::{PrefixExtractor, PrefixTarget};
@@ -92,6 +94,7 @@ pub mod config;
 pub mod db_cache;
 pub mod db_stats;
 pub mod manifest;
+pub mod mirror_policy;
 pub mod object_store_tag;
 pub mod prefix_extractor;
 pub mod seq_tracker;
