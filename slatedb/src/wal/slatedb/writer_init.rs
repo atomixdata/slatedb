@@ -14,7 +14,7 @@ use slatedb_common::metrics::MetricsRecorderHelper;
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::store::WalTableStore;
+use super::store::{WalFileId, WalTableStore};
 
 #[derive(Clone, Copy)]
 pub(crate) struct SlateDbWalWriterInitOptions {
@@ -22,6 +22,7 @@ pub(crate) struct SlateDbWalWriterInitOptions {
     max_wal_flushes_before_l0_flush: u64,
     max_flush_interval: Option<Duration>,
     group_commit: bool,
+    max_inflight_flushes: usize,
 }
 
 impl From<&Settings> for SlateDbWalWriterInitOptions {
@@ -33,6 +34,7 @@ impl From<&Settings> for SlateDbWalWriterInitOptions {
             max_wal_flushes_before_l0_flush: settings.max_wal_flushes_before_l0_flush,
             max_flush_interval: settings.flush_interval,
             group_commit: settings.wal_group_commit,
+            max_inflight_flushes: settings.wal_max_inflight_flushes.max(1),
         }
     }
 }
@@ -45,6 +47,7 @@ pub(crate) struct SlateDbWalWriterInit {
     max_wal_flushes_before_l0_flush: u64,
     max_flush_interval: Option<Duration>,
     group_commit: bool,
+    max_inflight_flushes: usize,
     empty_wal_id: u64,
     task_executor: Arc<MessageHandlerExecutor>,
     #[cfg_attr(not(test), allow(dead_code))]
@@ -74,6 +77,7 @@ impl SlateDbWalWriterInit {
             max_wal_flushes_before_l0_flush: options.max_wal_flushes_before_l0_flush,
             max_flush_interval: options.max_flush_interval,
             group_commit: options.group_commit,
+            max_inflight_flushes: options.max_inflight_flushes,
             empty_wal_id,
             task_executor,
             fp_tx,
@@ -108,11 +112,29 @@ impl wal::WriterInit for SlateDbWalWriterInit {
             assert!(empty_wal_id > manifest.core().replay_after_wal_id);
         }
         let manifest = manifest.clone();
+        // this writer is the only writer that could have written replay_after_wal_id,
+        // so it should not be possible for it to have advanced past the fencing wal.
+        // older writers would have failed with a stale epoch
+        let replay_after_wal_id = manifest.core().replay_after_wal_id;
+        assert!(empty_wal_id > replay_after_wal_id);
+
+        // Uploads overlap, so a crash or a fenced writer can leave WALs past a
+        // missing id. Durability is recorded in WAL order, so nothing past
+        // the first hole was ever acknowledged and the hole ends the log. The
+        // old writer may still land uploads for up to `window` ids past its
+        // last durable one, so every id in that window gets a fence and
+        // anything it already landed there is dropped.
+        let window = self.max_inflight_flushes as u64;
+        let mut fence_start = (replay_after_wal_id + 1).max(empty_wal_id.saturating_sub(window));
+        while fence_start < empty_wal_id && self.table_store.wal_exists(fence_start.into()).await? {
+            fence_start += 1;
+        }
 
         let mut _attempt = 0;
-        loop {
+        let mut wal_id = fence_start;
+        while wal_id < fence_start + window {
             _attempt += 1;
-            let wrote_fence = match self.table_store.write_wal_fence(empty_wal_id.into()).await {
+            let wrote_fence = match self.table_store.write_wal_fence(wal_id.into()).await {
                 Ok(()) => true,
                 Err(SlateDBError::Fenced) => false,
                 Err(err) => return Err(err.into()),
@@ -120,42 +142,56 @@ impl wal::WriterInit for SlateDbWalWriterInit {
             fail_point_send!(self.fp_tx, format!("{}:{}", "WriteWalFence", _attempt));
 
             if wrote_fence {
-                // this writer is the only writer that could have written replay_after_wal_id,
-                // so it should not be possible for it to have advanced past the fencing wal.
-                // older writers would have failed with a stale epoch
-                let replay_after_wal_id = manifest.core().replay_after_wal_id;
-                assert!(empty_wal_id > replay_after_wal_id);
-                let replay_iterator = SlateDbWalIterator::range(
-                    replay_after_wal_id + 1,
-                    WalIteratorEndBound::Exclusive(empty_wal_id + 1),
-                    SlateDbWalIteratorOptions::default(),
-                    self.table_store.clone(),
-                )?;
-                let wal_writer = SlateDbWalWriter::start_new(
-                    self.closed_result_reader.clone(),
-                    &self.recorder,
-                    empty_wal_id,
-                    self.table_store.clone(),
-                    self.max_wal_bytes_size,
-                    self.max_wal_flushes_before_l0_flush,
-                    self.max_flush_interval,
-                    self.group_commit,
-                    self.task_executor.clone(),
-                )
-                .await?;
-                let result = WriterInitResult {
-                    replay_iterator: Box::new(replay_iterator),
-                    wal_writer: Box::new(wal_writer),
-                };
-                return Ok(result);
+                wal_id += 1;
+                continue;
+            }
+            // Refresh validates that we own the latest epoch still.
+            writer_manifest.refresh().await?;
+            fail_point_send!(self.fp_tx, format!("{}:{}", "RefreshManifest", _attempt));
+            if wal_id == fence_start {
+                // The old writer landed the next contiguous WAL before the
+                // fence, so the log extends by one. Try the next wal ID.
+                fence_start += 1;
+                wal_id = fence_start;
             } else {
-                // Refresh validates that we own the latest epoch still.
-                writer_manifest.refresh().await?;
-                fail_point_send!(self.fp_tx, format!("{}:{}", "RefreshManifest", _attempt));
-                // The old writer managed to write a WAL before we could write the fencing wal.
-                // Try the next wal ID
-                empty_wal_id += 1;
+                // Landed past the fence by a writer that can no longer
+                // acknowledge it. Drop it and fence the id.
+                self.table_store.delete_sst(wal_id.into()).await?;
             }
         }
+        for orphan in self
+            .table_store
+            .list_wal_ssts(WalFileId::from(fence_start + window)..)
+            .await?
+        {
+            self.table_store.delete_sst(orphan.id).await?;
+        }
+
+        // Replay runs through the fences, which are empty, so the manifest's
+        // next WAL id lands after the window like the writer's.
+        let replay_iterator = SlateDbWalIterator::range(
+            replay_after_wal_id + 1,
+            WalIteratorEndBound::Exclusive(fence_start + window),
+            SlateDbWalIteratorOptions::default(),
+            self.table_store.clone(),
+        )?;
+        let wal_writer = SlateDbWalWriter::start_new(
+            self.closed_result_reader.clone(),
+            &self.recorder,
+            fence_start + window - 1,
+            self.table_store.clone(),
+            self.max_wal_bytes_size,
+            self.max_wal_flushes_before_l0_flush,
+            self.max_flush_interval,
+            self.group_commit,
+            self.max_inflight_flushes,
+            self.task_executor.clone(),
+        )
+        .await?;
+        let result = WriterInitResult {
+            replay_iterator: Box::new(replay_iterator),
+            wal_writer: Box::new(wal_writer),
+        };
+        Ok(result)
     }
 }

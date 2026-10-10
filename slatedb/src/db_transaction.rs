@@ -2108,6 +2108,7 @@ mod tests {
             max_wal_flushes_before_l0_flush: 4096,
             wal_buffer_bytes: None,
             wal_group_commit: false,
+            wal_max_inflight_flushes: 1,
             compactor_options,
             compression_codec: None,
             object_store_cache_options: crate::config::ObjectStoreCacheOptions::default(),

@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::fmt::{Debug, Formatter};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use self::stats::WalBufferStats;
 use crate::dispatcher::{MessageHandler, MessageHandlerExecutor, MessageTickerDef};
@@ -14,8 +14,10 @@ use crate::wal;
 use crate::wal::{FlushResultFuture, WalError, WalEvent, WalStatus, WalWriter};
 use async_trait::async_trait;
 use futures::{stream::BoxStream, FutureExt, StreamExt};
-use log::{error, trace, warn};
+use log::{error, trace};
 use slatedb_common::metrics::MetricsRecorderHelper;
+use std::panic::AssertUnwindSafe;
+use tokio::task::JoinHandle;
 use tokio::{runtime::Handle, sync::oneshot};
 use tracing::instrument;
 
@@ -117,6 +119,7 @@ impl SlateDbWalWriter {
         max_wal_flushes_before_l0_flush: u64,
         max_flush_interval: Option<Duration>,
         group_commit: bool,
+        max_inflight_flushes: usize,
         task_executor: Arc<MessageHandlerExecutor>,
     ) -> Result<Self, SlateDBError> {
         let current_wal = WalBuffer::new();
@@ -137,10 +140,16 @@ impl SlateDbWalWriter {
         let wal_flush_handler = WalFlushHandler {
             max_flush_interval,
             group_commit,
+            max_inflight_flushes: max_inflight_flushes.max(1),
             inner: inner.clone(),
             table_store: table_store.clone(),
             stats: stats.clone(),
             listener: None,
+            inflight: VecDeque::new(),
+            waiters: Vec::new(),
+            deferred_flush: false,
+            current_wal_since: Instant::now(),
+            batch_tick_scheduled: false,
         };
         task_executor.add_handler(
             WAL_BUFFER_TASK_NAME.to_string(),
@@ -297,14 +306,26 @@ impl SlateDbWalWriterInner {
         (need_flush, self.flush_epoch)
     }
 
-    /// Returns the list of immutable WALs that need to be flushed.
-    /// Used by the handler to determine which WALs to write to storage.
-    fn flushing_wals(&self) -> Vec<(u64, Arc<WalBuffer>)> {
-        let flushing_wals: Vec<_> = self.immutable_wals.iter().cloned().collect();
-        for (wal_id, _wal) in flushing_wals.iter() {
-            assert!(*wal_id > self.last_flushed_wal_id);
+    /// The last buffered seq that is not yet durable, if any. A `flush()`
+    /// caller is done once `last_flushed_seq` reaches it.
+    fn unflushed_target_seq(&self) -> Option<u64> {
+        let last = self.current_wal.last_seq().or_else(|| {
+            self.immutable_wals
+                .back()
+                .and_then(|(_, wal)| wal.last_seq())
+        })?;
+        if self.last_flushed_seq.is_some_and(|flushed| flushed >= last) {
+            None
+        } else {
+            Some(last)
         }
-        flushing_wals
+    }
+
+    /// The immutable WAL at `index`, in flush order.
+    fn immutable_wal(&self, index: usize) -> Option<(u64, Arc<WalBuffer>)> {
+        let (wal_id, wal) = self.immutable_wals.get(index)?;
+        assert!(*wal_id > self.last_flushed_wal_id);
+        Some((*wal_id, wal.clone()))
     }
 
     /// Returns the total size of all unflushed WALs in bytes.
@@ -452,6 +473,19 @@ enum WalFlushWork {
     Flush {
         result_tx: Option<oneshot::Sender<Result<(), WalError>>>,
     },
+    /// An upload started by the handler finished.
+    Flushed {
+        wal_id: u64,
+        result: Result<(), SlateDBError>,
+    },
+    /// The flush timer fired, or a deferred `flush()` request's batch wait
+    /// ended: freeze the current WAL if a slot is free.
+    Tick,
+    /// An upload task panicked. The handler re-raises the panic so the
+    /// dispatcher reports it like a panic in the handler itself.
+    Panicked {
+        payload: Box<dyn std::any::Any + Send>,
+    },
     Subscribe {
         listener: wal::WalStatusListener,
     },
@@ -461,73 +495,181 @@ impl Debug for WalFlushWork {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             WalFlushWork::Flush { .. } => f.write_str("Flush"),
+            WalFlushWork::Flushed { wal_id, .. } => write!(f, "Flushed({wal_id})"),
+            WalFlushWork::Tick => f.write_str("Tick"),
+            WalFlushWork::Panicked { .. } => f.write_str("Panicked"),
             WalFlushWork::Subscribe { .. } => f.write_str("Subscribe"),
         }
     }
+}
+
+/// A WAL upload in progress, in WAL order.
+struct InflightFlush {
+    wal_id: u64,
+    wal: Arc<WalBuffer>,
+    task: JoinHandle<Result<(), SlateDBError>>,
+    done: bool,
 }
 
 struct WalFlushHandler {
     max_flush_interval: Option<Duration>,
     /// Flush again as soon as a flush finishes if writes are buffered.
     group_commit: bool,
+    /// How many WAL uploads may run at once.
+    max_inflight_flushes: usize,
     inner: Arc<parking_lot::RwLock<SlateDbWalWriterInner>>,
     table_store: Arc<WalTableStore>,
     stats: Arc<WalBufferStats>,
     listener: Option<wal::WalStatusListener>,
+    /// Uploads in WAL order. Durability is recorded from the front, so a
+    /// later WAL that finishes first waits for the earlier ones.
+    inflight: VecDeque<InflightFlush>,
+    /// `flush()` callers with the seq each one waits for.
+    waiters: Vec<(u64, oneshot::Sender<Result<(), WalError>>)>,
+    /// A flush request arrived while every slot was busy; freeze the current
+    /// WAL when a slot frees up even without group commit.
+    deferred_flush: bool,
+    /// When the current WAL started collecting entries.
+    current_wal_since: Instant,
+    /// A delayed tick is already scheduled for a deferred `flush()` request.
+    batch_tick_scheduled: bool,
 }
 
+/// With several uploads in flight, a `flush()` request freezes the current
+/// WAL only once it is this old; a tick does it otherwise. Serialized uploads
+/// batch naturally because a request waits for the upload in flight, but
+/// with free slots every request would start its own small upload.
+const PIPELINE_BATCH_WAIT: Duration = Duration::from_millis(1);
+
 impl WalFlushHandler {
-    #[instrument(level = "trace", skip_all, err(level = tracing::Level::DEBUG))]
-    async fn do_flush(&self) -> Result<(), SlateDBError> {
-        let flushing_wals = {
-            let mut inner = self.inner.write();
-            inner.freeze_current_wal();
-            inner.flushing_wals()
-        };
-
-        for (wal_id, wal) in flushing_wals {
-            let result = self.do_flush_one_wal(wal_id, wal.clone()).await;
-            if let Err(e) = &result {
-                // a WAL buffer can be retried to flush multiple times, but WatchableOnceCell is only set once.
-                // we do NOT call `wal.notify_durable` as soon as encountered any error here, but notify
-                // the error when we're sure enters fatal state in `do_cleanup`.
-                error!("failed to flush WAL [wal_id={}]", wal_id);
-                return Err(e.clone());
+    /// Starts uploads until `max_inflight_flushes` are running. Freezes the
+    /// current WAL for upload when `freeze_current` is set and a slot is free,
+    /// so writes keep batching while every slot is busy.
+    fn start_flushes(&mut self, freeze_current: bool) {
+        loop {
+            if self.inflight.len() >= self.max_inflight_flushes {
+                if freeze_current && !self.inner.read().current_wal.is_empty() {
+                    self.deferred_flush = true;
+                }
+                return;
             }
-
-            // increment the last flushed wal id, and last flushed seq
-            let status = {
+            let next = {
                 let mut inner = self.inner.write();
-                inner.record_flushed_wal(wal_id, &wal);
-                inner.compute_status(&self.table_store)
+                let in_flight = self.inflight.len();
+                if inner.immutable_wals.len() <= in_flight {
+                    if !freeze_current || inner.current_wal.is_empty() {
+                        return;
+                    }
+                    inner.freeze_current_wal();
+                    self.current_wal_since = Instant::now();
+                }
+                inner.immutable_wal(in_flight)
             };
-
-            if Arc::strong_count(&wal) > 1 {
-                warn!("outstanding references to wal id {} after flushing", wal_id);
-            }
-            drop(wal);
-            self.notify_listener(WalEvent::WalFlushed(status));
+            let Some((wal_id, wal)) = next else {
+                return;
+            };
+            self.spawn_flush(wal_id, wal);
         }
-
-        Ok(())
     }
 
-    async fn do_flush_one_wal(&self, wal_id: u64, wal: Arc<WalBuffer>) -> Result<(), SlateDBError> {
-        self.stats.flushes.increment(1);
-
-        let mut sst_builder = self.table_store.table_builder();
-        let mut iter = wal.iter();
-        while let Some(entry) = iter.next() {
-            sst_builder.add(entry).await?;
+    /// How much longer a `flush()` request should let the current WAL batch
+    /// before freezing it. Zero when uploads are serialized, when the WAL is
+    /// old enough, or when nothing is buffered.
+    fn batch_wait_remaining(&self) -> Duration {
+        if self.max_inflight_flushes <= 1 || self.inner.read().current_wal.is_empty() {
+            return Duration::ZERO;
         }
+        PIPELINE_BATCH_WAIT.saturating_sub(self.current_wal_since.elapsed())
+    }
 
-        let encoded_sst = sst_builder.build().await?;
-        let written_bytes = encoded_sst.remaining_len() as u64;
-        self.table_store
-            .write_sst(wal_id.into(), &encoded_sst)
-            .await?;
-        self.stats.flush_bytes.increment(written_bytes);
-        Ok(())
+    fn schedule_batch_tick(&mut self, wait: Duration) {
+        if self.batch_tick_scheduled {
+            return;
+        }
+        self.batch_tick_scheduled = true;
+        let inner = self.inner.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(wait).await;
+            let _ = inner.read().send_flush_msg(WalFlushWork::Tick);
+        });
+    }
+
+    fn spawn_flush(&mut self, wal_id: u64, wal: Arc<WalBuffer>) {
+        let table_store = self.table_store.clone();
+        let stats = self.stats.clone();
+        let inner = self.inner.clone();
+        let upload = wal.clone();
+        let task = tokio::spawn(async move {
+            let upload = AssertUnwindSafe(flush_one_wal(&table_store, &stats, wal_id, &upload))
+                .catch_unwind()
+                .await;
+            let result = match upload {
+                Ok(result) => result,
+                Err(payload) => {
+                    let _ = inner
+                        .read()
+                        .send_flush_msg(WalFlushWork::Panicked { payload });
+                    return Err(SlateDBError::BackgroundTaskPanic(format!(
+                        "WAL flush task panicked [wal_id={wal_id}]"
+                    )));
+                }
+            };
+            if result.is_err() {
+                error!("failed to flush WAL [wal_id={}]", wal_id);
+            }
+            // The handler records durability in WAL order on this message.
+            // A closed channel means the writer is shutting down, and
+            // `cleanup` then collects the result from the task itself.
+            let _ = inner.read().send_flush_msg(WalFlushWork::Flushed {
+                wal_id,
+                result: result.clone(),
+            });
+            result
+        });
+        self.inflight.push_back(InflightFlush {
+            wal_id,
+            wal,
+            task,
+            done: false,
+        });
+    }
+
+    /// Records every finished upload at the front of the queue, in WAL order.
+    fn record_flushed(&mut self) {
+        while self.inflight.front().is_some_and(|flush| flush.done) {
+            let flushed = self.inflight.pop_front().expect("checked above");
+            let status = {
+                let mut inner = self.inner.write();
+                inner.record_flushed_wal(flushed.wal_id, &flushed.wal);
+                inner.compute_status(&self.table_store)
+            };
+            trace!(
+                "recorded durable WAL [wal_id={}, last_flushed_seq={:?}]",
+                flushed.wal_id,
+                status.last_flushed_seq
+            );
+            drop(flushed);
+            self.notify_listener(WalEvent::WalFlushed(status));
+        }
+    }
+
+    fn resolve_waiters(&mut self) {
+        let Some(last_flushed_seq) = self.inner.read().last_flushed_seq else {
+            return;
+        };
+        trace!(
+            "resolving waiters [last_flushed_seq={}, waiters={:?}]",
+            last_flushed_seq,
+            self.waiters.iter().map(|(seq, _)| *seq).collect::<Vec<_>>()
+        );
+        let (done, pending): (Vec<_>, Vec<_>) = self
+            .waiters
+            .drain(..)
+            .partition(|(seq, _)| *seq <= last_flushed_seq);
+        self.waiters = pending;
+        for (_, result_tx) in done {
+            let _ = result_tx.send(Ok(()));
+        }
     }
 
     fn notify_listener(&self, event: WalEvent) {
@@ -537,13 +679,35 @@ impl WalFlushHandler {
     }
 }
 
+#[instrument(level = "trace", skip_all, err(level = tracing::Level::DEBUG))]
+async fn flush_one_wal(
+    table_store: &WalTableStore,
+    stats: &WalBufferStats,
+    wal_id: u64,
+    wal: &WalBuffer,
+) -> Result<(), SlateDBError> {
+    stats.flushes.increment(1);
+
+    let mut sst_builder = table_store.table_builder();
+    let mut iter = wal.iter();
+    while let Some(entry) = iter.next() {
+        sst_builder.add(entry).await?;
+    }
+
+    let encoded_sst = sst_builder.build().await?;
+    let written_bytes = encoded_sst.remaining_len() as u64;
+    table_store.write_sst(wal_id.into(), &encoded_sst).await?;
+    stats.flush_bytes.increment(written_bytes);
+    Ok(())
+}
+
 #[async_trait]
 impl MessageHandler<WalFlushWork> for WalFlushHandler {
     fn tickers(&mut self) -> Vec<MessageTickerDef<WalFlushWork>> {
         if let Some(max_flush_interval) = self.max_flush_interval {
             return vec![MessageTickerDef::new(
                 max_flush_interval,
-                Box::new(|| WalFlushWork::Flush { result_tx: None }),
+                Box::new(|| WalFlushWork::Tick),
             )];
         }
         vec![]
@@ -552,21 +716,64 @@ impl MessageHandler<WalFlushWork> for WalFlushHandler {
     async fn handle(&mut self, message: WalFlushWork) -> Result<(), SlateDBError> {
         match message {
             WalFlushWork::Flush { result_tx } => {
-                let result = self.do_flush().await;
+                trace!(
+                    "flush request [waiter={}, inflight={}, deferred={}]",
+                    result_tx.is_some(),
+                    self.inflight.len(),
+                    self.deferred_flush
+                );
+                let explicit = result_tx.is_some();
                 if let Some(result_tx) = result_tx {
-                    let _ = result_tx.send(result.clone().map_err(WalError::from));
-                }
-                result?;
-                // Queue the next flush rather than looping here, so the
-                // dispatcher still checks for cancellation between flushes.
-                if self.group_commit {
-                    let inner = self.inner.read();
-                    if !inner.current_wal.is_empty() {
-                        let _ = inner.send_flush_msg(WalFlushWork::Flush { result_tx: None });
+                    let target = self.inner.read().unflushed_target_seq();
+                    trace!("flush request target [seq={:?}]", target);
+                    match target {
+                        Some(seq) => self.waiters.push((seq, result_tx)),
+                        None => {
+                            let _ = result_tx.send(Ok(()));
+                        }
                     }
+                }
+                let batch_wait = self.batch_wait_remaining();
+                if explicit && batch_wait > Duration::ZERO {
+                    self.schedule_batch_tick(batch_wait);
+                } else {
+                    self.start_flushes(true);
                 }
                 Ok(())
             }
+            WalFlushWork::Tick => {
+                self.batch_tick_scheduled = false;
+                self.start_flushes(true);
+                Ok(())
+            }
+            WalFlushWork::Flushed { wal_id, result } => {
+                trace!(
+                    "upload finished [wal_id={}, ok={}, inflight={:?}]",
+                    wal_id,
+                    result.is_ok(),
+                    self.inflight
+                        .iter()
+                        .map(|f| (f.wal_id, f.done))
+                        .collect::<Vec<_>>()
+                );
+                result?;
+                let flush = self
+                    .inflight
+                    .iter_mut()
+                    .find(|flush| flush.wal_id == wal_id)
+                    .expect("completion for a WAL that is not in flight");
+                flush.done = true;
+                self.record_flushed();
+                self.resolve_waiters();
+                // With group commit, keep flushing while writes are buffered
+                // rather than waiting for the next tick or request. A request
+                // that found every slot busy is honoured now either way.
+                let freeze = self.group_commit || self.deferred_flush;
+                self.deferred_flush = false;
+                self.start_flushes(freeze);
+                Ok(())
+            }
+            WalFlushWork::Panicked { payload } => std::panic::resume_unwind(payload),
             WalFlushWork::Subscribe { listener } => {
                 // TODO: support multiple listeners. For now, the db listener is the only one
                 assert!(self.listener.is_none());
@@ -581,6 +788,28 @@ impl MessageHandler<WalFlushWork> for WalFlushHandler {
         mut messages: BoxStream<'async_trait, WalFlushWork>,
         result: Result<(), SlateDBError>,
     ) -> Result<(), SlateDBError> {
+        // Let the uploads already running finish and record them in order, so
+        // a clean close loses nothing that was handed to the object store.
+        let mut result = result;
+        while let Some(mut flush) = self.inflight.pop_front() {
+            let upload = match (&mut flush.task).await {
+                Ok(upload) => upload,
+                Err(e) => Err(SlateDBError::BackgroundTaskPanic(format!(
+                    "WAL flush task failed: {e}"
+                ))),
+            };
+            match (&result, upload) {
+                (Ok(()), Ok(())) => {
+                    self.inflight.push_front(flush);
+                    self.inflight.front_mut().expect("just pushed").done = true;
+                    self.record_flushed();
+                }
+                (Ok(()), Err(e)) => result = Err(e),
+                (Err(_), _) => {}
+            }
+        }
+        self.resolve_waiters();
+
         let error = result
             .clone()
             .err()
@@ -593,6 +822,10 @@ impl MessageHandler<WalFlushWork> for WalFlushHandler {
             .mark_closed(error.clone(), &self.table_store);
         self.notify_listener(WalEvent::WalClosed(final_status.clone()));
 
+        for (_, result_tx) in self.waiters.drain(..) {
+            let _ = result_tx.send(Err(error.clone()));
+        }
+
         // drain remaining messages
         while let Some(msg) = messages.next().await {
             match msg {
@@ -601,6 +834,9 @@ impl MessageHandler<WalFlushWork> for WalFlushHandler {
                         let _ = result_tx.send(Err(error.clone()));
                     }
                 }
+                WalFlushWork::Flushed { .. }
+                | WalFlushWork::Tick
+                | WalFlushWork::Panicked { .. } => {}
                 WalFlushWork::Subscribe { listener } => {
                     (*listener)(WalEvent::WalClosed(final_status.clone()))
                 }
@@ -671,6 +907,7 @@ mod tests {
     use crate::format::sst::SsTableFormat;
     use crate::object_store_tag::TableStoreKind;
     use crate::oracle::DbOracle;
+    use crate::test_utils::GatedObjectStore;
     use crate::types::{RowEntry, ValueDeletable};
     use crate::wal::slatedb::sst_iterator::{WalSstIterator, WalSstIteratorOptions};
     use bytes::Bytes;
@@ -837,6 +1074,21 @@ mod tests {
         Arc<DefaultMetricsRecorder>,
     ) {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        setup_wal_buffer_with_store(object_store, flush_interval, listener, false, 1).await
+    }
+
+    async fn setup_wal_buffer_with_store(
+        object_store: Arc<dyn ObjectStore>,
+        flush_interval: Duration,
+        listener: wal::WalStatusListener,
+        group_commit: bool,
+        max_inflight_flushes: usize,
+    ) -> (
+        SlateDbWalWriter,
+        Arc<WalTableStore>,
+        Arc<DbStatusManager>,
+        Arc<DefaultMetricsRecorder>,
+    ) {
         let table_store = Arc::new(WalTableStore::new(
             object_store,
             SsTableFormat::default(),
@@ -860,7 +1112,8 @@ mod tests {
             1000,                 // max_wal_bytes_size
             4096,                 // max_wal_flushes_before_l0_flush
             Some(flush_interval), // max_flush_interval
-            false,                // group_commit
+            group_commit,
+            max_inflight_flushes,
             task_executor.clone(),
         )
         .await
@@ -1046,5 +1299,126 @@ mod tests {
         let status = flushed.pop().unwrap();
         assert_eq!(status.last_flushed_wal_id, 1);
         assert_eq!(status.last_flushed_seq, Some(1));
+    }
+
+    /// Yields until the flush handler has frozen `count` WALs.
+    async fn wait_for_frozen_wals(wal_buffer: &SlateDbWalWriter, count: usize) {
+        while wal_buffer.inner.read().immutable_wals.len() < count {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_flush_pipelines_uploads_and_records_in_order() {
+        let gated = Arc::new(GatedObjectStore::new(Arc::new(InMemory::new())));
+        let (mut wal_buffer, table_store, _, _) = setup_wal_buffer_with_store(
+            gated.clone(),
+            Duration::from_secs(3600),
+            Arc::new(|_status| {}),
+            true,
+            3,
+        )
+        .await;
+        gated.put_opts_gate.close();
+
+        // Three requests fill the three slots, so each one freezes its own
+        // WAL. Each request is handled before the next entry is appended, or
+        // the handler would batch the entries into one WAL.
+        let mut results = Vec::new();
+        for seq in 1..=3 {
+            let entry = make_entry(&format!("key{seq}"), "value", seq, None);
+            wal_buffer
+                .append(std::slice::from_ref(&entry))
+                .await
+                .unwrap();
+            results.push(wal_buffer.flush().await.unwrap());
+            wait_for_frozen_wals(&wal_buffer, seq as usize).await;
+        }
+        gated.put_opts_gate.wait_for_arrivals(3).await;
+        {
+            let inner = wal_buffer.inner.read();
+            assert_eq!(inner.immutable_wals.len(), 3);
+            assert_eq!(inner.last_flushed_wal_id, 0);
+        }
+
+        // With every slot busy, a fourth request batches instead of freezing.
+        let entry = make_entry("key4", "value", 4, None);
+        wal_buffer
+            .append(std::slice::from_ref(&entry))
+            .await
+            .unwrap();
+        results.push(wal_buffer.flush().await.unwrap());
+        tokio::task::yield_now().await;
+        {
+            let inner = wal_buffer.inner.read();
+            assert_eq!(inner.immutable_wals.len(), 3);
+            assert_eq!(inner.current_wal.len(), 1);
+        }
+
+        gated.put_opts_gate.release();
+        for result in results {
+            result.await.unwrap();
+        }
+        {
+            let inner = wal_buffer.inner.read();
+            assert_eq!(inner.last_flushed_wal_id, 4);
+            assert_eq!(inner.last_flushed_seq, Some(4));
+            assert!(inner.immutable_wals.is_empty());
+        }
+        for wal_id in 1..=4u64 {
+            let table = table_store.open_sst(wal_id.into()).await.unwrap();
+            let mut iter =
+                WalSstIterator::new(table, table_store.clone(), WalSstIteratorOptions::default())
+                    .await
+                    .unwrap();
+            let entry = iter.next().await.unwrap().unwrap();
+            assert_eq!(entry.seq, wal_id);
+            assert!(iter.next().await.unwrap().is_none());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_flush_records_later_wal_only_after_earlier_wal() {
+        let gated = Arc::new(GatedObjectStore::new(Arc::new(InMemory::new())));
+        let (mut wal_buffer, _, _, _) = setup_wal_buffer_with_store(
+            gated.clone(),
+            Duration::from_secs(3600),
+            Arc::new(|_status| {}),
+            true,
+            2,
+        )
+        .await;
+        gated.put_opts_gate.close();
+
+        let mut results = Vec::new();
+        for seq in 1..=2 {
+            let entry = make_entry(&format!("key{seq}"), "value", seq, None);
+            wal_buffer
+                .append(std::slice::from_ref(&entry))
+                .await
+                .unwrap();
+            results.push(wal_buffer.flush().await.unwrap());
+            wait_for_frozen_wals(&wal_buffer, seq as usize).await;
+        }
+        gated.put_opts_gate.wait_for_arrivals(2).await;
+
+        // Let one upload through. Whichever it was, WAL 2 cannot be durable
+        // before WAL 1, so at most WAL 1 is recorded.
+        gated.put_opts_gate.admit(1);
+        let second = results.pop().expect("two results");
+        let second = tokio::time::timeout(Duration::from_millis(100), second).await;
+        assert!(second.is_err(), "WAL 2 must not be durable before WAL 1");
+        assert!(wal_buffer.inner.read().last_flushed_wal_id <= 1);
+
+        gated.put_opts_gate.release();
+        for result in results {
+            result.await.unwrap();
+        }
+        let mut second = wal_buffer.flush().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), &mut second)
+            .await
+            .expect("flush completes")
+            .unwrap();
+        assert_eq!(wal_buffer.inner.read().last_flushed_wal_id, 2);
     }
 }

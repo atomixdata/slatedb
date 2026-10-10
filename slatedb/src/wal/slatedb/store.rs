@@ -570,6 +570,10 @@ impl WalTableStore {
         ))
     }
 
+    pub(crate) async fn wal_exists(&self, wal_id: WalFileId) -> Result<bool, SlateDBError> {
+        wal_object_exists(&self.object_store, &self.path(wal_id)).await
+    }
+
     fn path(&self, wal_id: WalFileId) -> Path {
         self.path_resolver.wal_sst_path(&wal_id)
     }

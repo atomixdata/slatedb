@@ -2265,7 +2265,7 @@ mod tests {
         assert_iterator, lookup_merge_operator_operands, GatedObjectStore,
         OnDemandCompactionSchedulerSupplier, StringConcatMergeOperator,
     };
-    use crate::types::RowEntry;
+    use crate::types::{RowEntry, ValueDeletable};
     use crate::wal::slatedb::store::WalTableStore;
     use crate::wal::{SlateDbWalReaderBuilder, WalError, WalReader as _};
     use crate::{proptest_util, test_utils, CloseReason, CompactorBuilder, KeyValue};
@@ -7079,6 +7079,75 @@ mod tests {
         assert_eq!(db2.inner.state.read().state().core().next_wal_sst_id, 5);
     }
 
+    #[tokio::test]
+    async fn test_open_recovers_from_wal_hole_left_by_pipelined_uploads() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = "/tmp/test_kv_store";
+        // A large L0 size keeps these few writes in one memtable, so the
+        // test exercises the WAL window rather than L0 limits.
+        let mut settings = test_db_options(0, 1024 * 1024, None);
+        settings.wal_max_inflight_flushes = 4;
+        let db1 = Db::builder(path, object_store.clone())
+            .with_settings(settings.clone())
+            .build()
+            .await
+            .unwrap();
+        db1.put(b"1", b"1")
+            .await
+            .unwrap()
+            .await_durable()
+            .await
+            .unwrap();
+        db1.close().await.unwrap();
+
+        // Simulate a crash mid-pipeline: a later WAL landed while the one
+        // before it did not. Nothing in it was acknowledged.
+        let wal_store = WalTableStore::new(
+            object_store.clone(),
+            SsTableFormat::default(),
+            path,
+            TableStoreKind::Main,
+        );
+        let last_seen = wal_store.last_seen_wal_id(0.into()).await.unwrap().value();
+        let hole = last_seen + 1;
+        let mut builder = wal_store.table_builder();
+        builder
+            .add(RowEntry::new(
+                Bytes::from_static(b"ghost"),
+                ValueDeletable::Value(Bytes::from_static(b"never acknowledged")),
+                1_000_000,
+                None,
+                None,
+            ))
+            .await
+            .unwrap();
+        let orphan = builder.build().await.unwrap();
+        wal_store
+            .write_sst((hole + 1).into(), &orphan)
+            .await
+            .unwrap();
+
+        let db2 = Db::builder(path, object_store.clone())
+            .with_settings(settings)
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(db2.get(b"1").await.unwrap(), Some(Bytes::from_static(b"1")));
+        assert_eq!(db2.get(b"ghost").await.unwrap(), None);
+        // Writes continue past the whole fenced window without tripping on
+        // the orphan or the fences.
+        for i in 0..8u8 {
+            db2.put(&[i], &[i])
+                .await
+                .unwrap()
+                .await_durable()
+                .await
+                .unwrap();
+        }
+        assert_eq!(db2.get(&[7u8]).await.unwrap(), Some(Bytes::from(vec![7u8])));
+        db2.close().await.unwrap();
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_writer_paused_in_replay_wal_should_be_fenced_by_concurrent_open() {
         // Race we're trying to reproduce:
@@ -7835,6 +7904,7 @@ mod tests {
             max_wal_flushes_before_l0_flush: 4096,
             wal_buffer_bytes: None,
             wal_group_commit: false,
+            wal_max_inflight_flushes: 1,
             compactor_options,
             compression_codec: None,
             object_store_cache_options: ObjectStoreCacheOptions::default(),

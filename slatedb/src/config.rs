@@ -790,6 +790,15 @@ pub struct Settings {
     #[serde(default)]
     pub wal_group_commit: bool,
 
+    /// Maximum number of WAL flushes (uploads) in flight at once. Above 1 the
+    /// writer freezes and uploads the next WAL while earlier uploads are still
+    /// running, so a write waiting for durability waits for about one upload
+    /// instead of the one in flight plus its own. Durability is still recorded
+    /// in WAL order, and a WAL is only acknowledged after every earlier WAL.
+    /// Implies `wal_group_commit`. Values below 1 behave as 1.
+    #[serde(default = "default_wal_max_inflight_flushes")]
+    pub wal_max_inflight_flushes: usize,
+
     /// Defines the max total number of SSTs in L0 across the entire key space. Memtables
     /// will not be flushed if the total L0 count (including in-flight uploads) would exceed
     /// this value, until compaction can compact the ssts into compacted.
@@ -899,6 +908,7 @@ impl std::fmt::Debug for Settings {
             )
             .field("wal_buffer_bytes", &self.wal_buffer_bytes)
             .field("wal_group_commit", &self.wal_group_commit)
+            .field("wal_max_inflight_flushes", &self.wal_max_inflight_flushes)
             .field("l0_max_ssts", &self.l0_max_ssts)
             .field("l0_max_ssts_per_key", &self.l0_max_ssts_per_key)
             .field("l0_flush_parallelism", &self.l0_flush_parallelism)
@@ -1120,6 +1130,10 @@ impl Provider for Settings {
     }
 }
 
+fn default_wal_max_inflight_flushes() -> usize {
+    1
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -1134,6 +1148,7 @@ impl Default for Settings {
             max_wal_flushes_before_l0_flush: 4096,
             wal_buffer_bytes: None,
             wal_group_commit: false,
+            wal_max_inflight_flushes: 1,
             l0_max_ssts: 8,
             l0_max_ssts_per_key: 8,
             l0_flush_parallelism: 4,
