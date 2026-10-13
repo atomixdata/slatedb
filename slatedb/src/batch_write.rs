@@ -458,7 +458,13 @@ impl DbInner {
         let memtable = guard.memtable();
         self.status_manager.add_memtable_segments(&touched_segments);
         memtable.record_touched_segments(touched_segments.clone());
-        entries.into_iter().for_each(|entry| memtable.put(entry));
+        entries.into_iter().for_each(|entry| {
+            if self.settings.memtable_prune_overwrites {
+                memtable.put_and_prune_overwritten(entry);
+            } else {
+                memtable.put(entry);
+            }
+        });
         memtable.table().durable_watcher()
     }
 
@@ -970,6 +976,45 @@ mod tests {
         ] {
             assert_eq!(db.get(k).await.unwrap().unwrap().as_ref(), v);
         }
+        db.close().await.unwrap();
+    }
+
+    fn prune_settings() -> crate::config::Settings {
+        crate::config::Settings {
+            memtable_prune_overwrites: true,
+            ..Default::default()
+        }
+    }
+
+    fn active_memtable_entry_num(db: &Db) -> usize {
+        db.inner
+            .state
+            .read()
+            .memtable()
+            .table()
+            .metadata()
+            .entry_num
+    }
+
+    #[tokio::test]
+    async fn test_memtable_prune_overwrites_keeps_one_row_per_key() {
+        let db = Db::builder(
+            "/tmp/test_memtable_prune_overwrites_keeps_one_row_per_key",
+            Arc::new(InMemory::new()),
+        )
+        .with_settings(prune_settings())
+        .build()
+        .await
+        .unwrap();
+
+        db.put(b"key", b"v1").await.unwrap();
+        db.put(b"key", b"v2").await.unwrap();
+        db.put(b"key", b"v3").await.unwrap();
+        db.put(b"other", b"x").await.unwrap();
+
+        assert_eq!(active_memtable_entry_num(&db), 2);
+        assert_eq!(db.get(b"key").await.unwrap().unwrap().as_ref(), b"v3");
+        assert_eq!(db.get(b"other").await.unwrap().unwrap().as_ref(), b"x");
         db.close().await.unwrap();
     }
 }
