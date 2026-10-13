@@ -1,26 +1,26 @@
 //! A cache of open files and a helper for positional reads.
 
-use lru::LruCache;
-use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 /// A cache of open file descriptors, keyed by filesystem path.
 ///
-/// Uses a `Mutex` protecting an `LruCache` for O(1) lookup, promotion, and
-/// eviction. Each read specifies its own offset, so threads can share a
-/// handle without a lock for each file. On Unix, these reads do not move
-/// the file cursor.
+/// Uses a sharded concurrent cache for O(1) lookup and eviction. A single
+/// mutex over an LRU list cannot carry this path: every lookup mutates the
+/// recency list, so readers serialize even on hits, and at tens of thousands
+/// of reads per second the handoff cost dominates the read itself.
+///
+/// Each read specifies its own offset, so threads can share a handle without
+/// a lock for each file. On Unix, these reads do not move the file cursor.
 #[derive(Clone)]
 pub struct FileHandleCache {
-    inner: Arc<std::sync::Mutex<LruCache<std::path::PathBuf, Arc<std::fs::File>>>>,
+    inner: Arc<quick_cache::sync::Cache<std::path::PathBuf, Arc<std::fs::File>>>,
 }
 
 impl std::fmt::Debug for FileHandleCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let inner = self.inner.lock().expect("lock should not be poisoned");
         f.debug_struct("FileHandleCache")
-            .field("len", &inner.len())
-            .field("cap", &inner.cap())
+            .field("len", &self.inner.len())
+            .field("cap", &self.inner.capacity())
             .finish()
     }
 }
@@ -32,19 +32,15 @@ impl FileHandleCache {
     ///
     /// Panics if `max_handles` is zero.
     pub fn new(max_handles: usize) -> Self {
+        assert!(max_handles > 0, "max_handles must be > 0");
         Self {
-            inner: Arc::new(std::sync::Mutex::new(LruCache::new(
-                NonZeroUsize::new(max_handles).expect("max_handles must be > 0"),
-            ))),
+            inner: Arc::new(quick_cache::sync::Cache::new(max_handles)),
         }
     }
 
     /// Returns the number of handles retained by the cache.
     pub fn len(&self) -> usize {
-        self.inner
-            .lock()
-            .expect("lock should not be poisoned")
-            .len()
+        self.inner.len()
     }
 
     /// Returns whether the cache retains no handles.
@@ -70,50 +66,51 @@ impl FileHandleCache {
     /// Unlike [`Self::get_or_open`], returns the error from opening the file
     /// as-is, including `NotFound`.
     /// The returned `Arc` keeps the file open after its cache entry is evicted.
+    ///
+    /// A hit runs no syscall. The cache does not check that a cached handle
+    /// still points to the file at `path`. Code that deletes or replaces a
+    /// cached file must call [`Self::invalidate`] after it.
+    ///
+    /// The `open` on a miss runs after the shard lock is released. If it ran
+    /// with the lock held, every reader of that shard would wait for it.
     pub fn try_get_or_open(
         &self,
         path: &std::path::Path,
     ) -> Result<Arc<std::fs::File>, std::io::Error> {
-        let mut cache = self.inner.lock().expect("lock should not be poisoned");
-        if let Some(handle) = cache.get(path) {
-            if Self::is_valid(handle, path) {
-                return Ok(handle.clone());
-            }
-            // Stale entry — remove it so we reopen below.
-            cache.pop(path);
+        if let Some(handle) = self.inner.get(path) {
+            return Ok(handle);
         }
 
         let handle = Arc::new(std::fs::File::open(path)?);
 
-        cache.push(path.to_path_buf(), handle.clone());
+        // Two threads missing on the same path both open it and both insert;
+        // one entry wins and the other's descriptor closes when its last
+        // reference drops. Both callers hold a valid handle either way, so
+        // the race costs a redundant open rather than correctness.
+        self.inner.insert(path.to_path_buf(), handle.clone());
+
+        // A delete or a replace can run between the `open` and the `insert`.
+        // Its `invalidate` then runs before the `insert`, so the cache keeps a
+        // handle to an unlinked file.
+        // The fstat below runs after the `insert`. If the file is unlinked,
+        // remove the entry. If a later unlink runs, its `invalidate` runs after
+        // the `insert` and removes the entry.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let unlinked = handle.metadata().map_or(true, |m| m.nlink() == 0);
+            if unlinked {
+                self.invalidate(path);
+            }
+        }
+
         Ok(handle)
-    }
-
-    /// Check whether a cached file descriptor still refers to a live file.
-    ///
-    /// On Unix an unlinked file keeps its data accessible through open fds,
-    /// but `fstat` will report `nlink == 0`. This single in-kernel syscall is
-    /// much cheaper than a full `open` and lets us detect deleted or replaced
-    /// files without a TOCTOU-prone path `stat`.
-    ///
-    /// On non-Unix platforms (e.g. Windows), we fall back to checking whether
-    /// the path still exists on disk.
-    #[cfg(unix)]
-    fn is_valid(handle: &std::fs::File, _path: &std::path::Path) -> bool {
-        use std::os::unix::fs::MetadataExt;
-        handle.metadata().is_ok_and(|m| m.nlink() > 0)
-    }
-
-    #[cfg(not(unix))]
-    fn is_valid(_handle: &std::fs::File, path: &std::path::Path) -> bool {
-        path.exists()
     }
 
     /// Remove a cached handle, e.g. after eviction or after a write replaces
     /// the file (since the cached fd would still reference the old inode).
     pub fn invalidate(&self, path: &std::path::Path) {
-        let mut cache = self.inner.lock().expect("lock should not be poisoned");
-        cache.pop(path);
+        self.inner.remove(path);
     }
 }
 
@@ -181,7 +178,7 @@ mod tests {
     }
 
     #[test]
-    fn should_evict_least_recently_used_handle_and_keep_active_readers() {
+    fn should_bound_handles_and_keep_active_readers() {
         let dir = tempfile::tempdir().unwrap();
         let cache = FileHandleCache::new(2);
         let paths = ["a", "b", "c"].map(|name| {
@@ -189,22 +186,18 @@ mod tests {
             std::fs::write(&path, name).unwrap();
             path
         });
-        let a = cache.get_or_open(&paths[0]).unwrap().unwrap();
-        let b = cache.get_or_open(&paths[1]).unwrap().unwrap();
-        assert!(Arc::ptr_eq(
-            &a,
-            &cache.get_or_open(&paths[0]).unwrap().unwrap()
-        ));
-        cache.get_or_open(&paths[2]).unwrap().unwrap();
-        assert_eq!(cache.len(), 2);
-        assert!(!Arc::ptr_eq(
-            &b,
-            &cache.get_or_open(&paths[1]).unwrap().unwrap()
-        ));
+        let handles = paths
+            .iter()
+            .map(|path| cache.get_or_open(path).unwrap().unwrap())
+            .collect::<Vec<_>>();
+        assert!(cache.len() <= 2);
 
-        let mut buf = [0];
-        read_exact_at_offset(&b, &mut buf, 0).unwrap();
-        assert_eq!(&buf, b"b");
+        // A handle that the cache evicted still reads its file.
+        for (handle, name) in handles.iter().zip(["a", "b", "c"]) {
+            let mut buf = [0];
+            read_exact_at_offset(handle, &mut buf, 0).unwrap();
+            assert_eq!(&buf, name.as_bytes());
+        }
     }
 
     #[test]
@@ -253,9 +246,8 @@ mod tests {
         assert_eq!(&buf, b"new");
     }
 
-    #[cfg(unix)]
     #[test]
-    fn should_reopen_unlinked_files() {
+    fn should_open_a_replaced_or_removed_file_after_invalidation() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("file");
         let replacement = dir.path().join("replacement");
@@ -263,8 +255,11 @@ mod tests {
         let cache = FileHandleCache::new(1);
         let old = cache.get_or_open(&path).unwrap().unwrap();
 
+        // Code that replaces a cached file invalidates it, as the mirror VFS
+        // does after a rename.
         std::fs::write(&replacement, b"new").unwrap();
         std::fs::rename(&replacement, &path).unwrap();
+        cache.invalidate(&path);
         let new = cache.get_or_open(&path).unwrap().unwrap();
         assert!(!Arc::ptr_eq(&old, &new));
         let mut buf = [0; 3];
@@ -272,6 +267,7 @@ mod tests {
         assert_eq!(&buf, b"new");
 
         std::fs::remove_file(&path).unwrap();
+        cache.invalidate(&path);
         assert!(cache.get_or_open(&path).unwrap().is_none());
         assert!(cache.is_empty());
     }
