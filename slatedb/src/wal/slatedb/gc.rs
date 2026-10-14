@@ -59,6 +59,38 @@ const WAL_ID_DELETE_SPREAD: Duration = Duration::from_secs(40);
 /// A collection by ID with fewer deletes than this does not spread them.
 const WAL_ID_SPREAD_MIN_DELETES: usize = 1_000;
 
+/// Env var that caps WAL deletes by ID per second. Unset or 0 means no cap.
+///
+/// The replay boundary moves only when a memtable flushes, so one collection
+/// can hold two flushes' worth of WALs, and spreading that over
+/// [`WAL_ID_DELETE_SPREAD`] deletes at twice the WAL creation rate. With a cap
+/// above the creation rate, a large collection takes longer instead.
+const WAL_ID_DELETE_MAX_RATE_ENV: &str = "SLATEDB_WAL_DELETE_MAX_RATE";
+
+/// Reads [`WAL_ID_DELETE_MAX_RATE_ENV`] as the minimum time between the
+/// starts of two deletes.
+fn min_delete_step_from_env() -> Duration {
+    match std::env::var(WAL_ID_DELETE_MAX_RATE_ENV)
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+    {
+        Some(rate) if rate > 0.0 => Duration::from_secs_f64(1.0 / rate),
+        _ => Duration::ZERO,
+    }
+}
+
+/// The time between the starts of consecutive deletes in a collection by ID
+/// of `count` WALs: spread over [`WAL_ID_DELETE_SPREAD`], but never shorter
+/// than `min_step`.
+fn delete_step(count: usize, min_step: Duration) -> Duration {
+    let spread = if count < WAL_ID_SPREAD_MIN_DELETES {
+        Duration::ZERO
+    } else {
+        WAL_ID_DELETE_SPREAD / u32::try_from(count).unwrap_or(u32::MAX)
+    };
+    spread.max(min_step)
+}
+
 /// The state that lets regular WAL GC collect by ID instead of listing.
 ///
 /// WAL IDs are sequential, and the latest manifest references every WAL from
@@ -97,6 +129,9 @@ pub(crate) struct SlateDbWalGc {
     /// Whether regular WAL GC collects by ID after its first listing.
     collect_by_id: bool,
     id_progress: Arc<Mutex<IdProgress>>,
+    /// The minimum time between the starts of two deletes by ID. See
+    /// [`WAL_ID_DELETE_MAX_RATE_ENV`].
+    min_delete_step: Duration,
 }
 
 impl std::fmt::Debug for SlateDbWalGc {
@@ -123,6 +158,7 @@ impl SlateDbWalGc {
             system_clock,
             collect_by_id: false,
             id_progress: Arc::new(Mutex::new(IdProgress::default())),
+            min_delete_step: min_delete_step_from_env(),
         }
     }
 
@@ -365,11 +401,7 @@ impl SlateDbWalGc {
                 );
             }
         } else {
-            let step = if delete.len() < WAL_ID_SPREAD_MIN_DELETES {
-                Duration::ZERO
-            } else {
-                WAL_ID_DELETE_SPREAD / u32::try_from(delete.len()).unwrap_or(u32::MAX)
-            };
+            let step = delete_step(delete.len(), self.min_delete_step);
             let failed = self
                 .delete_wal_ssts(delete, WAL_ID_DELETE_CONCURRENCY, step)
                 .await;
@@ -809,5 +841,24 @@ mod tests {
         let progress = collector.id_progress.lock();
         assert_eq!(progress.next_id, Some(6));
         assert!(progress.retry.is_empty());
+    }
+
+    #[test]
+    fn delete_step_caps_rate() {
+        // Small collections are not spread, unless a cap applies.
+        assert_eq!(delete_step(500, Duration::ZERO), Duration::ZERO);
+        assert_eq!(
+            delete_step(500, Duration::from_millis(3)),
+            Duration::from_millis(3)
+        );
+        // Large collections spread over WAL_ID_DELETE_SPREAD.
+        assert_eq!(
+            delete_step(10_000, Duration::ZERO),
+            Duration::from_millis(4)
+        );
+        // A cap slower than the spread wins: 28k deletes at 350/s take 80 s, not 40 s.
+        let capped = delete_step(28_000, Duration::from_secs_f64(1.0 / 350.0));
+        assert_eq!(capped, Duration::from_secs_f64(1.0 / 350.0));
+        assert!(capped * 28_000 > Duration::from_secs(79));
     }
 }
