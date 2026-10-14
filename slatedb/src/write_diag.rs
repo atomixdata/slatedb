@@ -20,6 +20,7 @@ pub(crate) const WRITE_DIAG_SERVICE: &str = write_diag_name!("service_seconds");
 pub(crate) const WRITE_DIAG_TOTAL: &str = write_diag_name!("total_seconds");
 pub(crate) const WRITE_DIAG_STEP_US: &str = write_diag_name!("step_us");
 pub(crate) const WRITE_DIAG_BUSY_US: &str = write_diag_name!("busy_us");
+pub(crate) const WRITE_DIAG_GROUPS: &str = write_diag_name!("groups");
 
 /// Reads the monotonic clock for the diagnostic timers. They never decide
 /// what is written, so they bypass the `SystemClock` that DST controls.
@@ -62,6 +63,8 @@ pub(crate) struct WriteDiagStats {
     steps: Vec<Arc<dyn CounterFn>>,
     busy_write_us: Arc<dyn CounterFn>,
     busy_flush_us: Arc<dyn CounterFn>,
+    /// Groups of writes inserted into the memtable together.
+    pub(crate) groups: Arc<dyn CounterFn>,
 }
 
 impl WriteDiagStats {
@@ -89,6 +92,7 @@ impl WriteDiagStats {
                 .collect(),
             busy_write_us: busy("write"),
             busy_flush_us: busy("flush"),
+            groups: recorder.counter(WRITE_DIAG_GROUPS).register(),
         }
     }
 
