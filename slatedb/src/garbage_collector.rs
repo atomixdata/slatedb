@@ -250,13 +250,16 @@ impl GarbageCollector {
         ));
         let wal_gc_task = options.wal_options.map(|wal_options| {
             let wal_gc = wal_gc.unwrap_or_else(|| {
-                Arc::new(SlateDbWalGc::new(
-                    wal_store.clone(),
-                    stats.clone(),
-                    WalGcMode::Regular,
-                    gc_filter.clone(),
-                    system_clock.clone(),
-                ))
+                Arc::new(
+                    SlateDbWalGc::new(
+                        wal_store.clone(),
+                        stats.clone(),
+                        WalGcMode::Regular,
+                        gc_filter.clone(),
+                        system_clock.clone(),
+                    )
+                    .with_collect_by_id(options.wal_collect_by_id),
+                )
             });
             WalGcTask::new(
                 manifest_store.clone(),
@@ -1193,6 +1196,7 @@ mod tests {
         .unwrap();
 
         let gc_opts = GarbageCollectorOptions {
+            wal_collect_by_id: false,
             manifest_options: None,
             wal_options: Some(GarbageCollectorDirectoryOptions {
                 min_age: Duration::from_secs(3600),
@@ -1264,6 +1268,7 @@ mod tests {
         .unwrap();
 
         let gc_opts = GarbageCollectorOptions {
+            wal_collect_by_id: false,
             manifest_options: None,
             wal_options: None,
             wal_fence_options: Some(GarbageCollectorDirectoryOptions {
@@ -1334,6 +1339,7 @@ mod tests {
         .unwrap();
 
         let gc_opts = GarbageCollectorOptions {
+            wal_collect_by_id: false,
             manifest_options: None,
             wal_options: None,
             wal_fence_options: Some(GarbageCollectorDirectoryOptions {
@@ -1413,6 +1419,7 @@ mod tests {
         .unwrap();
 
         let gc_opts = GarbageCollectorOptions {
+            wal_collect_by_id: false,
             manifest_options: None,
             wal_options: Some(GarbageCollectorDirectoryOptions {
                 min_age: Duration::from_secs(3600),
@@ -1891,6 +1898,7 @@ mod tests {
         }
 
         let gc_opts = GarbageCollectorOptions {
+            wal_collect_by_id: false,
             manifest_options: Some(GarbageCollectorDirectoryOptions {
                 min_age: Duration::from_secs(3600),
                 interval: None,
@@ -1971,6 +1979,7 @@ mod tests {
         // Build a GC with standard options (1h min_age)
         let recorder = MetricsRecorderHelper::noop();
         let gc_opts = GarbageCollectorOptions {
+            wal_collect_by_id: false,
             manifest_options: Some(GarbageCollectorDirectoryOptions {
                 min_age: Duration::from_secs(3600),
                 interval: None,
@@ -2050,6 +2059,7 @@ mod tests {
 
         let recorder = MetricsRecorderHelper::noop();
         let gc_opts = GarbageCollectorOptions {
+            wal_collect_by_id: false,
             manifest_options: None,
             wal_options: Some(GarbageCollectorDirectoryOptions {
                 min_age: Duration::from_secs(3600),
@@ -2103,6 +2113,7 @@ mod tests {
         let recorder = MetricsRecorderHelper::noop();
 
         let gc_opts = GarbageCollectorOptions {
+            wal_collect_by_id: false,
             manifest_options: None,
             wal_options: Some(GarbageCollectorDirectoryOptions {
                 min_age: Duration::from_secs(3600),
@@ -2156,6 +2167,7 @@ mod tests {
         let recorder = MetricsRecorderHelper::noop();
 
         let gc_opts = GarbageCollectorOptions {
+            wal_collect_by_id: false,
             manifest_options: Some(GarbageCollectorDirectoryOptions {
                 min_age: Duration::from_secs(3600),
                 interval: Some(Duration::from_secs(1)),
@@ -2505,6 +2517,7 @@ mod tests {
             dry_run: false,
         };
         let gc_opts = GarbageCollectorOptions {
+            wal_collect_by_id: false,
             manifest_options: Some(options),
             wal_options: Some(options),
             wal_fence_options: Some(options),
@@ -2604,6 +2617,7 @@ mod tests {
         .unwrap();
 
         let gc_opts = GarbageCollectorOptions {
+            wal_collect_by_id: false,
             manifest_options: None,
             wal_options: Some(GarbageCollectorDirectoryOptions {
                 min_age: Duration::from_secs(3600),
@@ -2742,6 +2756,7 @@ mod tests {
             dry_run: true,
         };
         let gc_opts = GarbageCollectorOptions {
+            wal_collect_by_id: false,
             manifest_options: Some(dry_run_options),
             wal_options: Some(dry_run_options),
             wal_fence_options: Some(dry_run_options),

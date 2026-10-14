@@ -280,6 +280,7 @@ mod tests {
                 self.object_store.clone(),
             ));
             let gc_opts = GarbageCollectorOptions {
+                wal_collect_by_id: false,
                 manifest_options: None,
                 wal_options: Some(GarbageCollectorDirectoryOptions {
                     min_age: Duration::ZERO,

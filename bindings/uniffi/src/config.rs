@@ -552,6 +552,7 @@ impl From<slatedb::config::GarbageCollectorScheduleOptions> for GarbageCollector
 impl From<GarbageCollectorOptions> for slatedb::config::GarbageCollectorOptions {
     fn from(value: GarbageCollectorOptions) -> Self {
         Self {
+            wal_collect_by_id: false,
             manifest_options: value.manifest_options.map(Into::into),
             wal_options: value.wal_options.map(Into::into),
             wal_fence_options: value.wal_fence_options.map(Into::into),

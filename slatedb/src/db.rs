@@ -8663,6 +8663,7 @@ mod tests {
         // Run a manual GC with aggressive settings to delete the L0 SST while
         // the manifest is still not updated.
         let gc_options = GarbageCollectorOptions {
+            wal_collect_by_id: false,
             wal_options: Some(GarbageCollectorDirectoryOptions {
                 interval: None,
                 min_age: Duration::from_millis(0),

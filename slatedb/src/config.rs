@@ -1698,6 +1698,24 @@ pub struct GarbageCollectorOptions {
     /// operations. Defaults to unbounded retries.
     #[serde(default)]
     pub object_store_max_retries: Option<u32>,
+
+    /// Whether regular WAL GC collects by ID instead of listing the WAL
+    /// directory on every run.
+    ///
+    /// WAL IDs are sequential, and the latest manifest references every WAL
+    /// from its replay boundary on. With this option, the first run lists the
+    /// directory once. Later runs delete each ID from where the previous run
+    /// stopped up to the replay boundary that GC saw `min_age` earlier. Use it
+    /// when listing is slow and the WAL directory holds many files, for example
+    /// with a remote WAL on an object store that lists about one file per
+    /// millisecond.
+    ///
+    /// GC by ID cannot see object sizes, so it also deletes zero-byte WAL fence
+    /// objects that a later writer wrote below the replay boundary. It keeps
+    /// the fences that its first listing found. Enable it only when one writer
+    /// at a time uses the database. See `wal_fence_options` for the risk.
+    #[serde(default)]
+    pub wal_collect_by_id: bool,
 }
 
 impl GarbageCollectorOptions {
@@ -1800,6 +1818,7 @@ impl Default for GarbageCollectorOptions {
             metric_level: None,
             boundary_files_enabled: true,
             object_store_max_retries: None,
+            wal_collect_by_id: false,
         }
     }
 }

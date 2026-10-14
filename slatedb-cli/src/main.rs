@@ -320,6 +320,7 @@ async fn exec_gc_once(
     }
     let gc_opts = match resource {
         GcResource::Manifest => GarbageCollectorOptions {
+            wal_collect_by_id: false,
             manifest_options: create_gc_dir_opts(min_age),
             wal_options: None,
             wal_fence_options: None,
@@ -331,6 +332,7 @@ async fn exec_gc_once(
             object_store_max_retries: None,
         },
         GcResource::Wal => GarbageCollectorOptions {
+            wal_collect_by_id: false,
             manifest_options: None,
             wal_options: create_gc_dir_opts(min_age),
             wal_fence_options: None,
@@ -342,6 +344,7 @@ async fn exec_gc_once(
             object_store_max_retries: None,
         },
         GcResource::WalFence => GarbageCollectorOptions {
+            wal_collect_by_id: false,
             manifest_options: None,
             wal_options: None,
             wal_fence_options: create_gc_dir_opts(min_age),
@@ -353,6 +356,7 @@ async fn exec_gc_once(
             object_store_max_retries: None,
         },
         GcResource::Compacted => GarbageCollectorOptions {
+            wal_collect_by_id: false,
             manifest_options: None,
             wal_options: None,
             wal_fence_options: None,
@@ -364,6 +368,7 @@ async fn exec_gc_once(
             object_store_max_retries: None,
         },
         GcResource::Compactions => GarbageCollectorOptions {
+            wal_collect_by_id: false,
             manifest_options: None,
             wal_options: None,
             wal_fence_options: None,
@@ -398,6 +403,7 @@ async fn schedule_gc(
         })
     }
     let gc_opts = GarbageCollectorOptions {
+        wal_collect_by_id: false,
         manifest_options: manifest_schedule.and_then(create_gc_dir_opts),
         wal_options: wal_schedule.and_then(create_gc_dir_opts),
         wal_fence_options: wal_fence_schedule.and_then(create_gc_dir_opts),
