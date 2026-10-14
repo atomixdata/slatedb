@@ -2,9 +2,10 @@ use std::collections::VecDeque;
 use std::fmt::{Debug, Formatter};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::time::Instant;
 
-use self::stats::WalBufferStats;
+use self::stats::{WalBufferStats, WalStage};
 use crate::dispatcher::{MessageHandler, MessageHandlerExecutor, MessageTickerDef};
 use crate::error::SlateDBError;
 use crate::types::RowEntry;
@@ -24,6 +25,14 @@ use tracing::instrument;
 use super::store::WalTableStore;
 
 pub(crate) const WAL_BUFFER_TASK_NAME: &str = "wal_writer";
+
+/// Reads the monotonic clock for the pipeline batch wait and the diagnostic
+/// stage timers. Neither decides which data is durable, so they do not go
+/// through the `SystemClock` that deterministic simulation tests control.
+#[allow(clippy::disallowed_methods)]
+fn monotonic_now() -> Instant {
+    Instant::now()
+}
 
 /// [`SlateDbWalWriter`] buffers write operations in memory before flushing them to persistent storage.
 /// The flush operation only targets Remote storage right now, later we can add an option to flush to local
@@ -101,6 +110,14 @@ struct WalBuffer {
     last_seq: u64,
     /// size of the entries that has been added to the WAL buffer in bytes
     entries_size: usize,
+    /// When the buffer was created. The diagnostic timers measure from here.
+    created: Instant,
+    /// The number of appends to this buffer.
+    appends: u64,
+    /// The sum of the append times, measured from `created`.
+    append_offsets: Duration,
+    /// When the writer froze this buffer for upload.
+    frozen_at: Option<Instant>,
 }
 
 /// An iterator over entries in a WalBuffer.
@@ -148,7 +165,7 @@ impl SlateDbWalWriter {
             inflight: VecDeque::new(),
             waiters: Vec::new(),
             deferred_flush: false,
-            current_wal_since: Instant::now(),
+            current_wal_since: monotonic_now(),
             batch_tick_scheduled: false,
         };
         task_executor.add_handler(
@@ -290,6 +307,7 @@ impl SlateDbWalWriterInner {
         for entry in entries {
             self.current_wal.append(entry.clone());
         }
+        self.current_wal.note_append();
         Ok(())
     }
 
@@ -378,7 +396,8 @@ impl SlateDbWalWriterInner {
         }
         let next_wal_id = self.next_wal_id;
         self.next_wal_id += 1;
-        let current_wal = std::mem::replace(&mut self.current_wal, WalBuffer::new());
+        let mut current_wal = std::mem::replace(&mut self.current_wal, WalBuffer::new());
+        current_wal.frozen_at = Some(monotonic_now());
         self.flush_epoch += 1;
         self.immutable_wals
             .push_back((next_wal_id, Arc::new(current_wal)));
@@ -415,7 +434,24 @@ impl WalBuffer {
             entries: VecDeque::new(),
             last_seq: 0,
             entries_size: 0,
+            created: monotonic_now(),
+            appends: 0,
+            append_offsets: Duration::ZERO,
+            frozen_at: None,
         }
+    }
+
+    /// Records the time of an append for the diagnostic timers.
+    fn note_append(&mut self) {
+        self.appends += 1;
+        self.append_offsets += self.created.elapsed();
+    }
+
+    /// The average time from an append to the freeze of this buffer.
+    fn freeze_wait(&self) -> Option<Duration> {
+        let frozen_at = self.frozen_at?;
+        let appends = u32::try_from(self.appends).ok().filter(|n| *n > 0)?;
+        Some(frozen_at.saturating_duration_since(self.created + self.append_offsets / appends))
     }
 
     fn append(&mut self, entry: RowEntry) {
@@ -477,6 +513,8 @@ enum WalFlushWork {
     Flushed {
         wal_id: u64,
         result: Result<(), SlateDBError>,
+        /// When the upload finished.
+        finished: Instant,
     },
     /// The flush timer fired, or a deferred `flush()` request's batch wait
     /// ended: freeze the current WAL if a slot is free.
@@ -509,6 +547,8 @@ struct InflightFlush {
     wal: Arc<WalBuffer>,
     task: JoinHandle<Result<(), SlateDBError>>,
     done: bool,
+    /// When the upload finished.
+    finished: Option<Instant>,
 }
 
 struct WalFlushHandler {
@@ -561,7 +601,7 @@ impl WalFlushHandler {
                         return;
                     }
                     inner.freeze_current_wal();
-                    self.current_wal_since = Instant::now();
+                    self.current_wal_since = monotonic_now();
                 }
                 inner.immutable_wal(in_flight)
             };
@@ -582,6 +622,8 @@ impl WalFlushHandler {
         PIPELINE_BATCH_WAIT.saturating_sub(self.current_wal_since.elapsed())
     }
 
+    // The batch wait is a short monotonic timer, like `monotonic_now`.
+    #[allow(clippy::disallowed_methods)]
     fn schedule_batch_tick(&mut self, wait: Duration) {
         if self.batch_tick_scheduled {
             return;
@@ -600,9 +642,25 @@ impl WalFlushHandler {
         let inner = self.inner.clone();
         let upload = wal.clone();
         let task = tokio::spawn(async move {
-            let upload = AssertUnwindSafe(flush_one_wal(&table_store, &stats, wal_id, &upload))
-                .catch_unwind()
-                .await;
+            let started = monotonic_now();
+            let upload_result =
+                AssertUnwindSafe(flush_one_wal(&table_store, &stats, wal_id, &upload))
+                    .catch_unwind()
+                    .await;
+            let finished = monotonic_now();
+            let appends = upload.appends;
+            if let Some(freeze_wait) = upload.freeze_wait() {
+                stats.record_stage(WalStage::Freeze, freeze_wait, appends);
+            }
+            if let Some(frozen_at) = upload.frozen_at {
+                stats.record_stage(
+                    WalStage::Slot,
+                    started.saturating_duration_since(frozen_at),
+                    appends,
+                );
+            }
+            stats.record_stage(WalStage::Upload, finished - started, appends);
+            let upload = upload_result;
             let result = match upload {
                 Ok(result) => result,
                 Err(payload) => {
@@ -623,6 +681,7 @@ impl WalFlushHandler {
             let _ = inner.read().send_flush_msg(WalFlushWork::Flushed {
                 wal_id,
                 result: result.clone(),
+                finished,
             });
             result
         });
@@ -631,6 +690,7 @@ impl WalFlushHandler {
             wal,
             task,
             done: false,
+            finished: None,
         });
     }
 
@@ -638,6 +698,10 @@ impl WalFlushHandler {
     fn record_flushed(&mut self) {
         while self.inflight.front().is_some_and(|flush| flush.done) {
             let flushed = self.inflight.pop_front().expect("checked above");
+            if let Some(finished) = flushed.finished {
+                self.stats
+                    .record_stage(WalStage::Order, finished.elapsed(), flushed.wal.appends);
+            }
             let status = {
                 let mut inner = self.inner.write();
                 inner.record_flushed_wal(flushed.wal_id, &flushed.wal);
@@ -746,7 +810,11 @@ impl MessageHandler<WalFlushWork> for WalFlushHandler {
                 self.start_flushes(true);
                 Ok(())
             }
-            WalFlushWork::Flushed { wal_id, result } => {
+            WalFlushWork::Flushed {
+                wal_id,
+                result,
+                finished,
+            } => {
                 trace!(
                     "upload finished [wal_id={}, ok={}, inflight={:?}]",
                     wal_id,
@@ -763,6 +831,7 @@ impl MessageHandler<WalFlushWork> for WalFlushHandler {
                     .find(|flush| flush.wal_id == wal_id)
                     .expect("completion for a WAL that is not in flight");
                 flush.done = true;
+                flush.finished = Some(finished);
                 self.record_flushed();
                 self.resolve_waiters();
                 // With group commit, keep flushing while writes are buffered
@@ -867,8 +936,9 @@ impl wal::WalObserver for SlateDbWalObserver {
 }
 
 pub mod stats {
-    use slatedb_common::metrics::{CounterFn, GaugeFn, MetricsRecorderHelper};
+    use slatedb_common::metrics::{CounterFn, GaugeFn, HistogramFn, MetricsRecorderHelper};
     use std::sync::Arc;
+    use std::time::Duration;
 
     macro_rules! wal_stat_name {
         ($suffix:expr) => {
@@ -880,12 +950,61 @@ pub mod stats {
     pub const WAL_BUFFER_FLUSH_REQUESTS: &str = wal_stat_name!("wal_buffer_flush_requests");
     pub const WAL_BUFFER_ESTIMATED_BYTES: &str = wal_stat_name!("wal_buffer_estimated_bytes");
     pub const WAL_FLUSH_BYTES: &str = wal_stat_name!("wal_flush_bytes");
+    pub const WAL_DIAG_FREEZE_WAIT: &str = wal_stat_name!("wal_diag_freeze_wait_seconds");
+    pub const WAL_DIAG_SLOT_WAIT: &str = wal_stat_name!("wal_diag_slot_wait_seconds");
+    pub const WAL_DIAG_UPLOAD: &str = wal_stat_name!("wal_diag_upload_seconds");
+    pub const WAL_DIAG_ORDER_WAIT: &str = wal_stat_name!("wal_diag_order_wait_seconds");
+    pub const WAL_DIAG_FREEZE_WAIT_US: &str = wal_stat_name!("wal_diag_freeze_wait_us");
+    pub const WAL_DIAG_SLOT_WAIT_US: &str = wal_stat_name!("wal_diag_slot_wait_us");
+    pub const WAL_DIAG_UPLOAD_US: &str = wal_stat_name!("wal_diag_upload_us");
+    pub const WAL_DIAG_ORDER_WAIT_US: &str = wal_stat_name!("wal_diag_order_wait_us");
+    pub const WAL_DIAG_APPENDS: &str = wal_stat_name!("wal_diag_appends");
+
+    /// Bucket bounds in seconds for the diagnostic WAL stage timers.
+    const DIAG_BOUNDARIES: &[f64] = &[
+        0.0005, 0.001, 0.002, 0.003, 0.005, 0.0075, 0.01, 0.0125, 0.015, 0.0175, 0.02, 0.025, 0.03,
+        0.035, 0.04, 0.05, 0.06, 0.08, 0.1, 0.15, 0.2, 0.3, 0.5, 1.0,
+    ];
+
+    /// A stage that a write goes through between its append and its durability.
+    #[derive(Clone, Copy)]
+    pub(super) enum WalStage {
+        /// From the append to the freeze of its WAL.
+        Freeze,
+        /// From the freeze to the start of the upload.
+        Slot,
+        /// The upload.
+        Upload,
+        /// From the end of the upload to the record of durability in WAL order.
+        Order,
+    }
+
+    /// A diagnostic timer: one histogram observation per WAL, and a counter of
+    /// microseconds weighted by the appends in the WAL.
+    pub(super) struct StageTimer {
+        per_wal: Arc<dyn HistogramFn>,
+        weighted_us: Arc<dyn CounterFn>,
+    }
+
+    impl StageTimer {
+        fn new(recorder: &MetricsRecorderHelper, histogram: &str, counter: &str) -> Self {
+            Self {
+                per_wal: recorder.histogram(histogram, DIAG_BOUNDARIES).register(),
+                weighted_us: recorder.counter(counter).register(),
+            }
+        }
+    }
 
     pub(super) struct WalBufferStats {
         pub(super) estimated_bytes: Arc<dyn GaugeFn>,
         pub(super) flushes: Arc<dyn CounterFn>,
         pub(super) flush_requests: Arc<dyn CounterFn>,
         pub(super) flush_bytes: Arc<dyn CounterFn>,
+        freeze: StageTimer,
+        slot: StageTimer,
+        upload: StageTimer,
+        order: StageTimer,
+        appends: Arc<dyn CounterFn>,
     }
 
     impl WalBufferStats {
@@ -895,6 +1014,27 @@ pub mod stats {
                 flushes: recorder.counter(WAL_BUFFER_FLUSHES).register(),
                 flush_requests: recorder.counter(WAL_BUFFER_FLUSH_REQUESTS).register(),
                 flush_bytes: recorder.counter(WAL_FLUSH_BYTES).register(),
+                freeze: StageTimer::new(recorder, WAL_DIAG_FREEZE_WAIT, WAL_DIAG_FREEZE_WAIT_US),
+                slot: StageTimer::new(recorder, WAL_DIAG_SLOT_WAIT, WAL_DIAG_SLOT_WAIT_US),
+                upload: StageTimer::new(recorder, WAL_DIAG_UPLOAD, WAL_DIAG_UPLOAD_US),
+                order: StageTimer::new(recorder, WAL_DIAG_ORDER_WAIT, WAL_DIAG_ORDER_WAIT_US),
+                appends: recorder.counter(WAL_DIAG_APPENDS).register(),
+            }
+        }
+
+        /// Records how long the appends of one WAL spent in `stage`.
+        pub(super) fn record_stage(&self, stage: WalStage, duration: Duration, appends: u64) {
+            let timer = match stage {
+                WalStage::Freeze => &self.freeze,
+                WalStage::Slot => &self.slot,
+                WalStage::Upload => &self.upload,
+                WalStage::Order => &self.order,
+            };
+            timer.per_wal.record(duration.as_secs_f64());
+            let micros = u64::try_from(duration.as_micros()).unwrap_or(u64::MAX);
+            timer.weighted_us.increment(micros.saturating_mul(appends));
+            if matches!(stage, WalStage::Upload) {
+                self.appends.increment(appends);
             }
         }
     }
