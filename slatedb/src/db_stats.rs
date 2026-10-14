@@ -78,6 +78,7 @@ pub(crate) struct DbStatsInner {
     pub(crate) merge_operator_read_operands: Arc<dyn CounterFn>,
     pub(crate) merge_operator_flush_operands: Arc<dyn CounterFn>,
     pub(crate) memtable_write_bytes: Arc<dyn CounterFn>,
+    pub(crate) write_diag: crate::write_diag::WriteDiagStats,
 }
 
 #[derive(Clone)]
@@ -176,6 +177,7 @@ impl DbStats {
                 .description(MERGE_OPERATOR_OPERANDS_DESCRIPTION)
                 .register(),
             memtable_write_bytes: recorder.counter(MEMTABLE_WRITE_BYTES).register(),
+            write_diag: crate::write_diag::WriteDiagStats::new(recorder),
         };
         DbStats {
             inner: Arc::new(inner),

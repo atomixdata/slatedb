@@ -40,6 +40,7 @@ use crate::mem_table::KVTable;
 use crate::types::RowEntry;
 use crate::utils::WatchableOnceCellReader;
 use crate::wal::{FlushResultFuture, WalWriter};
+use crate::write_diag::{monotonic_now, WriteStep};
 use crate::{batch::WriteBatch, db::DbInner, db::WriteHandle, error::SlateDBError};
 use bytes::Bytes;
 use parking_lot::RwLockWriteGuard;
@@ -76,6 +77,8 @@ pub(crate) struct WriteBatchRequest {
     /// transfers from the caller to the writer. `None` for
     /// non-transactional writes. Fix for #1732.
     pub(crate) txn: Option<DbTransaction>,
+    /// When the caller sent the request, for the diagnostic queue wait.
+    pub(crate) enqueued: tokio::time::Instant,
 }
 
 impl std::fmt::Debug for BatchWriterMessage {
@@ -119,12 +122,19 @@ impl MessageHandler<BatchWriterMessage> for WriteBatchEventHandler {
                 options,
                 done,
                 txn,
+                enqueued,
             }) => {
+                let diag = &self.db_inner.db_stats.write_diag;
+                let started = monotonic_now();
+                diag.queue_wait.record((started - enqueued).as_secs_f64());
                 let wal_writer = self.wal_writer.as_deref_mut();
                 let result = self
                     .db_inner
                     .write_batch(batch, &options, txn.as_ref(), wal_writer)
                     .await;
+                let service = started.elapsed();
+                diag.service.record(service.as_secs_f64());
+                diag.busy(true, service);
                 match result {
                     Ok(write_result) => {
                         let _ = done.send(write_result);
@@ -141,10 +151,15 @@ impl MessageHandler<BatchWriterMessage> for WriteBatchEventHandler {
                     freeze_memtable,
                     done,
                 } = flush_msg;
+                let started = monotonic_now();
                 let result = self
                     .db_inner
                     .flush_batch_writer(freeze_memtable, self.wal_writer.as_mut())
                     .await;
+                self.db_inner
+                    .db_stats
+                    .write_diag
+                    .busy(false, started.elapsed());
                 match result {
                     Ok(flush_result) => {
                         let _ = done.send(Ok(flush_result));
@@ -197,6 +212,8 @@ impl DbInner {
         mut wal_writer: Option<&mut (dyn WalWriter + 'static)>,
     ) -> Result<WriteBatchResult, SlateDBError> {
         let _options = options;
+        let diag = &self.db_stats.write_diag;
+        let mut step_start = monotonic_now();
         #[cfg(not(dst))]
         let now = self.mono_clock.now().await?;
         #[cfg(dst)]
@@ -227,6 +244,8 @@ impl DbInner {
             }
         }
 
+        step_start = diag.step(WriteStep::Seq, step_start);
+
         // Count batch-local merge folding on the flush path so DB-side merge
         // resolution uses one metric for both write batches and memtable flushes.
         let (entries, touched_segments, entries_size) = match batch
@@ -251,6 +270,7 @@ impl DbInner {
         if let Err(error) = self.validate_segment_antichain(&touched_segments) {
             return Ok(Err(error));
         }
+        step_start = diag.step(WriteStep::Extract, step_start);
 
         if let Some(wal_writer) = wal_writer.as_mut() {
             assert!(self.wal_enabled);
@@ -260,6 +280,7 @@ impl DbInner {
             // this by appending the entire entry batch in a single call to the WAL buffer,
             // which holds a write lock during the append.
             wal_writer.append(&entries).await?;
+            step_start = diag.step(WriteStep::WalAppend, step_start);
             // TODO: handle sync here, if sync is enabled, we can call `flush` here. let's put this
             // in another Pull Request.
             self.write_entries_to_memtable(entries, touched_segments);
@@ -270,6 +291,7 @@ impl DbInner {
         // increment memtable_write_bytes by the size of the keys and values inserted into the memtable
         // after merge operators and overwrites are collapsed
         self.db_stats.memtable_write_bytes.increment(entries_size);
+        step_start = diag.step(WriteStep::Memtable, step_start);
 
         // insert a fail point to make it easier to test the case where the last_committed_seq is not updated.
         // this is useful for testing the case where the reader is not able to see the writes.
@@ -290,6 +312,8 @@ impl DbInner {
                 .track_recent_committed_write_batch(&write_keys, commit_seq);
         }
 
+        step_start = diag.step(WriteStep::TxnTrack, step_start);
+
         // insert a fail point to make it easier to test the case where the transaction is committed but
         // but remaining work hasn't been done. this is useful for testing that transaction commits and
         // commited seqnums get updated in lock-step. See #1301 for details.
@@ -304,6 +328,7 @@ impl DbInner {
 
         // maybe freeze the memtable.
         self.maybe_freeze_current_memtable(wal_writer.as_deref())?;
+        diag.step(WriteStep::Freeze, step_start);
 
         let write_handle =
             WriteHandle::new_with_waiter(commit_seq, now, self.status_manager.durability_waiter());
@@ -576,6 +601,7 @@ mod tests {
                 options,
                 done,
                 txn: None,
+                enqueued: monotonic_now(),
             }),
             rx,
         )

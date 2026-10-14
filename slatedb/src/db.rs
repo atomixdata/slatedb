@@ -289,17 +289,23 @@ impl DbInner {
         }
 
         let (tx, rx) = tokio::sync::oneshot::channel();
+        let started = crate::write_diag::monotonic_now();
+        self.maybe_apply_backpressure().await?;
+        let enqueued = crate::write_diag::monotonic_now();
+        let diag = &self.db_stats.write_diag;
+        diag.backpressure.record((enqueued - started).as_secs_f64());
         let batch_msg = BatchWriterMessage::WriteBatch(WriteBatchRequest {
             batch,
             options: options.clone(),
             done: tx,
             txn,
+            enqueued,
         });
-
-        self.maybe_apply_backpressure().await?;
         self.write_notifier.send(batch_msg)?;
 
-        rx.await?
+        let result = rx.await?;
+        diag.total.record(started.elapsed().as_secs_f64());
+        result
     }
 
     #[inline]

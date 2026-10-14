@@ -177,6 +177,7 @@ mod utils;
 mod fence;
 mod wal_reader;
 mod wal_replay;
+mod write_diag;
 
 // Initialize test infrastructure (deadlock detector, tracing) for all tests.
 // This ctor runs at crate load time, ensuring these are set up even for tests
