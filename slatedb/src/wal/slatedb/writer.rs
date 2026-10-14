@@ -960,11 +960,7 @@ pub mod stats {
     pub const WAL_DIAG_ORDER_WAIT_US: &str = wal_stat_name!("wal_diag_order_wait_us");
     pub const WAL_DIAG_APPENDS: &str = wal_stat_name!("wal_diag_appends");
 
-    /// Bucket bounds in seconds for the diagnostic WAL stage timers.
-    const DIAG_BOUNDARIES: &[f64] = &[
-        0.0005, 0.001, 0.002, 0.003, 0.005, 0.0075, 0.01, 0.0125, 0.015, 0.0175, 0.02, 0.025, 0.03,
-        0.035, 0.04, 0.05, 0.06, 0.08, 0.1, 0.15, 0.2, 0.3, 0.5, 1.0,
-    ];
+    use slatedb_common::metrics::FINE_LATENCY_BOUNDARIES as DIAG_BOUNDARIES;
 
     /// A stage that a write goes through between its append and its durability.
     #[derive(Clone, Copy)]

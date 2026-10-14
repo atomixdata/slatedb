@@ -29,6 +29,16 @@ pub const LATENCY_BOUNDARIES: &[f64] = &[
     0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
 ];
 
+/// Latency boundaries in seconds with 1 ms steps from 1 ms to 40 ms, for
+/// object store requests whose latency matters at millisecond precision.
+pub const FINE_LATENCY_BOUNDARIES: &[f64] = &[
+    0.0001, 0.00025, 0.0005, 0.001, 0.002, 0.003, 0.004, 0.005, 0.006, 0.007, 0.008, 0.009, 0.010,
+    0.011, 0.012, 0.013, 0.014, 0.015, 0.016, 0.017, 0.018, 0.019, 0.020, 0.021, 0.022, 0.023,
+    0.024, 0.025, 0.026, 0.027, 0.028, 0.029, 0.030, 0.031, 0.032, 0.033, 0.034, 0.035, 0.036,
+    0.037, 0.038, 0.039, 0.040, 0.045, 0.05, 0.055, 0.06, 0.07, 0.08, 0.09, 0.1, 0.125, 0.15, 0.2,
+    0.25, 0.3, 0.4, 0.5, 0.75, 1.0, 2.0, 5.0, 10.0,
+];
+
 /// Standard histogram boundaries for size metrics (in bytes).
 /// Powers of two from 128B to 4MB, tailored for storage engine I/O sizes.
 pub const SIZE_BOUNDARIES: &[f64] = &[

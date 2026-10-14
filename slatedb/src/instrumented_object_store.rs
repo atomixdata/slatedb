@@ -279,7 +279,7 @@ pub mod stats {
     use std::time::Duration;
 
     use slatedb_common::metrics::{
-        CounterFn, HistogramFn, MetricsRecorderHelper, LATENCY_BOUNDARIES,
+        CounterFn, HistogramFn, MetricsRecorderHelper, FINE_LATENCY_BOUNDARIES,
     };
 
     use crate::instrumented_object_store::ObjectStoreComponent;
@@ -436,7 +436,7 @@ pub mod stats {
                     .labels(&labels)
                     .register(),
                 duration_seconds: recorder
-                    .histogram(REQUEST_DURATION_SECONDS, LATENCY_BOUNDARIES)
+                    .histogram(REQUEST_DURATION_SECONDS, FINE_LATENCY_BOUNDARIES)
                     .description("Object store API request latency in seconds")
                     .labels(&labels)
                     .register(),
