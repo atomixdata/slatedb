@@ -49,6 +49,16 @@ const WAL_ID_DELETE_CONCURRENCY: usize = 32;
 /// remaining IDs wait for the next collection.
 const WAL_ID_MAX_PER_COLLECTION: u64 = 200_000;
 
+/// The time over which one collection by ID spreads its deletes.
+///
+/// A burst of deletes raised the latency of WAL uploads on RustFS. GC waits
+/// for a collection to finish before it starts the next one, so a WAL GC
+/// interval shorter than this time only delays the next collection.
+const WAL_ID_DELETE_SPREAD: Duration = Duration::from_secs(40);
+
+/// A collection by ID with fewer deletes than this does not spread them.
+const WAL_ID_SPREAD_MIN_DELETES: usize = 1_000;
+
 /// The state that lets regular WAL GC collect by ID instead of listing.
 ///
 /// WAL IDs are sequential, and the latest manifest references every WAL from
@@ -201,14 +211,36 @@ impl SlateDbWalGc {
             return sst_ids;
         }
 
-        self.delete_wal_ssts(sst_ids, GC_DELETE_CONCURRENCY).await
+        self.delete_wal_ssts(sst_ids, GC_DELETE_CONCURRENCY, Duration::ZERO)
+            .await
     }
 
     /// Deletes WAL SSTs with at most `concurrency` deletes in flight. Returns
     /// the IDs that GC could not delete. A missing object counts as deleted.
-    async fn delete_wal_ssts(&self, sst_ids: Vec<WalFileId>, concurrency: usize) -> Vec<WalFileId> {
-        futures::stream::iter(sst_ids)
-            .map(|id| async move { (id, self.wal_store.delete_sst(id).await) })
+    ///
+    /// If `step` is not zero, the delete at position `i` starts no earlier
+    /// than `i * step` after the first one.
+    async fn delete_wal_ssts(
+        &self,
+        sst_ids: Vec<WalFileId>,
+        concurrency: usize,
+        step: Duration,
+    ) -> Vec<WalFileId> {
+        let start = self.system_clock.now();
+        futures::stream::iter(sst_ids.into_iter().enumerate())
+            .map(|(position, id)| async move {
+                if !step.is_zero() {
+                    let offset = step * u32::try_from(position).unwrap_or(u32::MAX);
+                    let due = start + chrono::Duration::from_std(offset).expect("invalid duration");
+                    let wait = (due - self.system_clock.now())
+                        .to_std()
+                        .unwrap_or(Duration::ZERO);
+                    if !wait.is_zero() {
+                        self.system_clock.sleep(wait).await;
+                    }
+                }
+                (id, self.wal_store.delete_sst(id).await)
+            })
             .buffer_unordered(concurrency)
             .filter_map(|(id, result)| async move {
                 match result {
@@ -333,8 +365,13 @@ impl SlateDbWalGc {
                 );
             }
         } else {
+            let step = if delete.len() < WAL_ID_SPREAD_MIN_DELETES {
+                Duration::ZERO
+            } else {
+                WAL_ID_DELETE_SPREAD / u32::try_from(delete.len()).unwrap_or(u32::MAX)
+            };
             let failed = self
-                .delete_wal_ssts(delete, WAL_ID_DELETE_CONCURRENCY)
+                .delete_wal_ssts(delete, WAL_ID_DELETE_CONCURRENCY, step)
                 .await;
             keep.extend(failed.into_iter().map(|id| id.value()));
         }
