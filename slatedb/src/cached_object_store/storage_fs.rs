@@ -2,7 +2,6 @@ use crate::cached_object_store::stats::CachedObjectStoreStats;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use log::{debug, error, warn};
-use lru::LruCache;
 use object_store::path::Path;
 use object_store::{Attributes, ObjectMeta};
 use rand::{distr::Alphanumeric, Rng};
@@ -11,7 +10,6 @@ use slatedb_common::DbRand;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
 use std::io::Write;
-use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -37,22 +35,24 @@ impl CachedFileHandle {
 
 /// A cache of open file descriptors, keyed by filesystem path.
 ///
-/// Uses a `Mutex` protecting an `LruCache` for O(1) lookup, promotion, and
-/// eviction. Individual file reads use positional I/O (`pread` /
-/// `read_exact_at`) which does not touch the file cursor, so multiple threads
-/// can read from the same `Arc<CachedFileHandle>` concurrently without any
-/// per-file locking.
+/// Uses a sharded concurrent cache for O(1) lookup and eviction. A single
+/// mutex over an `LruCache` cannot carry this path: every lookup mutates the
+/// recency list, so readers serialize even on hits, and at tens of thousands
+/// of reads per second the handoff cost dominates the read itself.
+///
+/// Individual file reads use positional I/O (`pread` / `read_exact_at`) which
+/// does not touch the file cursor, so multiple threads can read from the same
+/// `Arc<CachedFileHandle>` concurrently without any per-file locking.
 #[derive(Clone)]
 pub(crate) struct FileHandleCache {
-    inner: Arc<std::sync::Mutex<LruCache<std::path::PathBuf, Arc<CachedFileHandle>>>>,
+    inner: Arc<quick_cache::sync::Cache<std::path::PathBuf, Arc<CachedFileHandle>>>,
 }
 
 impl std::fmt::Debug for FileHandleCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let inner = self.inner.lock().expect("lock should not be poisoned");
         f.debug_struct("FileHandleCache")
-            .field("len", &inner.len())
-            .field("cap", &inner.cap())
+            .field("len", &self.inner.len())
+            .field("cap", &self.inner.capacity())
             .finish()
     }
 }
@@ -60,25 +60,25 @@ impl std::fmt::Debug for FileHandleCache {
 impl FileHandleCache {
     fn new(max_handles: usize) -> Self {
         Self {
-            inner: Arc::new(std::sync::Mutex::new(LruCache::new(
-                NonZeroUsize::new(max_handles).expect("max_handles must be > 0"),
-            ))),
+            inner: Arc::new(quick_cache::sync::Cache::new(max_handles)),
         }
     }
 
     /// Look up a cached file handle, or open the file and cache it.
     /// Returns `Ok(None)` if the file does not exist on disk.
+    ///
+    /// A hit runs no syscall. The cache does not check that a cached handle
+    /// still points to the file at `path`. Code that deletes or replaces a
+    /// cache file must call [`Self::invalidate`] after it.
+    ///
+    /// The `open` on a miss runs after the shard lock is released. If it ran
+    /// with the lock held, every reader of that shard would wait for it.
     fn get_or_open(
         &self,
         path: &std::path::Path,
     ) -> Result<Option<Arc<CachedFileHandle>>, std::io::Error> {
-        let mut cache = self.inner.lock().expect("lock should not be poisoned");
-        if let Some(handle) = cache.get(path) {
-            if Self::is_valid(handle, path) {
-                return Ok(Some(handle.clone()));
-            }
-            // Stale entry — remove it so we reopen below.
-            cache.pop(path);
+        if let Some(handle) = self.inner.get(path) {
+            return Ok(Some(handle));
         }
 
         let file = match std::fs::File::open(path) {
@@ -89,35 +89,34 @@ impl FileHandleCache {
 
         let handle = Arc::new(CachedFileHandle { file });
 
-        cache.push(path.to_path_buf(), handle.clone());
+        // Two threads missing on the same path both open it and both insert;
+        // one entry wins and the other's descriptor closes when its last
+        // reference drops. Both callers hold a valid handle either way, so
+        // the race costs a redundant open rather than correctness.
+        self.inner.insert(path.to_path_buf(), handle.clone());
+
+        // A delete or a replace can run between the `open` and the `insert`.
+        // Its `invalidate` then runs before the `insert`, so the cache keeps a
+        // handle to an unlinked file.
+        // The fstat below runs after the `insert`. If the file is unlinked,
+        // remove the entry. If a later unlink runs, its `invalidate` runs after
+        // the `insert` and removes the entry.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let unlinked = handle.file.metadata().map_or(true, |m| m.nlink() == 0);
+            if unlinked {
+                self.invalidate(path);
+            }
+        }
+
         Ok(Some(handle))
-    }
-
-    /// Check whether a cached file descriptor still refers to a live file.
-    ///
-    /// On Unix an unlinked file keeps its data accessible through open fds,
-    /// but `fstat` will report `nlink == 0`. This single in-kernel syscall is
-    /// much cheaper than a full `open` and lets us detect deleted or replaced
-    /// files without a TOCTOU-prone path `stat`.
-    ///
-    /// On non-Unix platforms (e.g. Windows), we fall back to checking whether
-    /// the path still exists on disk.
-    #[cfg(unix)]
-    fn is_valid(handle: &CachedFileHandle, _path: &std::path::Path) -> bool {
-        use std::os::unix::fs::MetadataExt;
-        handle.file().metadata().is_ok_and(|m| m.nlink() > 0)
-    }
-
-    #[cfg(not(unix))]
-    fn is_valid(_handle: &CachedFileHandle, path: &std::path::Path) -> bool {
-        path.exists()
     }
 
     /// Remove a cached handle, e.g. after eviction or after a write replaces
     /// the file (since the cached fd would still reference the old inode).
     fn invalidate(&self, path: &std::path::Path) {
-        let mut cache = self.inner.lock().expect("lock should not be poisoned");
-        cache.pop(path);
+        self.inner.remove(path);
     }
 }
 
@@ -188,7 +187,14 @@ impl FsCacheStorage {
 
     #[cfg(test)]
     pub(crate) fn file_handle_cache_population(&self) -> usize {
-        self.file_handle_cache.inner.lock().unwrap().len()
+        self.file_handle_cache.inner.len()
+    }
+
+    /// Deletes a cache file and removes its cached handle, as the evictor does.
+    #[cfg(test)]
+    pub(crate) fn remove_cache_file(&self, path: &std::path::Path) {
+        std::fs::remove_file(path).unwrap();
+        self.file_handle_cache.invalidate(path);
     }
 }
 
@@ -509,6 +515,42 @@ impl LocalCacheEntry for FsCacheEntry {
         } else {
             Ok(None)
         }
+    }
+
+    async fn warm(&self) -> object_store::Result<Option<(ObjectMeta, Attributes)>> {
+        // Reading the head opens and caches the head file handle and returns
+        // the metadata we need. A `None` means the entry is not on disk.
+        let Some((meta, attributes)) = self.read_head().await? else {
+            return Ok(None);
+        };
+
+        // Open (and cache) a handle for each part file. Parts are numbered
+        // 0..ceil(size / part_size); a preloaded object is fetched whole, so all
+        // parts exist. Any part that is missing (partial cache) is skipped.
+        let num_parts = (meta.size as usize).div_ceil(self.part_size);
+        if num_parts > 0 {
+            let root_folder = self.root_folder.clone();
+            let location = self.location.clone();
+            let part_size = self.part_size;
+            let file_handle_cache = self.file_handle_cache.clone();
+            #[allow(clippy::disallowed_methods)]
+            tokio::task::spawn_blocking(move || {
+                for part_number in 0..num_parts {
+                    let part_path = Self::make_part_path(
+                        root_folder.clone(),
+                        &location,
+                        part_number,
+                        part_size,
+                    );
+                    // Best-effort: ignore missing parts and open errors.
+                    let _ = file_handle_cache.get_or_open(&part_path);
+                }
+            })
+            .await
+            .map_err(wrap_io_err)?;
+        }
+
+        Ok(Some((meta, attributes)))
     }
 
     async fn delete(&self) {

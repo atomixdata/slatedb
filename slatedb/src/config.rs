@@ -390,8 +390,12 @@ pub struct ScanOptions {
     /// Optional context forwarded to custom filter policies; ignored by
     /// built-in filters. See [`FilterContext`].
     ///
-    /// Consulted by `scan_prefix`, and by `scan` only when a registered
-    /// policy reports [`crate::filter_policy::FilterPolicy::supports_range_queries`].
+    /// Consulted by `scan` only when a registered policy reports
+    /// [`crate::filter_policy::FilterPolicy::supports_range_queries`], and by
+    /// `scan_prefix` only when a registered policy reports
+    /// [`crate::filter_policy::FilterPolicy::supports_prefix_queries`] or,
+    /// failing that, `supports_range_queries`, in which case the prefix's key
+    /// range is what the filters are asked about.
     pub filter_context: Option<FilterContext>,
     /// Optional caller-provided tracing settings.
     pub tracing_options: Option<TracingOptions>,
@@ -850,6 +854,20 @@ pub struct Settings {
     #[serde(default)]
     pub object_store_max_retries: Option<u32>,
 
+    /// Removes the previous version of a key from the active memtable when a
+    /// new write overwrites it. A key that is rewritten many times before a
+    /// flush then costs one row of memory instead of one row per write.
+    ///
+    /// The pruning does not protect readers. A snapshot, a transaction, a get
+    /// or scan in flight, or a read with [`DurabilityLevel::Remote`] whose
+    /// sequence bound is below the new row can no longer find the pruned
+    /// version and reads an older source instead. Turn this on only when the
+    /// application keeps such reads away from the keys that it rewrites.
+    ///
+    /// Default: false
+    #[serde(default)]
+    pub memtable_prune_overwrites: bool,
+
     /// The block format for SST files. This is only available in tests
     /// to verify backward compatibility between V1 and V2 formats.
     #[cfg(test)]
@@ -888,7 +906,8 @@ impl std::fmt::Debug for Settings {
             )
             .field("garbage_collector_options", &self.garbage_collector_options)
             .field("metric_level", &self.metric_level)
-            .field("default_ttl_millis", &self.default_ttl_millis);
+            .field("default_ttl_millis", &self.default_ttl_millis)
+            .field("memtable_prune_overwrites", &self.memtable_prune_overwrites);
         data.finish()
     }
 }
@@ -1120,6 +1139,7 @@ impl Default for Settings {
             metric_level: MetricLevel::default(),
             default_ttl_millis: None,
             object_store_max_retries: None,
+            memtable_prune_overwrites: false,
             #[cfg(test)]
             block_format: None,
         }
@@ -1471,6 +1491,27 @@ pub struct SizeTieredCompactionSchedulerOptions {
     /// be included in a given compaction. A sorted run S will be added to a compaction C if S's
     /// size is less than this value times the min size of the runs currently included in C.
     pub include_size_threshold: f32,
+
+    /// The projected sorted-run count above which fallback consolidation starts for each tree.
+    /// Zero disables the trigger. This value does not impose a hard limit.
+    /// The scheduler rejects one with a warning and disables the fallback.
+    /// Enabled values must be at least two.
+    ///
+    /// The projected count includes active compactions and newly selected work.
+    /// The fallback limits its sources to reach this count without going below it.
+    /// Normal size-based scheduling can reduce the count further.
+    ///
+    /// A threshold of two can cause frequent fallback merges as new runs arrive.
+    /// Repeatedly merging new data with a growing run increases storage reads and writes
+    /// and consumes compaction capacity. Other low thresholds can have the same cost.
+    ///
+    /// When normal scheduling finds no work, the fallback ignores `min_compaction_sources`
+    /// and `include_size_threshold`. It requires at least two sources and respects
+    /// `max_compaction_sources`, source conflicts, and existing limits on compaction work.
+    ///
+    /// The fallback tries consecutive groups from newest to oldest. It stops each group
+    /// at `max_compaction_sources` and keeps the newest eligible sources in that group.
+    pub sorted_run_consolidation_threshold: usize,
 }
 
 impl Default for SizeTieredCompactionSchedulerOptions {
@@ -1479,6 +1520,7 @@ impl Default for SizeTieredCompactionSchedulerOptions {
             min_compaction_sources: 4,
             max_compaction_sources: 8,
             include_size_threshold: 4.0,
+            sorted_run_consolidation_threshold: 0,
         }
     }
 }
@@ -1515,6 +1557,15 @@ impl From<&HashMap<String, String>> for SizeTieredCompactionSchedulerOptions {
                         );
                     }
                 },
+                "sorted_run_consolidation_threshold" => match value.parse::<usize>() {
+                    Ok(parsed) => options.sorted_run_consolidation_threshold = parsed,
+                    Err(err) => {
+                        warn!(
+                            "invalid scheduler option value for sorted_run_consolidation_threshold: '{}': {}",
+                            value, err
+                        );
+                    }
+                },
                 _ => {
                     warn!("unknown scheduler option '{}'; ignoring", key);
                 }
@@ -1545,6 +1596,10 @@ impl From<SizeTieredCompactionSchedulerOptions> for HashMap<String, String> {
         map.insert(
             "include_size_threshold".to_string(),
             options.include_size_threshold.to_string(),
+        );
+        map.insert(
+            "sorted_run_consolidation_threshold".to_string(),
+            options.sorted_run_consolidation_threshold.to_string(),
         );
         map
     }
@@ -1611,6 +1666,9 @@ pub struct GarbageCollectorOptions {
     /// Whether manifest and compactions boundary files are advanced before deletion.
     ///
     /// Disable this only for object stores that do not support conditional overwrites (`If-Match`).
+    /// For these stores, including `LocalFileSystem`, set this to `false`.
+    /// If a boundary update returns `NotImplemented`, GC logs a warning and skips deletion
+    /// for that resource.
     /// Without boundary advancement, a SlateDB client or compactor can begin updating a manifest or
     /// compactions file, stop making progress (for example, because its process or host is
     /// suspended), then resume after the garbage collector's `min_age`. It can then recreate a
@@ -2123,6 +2181,7 @@ object_store_cache_options:
             min_compaction_sources: 3,
             max_compaction_sources: 9,
             include_size_threshold: 7.0,
+            sorted_run_consolidation_threshold: 5,
         };
 
         let map: HashMap<String, String> = options.into();
@@ -2131,6 +2190,7 @@ object_store_cache_options:
         assert_eq!(roundtripped.min_compaction_sources, 3);
         assert_eq!(roundtripped.max_compaction_sources, 9);
         assert_eq!(roundtripped.include_size_threshold, 7.0);
+        assert_eq!(roundtripped.sorted_run_consolidation_threshold, 5);
     }
 
     #[test]

@@ -21,6 +21,7 @@ use crate::bytes_range::BytesRange;
 use crate::db_state::{SortedRun, SsTableHandle, SsTableView};
 use crate::error::SlateDBError;
 use crate::flatbuffer_types::SsTableIndexOwned;
+use crate::read_trace::ReadTrace;
 use crate::tablestore::TableStore;
 
 /// The worker's progress through one planned key range.
@@ -175,13 +176,7 @@ pub(crate) async fn plan_subcompaction_ranges(
             let segment = segment.clone();
             async move {
                 let index = table_store
-                    .read_index(
-                        &view.sst,
-                        true,
-                        Some(segment),
-                        &crate::reader::ReadTrace::new(None),
-                        None,
-                    )
+                    .read_index(&view.sst, true, Some(segment), &ReadTrace::none(), None)
                     .await?;
                 // `filter_offset` marks the end of the data-block region: the
                 // filter, index, and stats blocks all follow it, and when the
@@ -375,6 +370,7 @@ mod tests {
                     &BlockMetaArgs {
                         offset: *offset,
                         first_key: Some(first_key),
+                        encoded_len: 0,
                     },
                 )
             })

@@ -33,6 +33,7 @@ use bytes::Bytes;
 use futures::stream::BoxStream;
 use futures::StreamExt;
 use parking_lot::RwLockWriteGuard;
+use slatedb_common::clock::SystemClock;
 use slatedb_txn_obj::DirtyObject;
 use std::cmp;
 use std::collections::{BTreeMap, HashSet};
@@ -96,6 +97,11 @@ impl std::fmt::Debug for ManifestWriterCommand {
 
 pub(super) const MANIFEST_WRITER_TASK_NAME: &str = "l0_manifest_writer";
 
+/// First delay between manifest polls while the flush tracker is stalled on L0.
+const MIN_L0_STALL_POLL_BACKOFF: Duration = Duration::from_millis(50);
+/// Longest delay between manifest polls while the flush tracker is stalled on L0.
+const MAX_L0_STALL_POLL_BACKOFF: Duration = Duration::from_secs(1);
+
 /// Ordered L0 retirement and manifest update subsystem.
 pub(crate) struct ManifestWriter {
     commands_tx: SafeSender<ManifestWriterCommand>,
@@ -111,10 +117,17 @@ impl ManifestWriter {
         executor: &crate::dispatcher::MessageHandlerExecutor,
         tokio_handle: &Handle,
         tracker_tx: SafeSender<TrackerMessage>,
+        l0_stall_rx: watch::Receiver<u64>,
     ) -> Result<Self, SlateDBError> {
         let (commands_tx, commands_rx) =
             SafeSender::unbounded_channel(closed_result.result_reader());
-        let handler = ManifestWriterHandler::new(db, manifest, manifest_poll_interval, tracker_tx);
+        let handler = ManifestWriterHandler::new(
+            db,
+            manifest,
+            manifest_poll_interval,
+            tracker_tx,
+            l0_stall_rx,
+        );
         executor.add_handler(
             MANIFEST_WRITER_TASK_NAME.to_string(),
             Box::new(handler),
@@ -211,6 +224,9 @@ struct ManifestWriterHandler {
     /// Watches the database status so the manifest write can wait for
     /// WAL durability without blocking uploads.
     db_status_rx: watch::Receiver<crate::db_status::DbStatus>,
+    /// Watches the flush tracker's L0 stall state so the manifest is polled
+    /// while a writer is stalled. See [`L0StallPollNotifier`].
+    l0_stall_rx: watch::Receiver<u64>,
     pending_flushes: Vec<PendingFlush>,
     pending_checkpoints: Vec<PendingCheckpoint>,
     pending_manifest_refreshes: Vec<oneshot::Sender<Result<(), SlateDBError>>>,
@@ -226,9 +242,16 @@ impl MessageHandler<ManifestWriterCommand> for ManifestWriterHandler {
     }
 
     fn notifiers(&mut self) -> Vec<Box<dyn crate::dispatcher::Notifier<ManifestWriterCommand>>> {
-        vec![Box::new(DurableSeqNotifier {
-            rx: self.db_status_rx.clone(),
-        })]
+        vec![
+            Box::new(DurableSeqNotifier {
+                rx: self.db_status_rx.clone(),
+            }),
+            Box::new(L0StallPollNotifier::new(
+                self.l0_stall_rx.clone(),
+                Arc::clone(&self.db.system_clock),
+                self.manifest_poll_interval,
+            )),
+        ]
     }
 
     async fn handle(&mut self, command: ManifestWriterCommand) -> Result<(), SlateDBError> {
@@ -288,6 +311,7 @@ impl ManifestWriterHandler {
         manifest: FenceableManifest,
         manifest_poll_interval: Duration,
         tracker_tx: SafeSender<TrackerMessage>,
+        l0_stall_rx: watch::Receiver<u64>,
     ) -> Self {
         let durable_seq = db.oracle.last_remote_persisted_seq();
         let db_status_rx = db.status_manager.subscribe();
@@ -300,6 +324,7 @@ impl ManifestWriterHandler {
             ready: BTreeMap::new(),
             durable_seq,
             db_status_rx,
+            l0_stall_rx,
             pending_checkpoints: Vec::new(),
             pending_manifest_refreshes: Vec::new(),
         }
@@ -479,13 +504,6 @@ impl ManifestWriterHandler {
     }
 
     fn apply_uploaded_state(&self, staged_batch: &[UploadedMemtable]) -> Result<(), SlateDBError> {
-        let min_active_snapshot_seq = [
-            self.db.snapshot_manager.min_active_seq(),
-            self.db.txn_manager.min_active_seq(),
-        ]
-        .into_iter()
-        .flatten()
-        .min();
         let segmented = self.db.segment_extractor.is_some();
         let mut guard = self.db.state.write();
         let manifest = guard.modify(|modifier| {
@@ -539,7 +557,6 @@ impl ManifestWriterHandler {
                 // can do that. So assert `>` rather than `>=`.
                 assert!(uploaded.last_seq > core.last_l0_seq);
                 core.last_l0_seq = uploaded.last_seq;
-                core.recent_snapshot_min_seq = min_active_snapshot_seq.unwrap_or(uploaded.last_seq);
                 core.sequence_tracker.extend_from(uploaded_tracker);
             }
             Ok(modifier.state.manifest.clone())
@@ -591,7 +608,7 @@ impl ManifestWriterHandler {
         &mut self,
         checkpoint_options: &[&CheckpointOptions],
     ) -> Result<Vec<CheckpointCreateResult>, SlateDBError> {
-        let mut dirty = self.clone_local_manifest_for_write();
+        let mut dirty = self.prepare_local_manifest_for_write();
         let mut checkpoint_results = Vec::new();
         for options in checkpoint_options {
             let id = self.db.rand.rng().gen_uuid();
@@ -616,18 +633,35 @@ impl ManifestWriterHandler {
     }
 
     async fn write_current_manifest(&mut self) -> Result<(), SlateDBError> {
-        let dirty = self.clone_local_manifest_for_write();
+        let dirty = self.prepare_local_manifest_for_write();
         self.manifest.update(dirty.clone()).await?;
         self.db.status_manager.report_manifest(dirty.into());
         Ok(())
     }
 
-    fn clone_local_manifest_for_write(&self) -> DirtyObject<Manifest> {
-        let dirty = {
-            let rguard_state = self.db.state.read();
-            rguard_state.state().manifest.clone()
-        };
-        dirty
+    fn prepare_local_manifest_for_write(&self) -> DirtyObject<Manifest> {
+        let min_active_snapshot_seq = [
+            self.db.snapshot_manager.min_active_seq(),
+            self.db.txn_manager.min_active_seq(),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
+        // A closed WAL still reports the last durable file for the final manifest write.
+        let wal_status = self
+            .db
+            .wal_observer
+            .status()
+            .unwrap_or_else(|status| status);
+        let mut guard = self.db.state.write();
+        guard.set_next_wal_id(wal_status.last_flushed_wal_id + 1);
+        let manifest = guard.modify(|modifier| {
+            let core = &mut modifier.state.manifest.value.core;
+            core.recent_snapshot_min_seq = min_active_snapshot_seq.unwrap_or(core.last_l0_seq);
+            modifier.state.manifest.clone()
+        });
+        self.report_to_status_manager(&guard, manifest.clone().into());
+        manifest
     }
 
     async fn load_manifest(&mut self) -> Result<(), SlateDBError> {
@@ -885,9 +919,80 @@ impl crate::dispatcher::Notifier<ManifestWriterCommand> for DurableSeqNotifier {
     }
 }
 
+/// Polls the manifest while the flush tracker is stalled on L0, so a slot
+/// freed by compaction is seen before the next `manifest_poll_interval` tick.
+///
+/// `rx` carries 0 while dispatch is not stalled and an id that is distinct
+/// for every stall otherwise. A new id polls at once and restarts the
+/// backoff; while the same id persists, each poll waits twice as long as
+/// the one before, up to `max_backoff`. Nothing runs while `rx` is 0.
+struct L0StallPollNotifier {
+    rx: watch::Receiver<u64>,
+    clock: Arc<dyn SystemClock>,
+    max_backoff: Duration,
+    /// The stall being polled and the delay before its next poll.
+    /// `None` while not stalled.
+    stall: Option<(u64, Duration)>,
+}
+
+impl L0StallPollNotifier {
+    fn new(
+        rx: watch::Receiver<u64>,
+        clock: Arc<dyn SystemClock>,
+        manifest_poll_interval: Duration,
+    ) -> Self {
+        Self {
+            rx,
+            clock,
+            max_backoff: MAX_L0_STALL_POLL_BACKOFF.min(manifest_poll_interval),
+            stall: None,
+        }
+    }
+}
+
+#[async_trait]
+impl crate::dispatcher::Notifier<ManifestWriterCommand> for L0StallPollNotifier {
+    async fn notify(&mut self) -> ManifestWriterCommand {
+        loop {
+            let stall_id = *self.rx.borrow_and_update();
+            if stall_id == 0 {
+                self.stall = None;
+                // As in DurableSeqNotifier, Err means the sender is gone and
+                // the database is closing.
+                if self.rx.changed().await.is_err() {
+                    std::future::pending::<()>().await;
+                }
+                continue;
+            }
+            let delay = match self.stall {
+                Some((id, delay)) if id == stall_id => delay,
+                _ => {
+                    let first = MIN_L0_STALL_POLL_BACKOFF.min(self.max_backoff);
+                    self.stall = Some((stall_id, first));
+                    return ManifestWriterCommand::PollManifest { done: None };
+                }
+            };
+            tokio::select! {
+                _ = self.clock.sleep(delay) => {
+                    self.stall = Some((stall_id, (delay * 2).min(self.max_backoff)));
+                    return ManifestWriterCommand::PollManifest { done: None };
+                }
+                changed = self.rx.changed() => {
+                    if changed.is_err() {
+                        std::future::pending::<()>().await;
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ManifestWriter, ManifestWriterCommand, ManifestWriterHandler, TrackerMessage};
+    use super::{
+        L0StallPollNotifier, ManifestWriter, ManifestWriterCommand, ManifestWriterHandler,
+        TrackerMessage,
+    };
     use crate::block_cache_policy::BlockCachePolicy;
     use crate::config::{CheckpointOptions, Settings};
     use crate::db::DbInner;
@@ -896,28 +1001,29 @@ mod tests {
     use crate::flush::SegmentedSstHandle;
     use crate::format::sst::SsTableFormat;
     use crate::manifest::store::{FenceableManifest, ManifestStore, StoredManifest};
-    use crate::manifest::ManifestCore;
+    use crate::manifest::{ManifestCore, VersionedManifest};
     use crate::memtable_flusher::uploader::UploadedMemtable;
     use crate::paths::PathResolver;
     use crate::tablestore::{TableStore, TableStoreKind};
     use crate::types::RowEntry;
     use crate::utils::WatchableOnceCell;
 
+    use crate::dispatcher::Notifier;
     use crate::wal::test_utils::FakeWalWriter;
-    use crate::wal::WalWriter;
+    use crate::wal::{WalError, WalObserver, WalStatus, WalStatusListener, WalWriter};
     use bytes::Bytes;
     use fail_parallel::FailPointRegistry;
     use object_store::memory::InMemory;
     use object_store::path::Path;
     use object_store::ObjectStore;
-    use slatedb_common::clock::DefaultSystemClock;
-    use slatedb_common::clock::SystemClock;
+    use slatedb_common::clock::{DefaultSystemClock, MockSystemClock, SystemClock};
     use slatedb_common::metrics::MetricsRecorderHelper;
     use slatedb_common::DbRand;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::runtime::Handle;
-    use tokio::sync::oneshot;
+    use tokio::sync::{oneshot, watch};
     use tokio::time::timeout;
 
     struct StartedManifestWriter {
@@ -925,6 +1031,7 @@ mod tests {
         executor: crate::dispatcher::MessageHandlerExecutor,
         tracker_rx: async_channel::Receiver<TrackerMessage>,
         closed_result: WatchableOnceCell<Result<(), SlateDBError>>,
+        _l0_stall_tx: watch::Sender<u64>,
     }
 
     impl StartedManifestWriter {
@@ -958,6 +1065,7 @@ mod tests {
         );
         let (tracker_tx, tracker_rx) =
             crate::utils::SafeSender::unbounded_channel(closed_result.result_reader());
+        let (l0_stall_tx, l0_stall_rx) = watch::channel(0);
         let writer = ManifestWriter::start(
             inner,
             manifest,
@@ -966,6 +1074,7 @@ mod tests {
             &executor,
             &Handle::current(),
             tracker_tx,
+            l0_stall_rx,
         )
         .unwrap();
         executor.monitor_on(&Handle::current()).unwrap();
@@ -974,7 +1083,143 @@ mod tests {
             executor,
             tracker_rx,
             closed_result,
+            _l0_stall_tx: l0_stall_tx,
         }
+    }
+
+    fn stall_notifier(
+        clock: Arc<MockSystemClock>,
+        manifest_poll_interval: Duration,
+    ) -> (watch::Sender<u64>, L0StallPollNotifier) {
+        let (tx, rx) = watch::channel(0);
+        (
+            tx,
+            L0StallPollNotifier::new(rx, clock, manifest_poll_interval),
+        )
+    }
+
+    /// Drives one `notify` call on the mock clock: it must stay pending until
+    /// the clock has advanced by `expected`, then produce a `PollManifest`
+    /// with no reply channel. A zero `expected` demands a poll at once.
+    async fn assert_poll_after(
+        notifier: &mut L0StallPollNotifier,
+        clock: &MockSystemClock,
+        expected: Duration,
+    ) {
+        let notify = notifier.notify();
+        tokio::pin!(notify);
+        if !expected.is_zero() {
+            assert!(timeout(Duration::from_millis(20), &mut notify)
+                .await
+                .is_err());
+            clock.advance(expected - Duration::from_millis(1)).await;
+            assert!(
+                timeout(Duration::from_millis(20), &mut notify)
+                    .await
+                    .is_err(),
+                "polled before {expected:?} elapsed"
+            );
+            clock.advance(Duration::from_millis(1)).await;
+        }
+        let command = timeout(Duration::from_secs(5), &mut notify)
+            .await
+            .unwrap_or_else(|_| panic!("no poll after {expected:?}"));
+        assert!(matches!(
+            command,
+            ManifestWriterCommand::PollManifest { done: None }
+        ));
+    }
+
+    #[tokio::test]
+    async fn l0_stall_notifier_is_idle_while_not_stalled() {
+        let clock = Arc::new(MockSystemClock::new());
+        let (_tx, mut notifier) = stall_notifier(Arc::clone(&clock), Duration::from_secs(60));
+        let notify = notifier.notify();
+        tokio::pin!(notify);
+        assert!(timeout(Duration::from_millis(50), &mut notify)
+            .await
+            .is_err());
+        clock.advance(Duration::from_secs(120)).await;
+        assert!(timeout(Duration::from_millis(50), &mut notify)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn l0_stall_notifier_polls_at_once_then_backs_off_to_the_cap() {
+        let clock = Arc::new(MockSystemClock::new());
+        let (tx, mut notifier) = stall_notifier(Arc::clone(&clock), Duration::from_secs(60));
+        tx.send(1).unwrap();
+        assert_poll_after(&mut notifier, &clock, Duration::ZERO).await;
+        for millis in [50, 100, 200, 400, 800, 1000, 1000] {
+            assert_poll_after(&mut notifier, &clock, Duration::from_millis(millis)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn l0_stall_notifier_backoff_is_capped_at_manifest_poll_interval() {
+        let clock = Arc::new(MockSystemClock::new());
+        let (tx, mut notifier) = stall_notifier(Arc::clone(&clock), Duration::from_millis(20));
+        tx.send(1).unwrap();
+        assert_poll_after(&mut notifier, &clock, Duration::ZERO).await;
+        for _ in 0..3 {
+            assert_poll_after(&mut notifier, &clock, Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn l0_stall_notifier_goes_idle_when_the_stall_clears_and_restarts_backoff() {
+        let clock = Arc::new(MockSystemClock::new());
+        let (tx, mut notifier) = stall_notifier(Arc::clone(&clock), Duration::from_secs(60));
+        tx.send(1).unwrap();
+        assert_poll_after(&mut notifier, &clock, Duration::ZERO).await;
+        assert_poll_after(&mut notifier, &clock, Duration::from_millis(50)).await;
+        assert_poll_after(&mut notifier, &clock, Duration::from_millis(100)).await;
+
+        {
+            // The stall clears while the 200 ms sleep is in flight: the sleep
+            // is abandoned and no poll follows, however far the clock moves.
+            let notify = notifier.notify();
+            tokio::pin!(notify);
+            assert!(timeout(Duration::from_millis(20), &mut notify)
+                .await
+                .is_err());
+            tx.send(0).unwrap();
+            assert!(timeout(Duration::from_millis(20), &mut notify)
+                .await
+                .is_err());
+            clock.advance(Duration::from_secs(10)).await;
+            assert!(timeout(Duration::from_millis(50), &mut notify)
+                .await
+                .is_err());
+
+            // A new stall polls at once.
+            tx.send(2).unwrap();
+            let command = timeout(Duration::from_secs(5), &mut notify).await.unwrap();
+            assert!(matches!(
+                command,
+                ManifestWriterCommand::PollManifest { done: None }
+            ));
+        }
+        // And the backoff starts over.
+        assert_poll_after(&mut notifier, &clock, Duration::from_millis(50)).await;
+    }
+
+    #[tokio::test]
+    async fn l0_stall_notifier_restarts_backoff_for_a_stall_it_never_saw_clear() {
+        let clock = Arc::new(MockSystemClock::new());
+        let (tx, mut notifier) = stall_notifier(Arc::clone(&clock), Duration::from_secs(60));
+        tx.send(1).unwrap();
+        assert_poll_after(&mut notifier, &clock, Duration::ZERO).await;
+        assert_poll_after(&mut notifier, &clock, Duration::from_millis(50)).await;
+        assert_poll_after(&mut notifier, &clock, Duration::from_millis(100)).await;
+
+        // Between two notify calls the stall clears and a new one starts; the
+        // notifier only ever reads the new id.
+        tx.send(0).unwrap();
+        tx.send(2).unwrap();
+        assert_poll_after(&mut notifier, &clock, Duration::ZERO).await;
+        assert_poll_after(&mut notifier, &clock, Duration::from_millis(50)).await;
     }
 
     async fn assert_no_flush_event(
@@ -1028,6 +1273,7 @@ mod tests {
             harness.manifest,
             Duration::from_secs(3600),
             tracker_tx,
+            watch::channel(0).1,
         )
     }
 
@@ -1035,6 +1281,21 @@ mod tests {
         path: &str,
         fp_registry: Arc<FailPointRegistry>,
         segment_extractor: Option<Arc<dyn crate::prefix_extractor::PrefixExtractor>>,
+    ) -> TestHarness {
+        setup_harness_with_wal_observer(
+            path,
+            fp_registry,
+            segment_extractor,
+            FakeWalWriter::new(0).observer(),
+        )
+        .await
+    }
+
+    async fn setup_harness_with_wal_observer(
+        path: &str,
+        fp_registry: Arc<FailPointRegistry>,
+        segment_extractor: Option<Arc<dyn crate::prefix_extractor::PrefixExtractor>>,
+        wal_observer: Box<dyn WalObserver>,
     ) -> TestHarness {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let path = path.to_string();
@@ -1066,7 +1327,6 @@ mod tests {
         let status_manager = DbStatusManager::new(0);
         let (write_tx, _) =
             crate::utils::SafeSender::unbounded_channel(status_manager.result_reader());
-        let wal_writer = Box::new(FakeWalWriter::new(0));
         let inner = Arc::new(
             DbInner::new(
                 settings.clone(),
@@ -1078,7 +1338,7 @@ mod tests {
                     &WatchableOnceCell::new(),
                 )),
                 write_tx,
-                wal_writer.observer(),
+                wal_observer,
                 db_metrics,
                 fp_registry,
                 None,
@@ -1100,6 +1360,7 @@ mod tests {
             stored_manifest,
             Duration::from_secs(300),
             Arc::new(DefaultSystemClock::new()),
+            None,
         )
         .await
         .unwrap();
@@ -1125,6 +1386,7 @@ mod tests {
             stored_manifest,
             Duration::from_secs(300),
             Arc::new(DefaultSystemClock::new()),
+            None,
         )
         .await
         .unwrap()
@@ -1210,6 +1472,233 @@ mod tests {
         let uploaded = next_uploaded_memtable_no_wal(inner, key, value).await;
         inner.oracle.advance_durable_seq(uploaded.last_seq);
         uploaded
+    }
+
+    #[rstest::rstest]
+    #[case(None, None, 30)]
+    #[case(Some(10), None, 10)]
+    #[case(None, Some(20), 20)]
+    #[case(Some(10), Some(20), 10)]
+    #[case(Some(20), Some(10), 10)]
+    #[tokio::test]
+    async fn manifest_writes_refresh_snapshot_min_seq_without_uploaded_tables(
+        #[case] snapshot_seq: Option<u64>,
+        #[case] txn_seq: Option<u64>,
+        #[case] expected_min_seq: u64,
+    ) {
+        let harness = setup_harness(
+            "/tmp/test_manifest_writes_refresh_snapshot_min_seq",
+            Arc::new(FailPointRegistry::new()),
+        )
+        .await;
+        let manifest_store = ManifestStore::new(
+            &Path::from(harness.path.clone()),
+            Arc::clone(&harness.object_store),
+        );
+        let mut handler = new_handler_from_harness(harness);
+        handler.load_manifest().await.unwrap();
+        let snapshot =
+            snapshot_seq.map(|seq| handler.db.snapshot_manager.new_snapshot(Some(seq)).0);
+        let txn = txn_seq.map(|seq| {
+            handler.db.oracle.advance_committed_seq(seq);
+            handler.db.txn_manager.new_transaction().0
+        });
+        handler.db.oracle.advance_committed_seq(30);
+        handler.db.state.write().modify(|modifier| {
+            modifier.state.manifest.value.core.last_l0_seq = 30;
+        });
+
+        handler.write_current_manifest_safely().await.unwrap();
+        assert_eq!(
+            handler
+                .db
+                .state
+                .read()
+                .state()
+                .core()
+                .recent_snapshot_min_seq,
+            expected_min_seq
+        );
+        assert_eq!(
+            manifest_store
+                .read_latest_manifest()
+                .await
+                .unwrap()
+                .manifest
+                .core
+                .recent_snapshot_min_seq,
+            expected_min_seq
+        );
+
+        if let Some(snapshot) = snapshot {
+            handler.db.snapshot_manager.drop_snapshot(&snapshot);
+        }
+        if let Some(txn) = txn {
+            handler.db.txn_manager.drop_txn(&txn);
+        }
+        handler
+            .write_manifest_update_safely(&[&CheckpointOptions::default()])
+            .await
+            .unwrap();
+        assert_eq!(
+            handler
+                .db
+                .state
+                .read()
+                .state()
+                .core()
+                .recent_snapshot_min_seq,
+            30
+        );
+        assert_eq!(
+            manifest_store
+                .read_latest_manifest()
+                .await
+                .unwrap()
+                .manifest
+                .core
+                .recent_snapshot_min_seq,
+            30
+        );
+    }
+
+    struct AdvancingWalObserver {
+        next_flushed_wal_id: Arc<AtomicU64>,
+    }
+
+    impl WalObserver for AdvancingWalObserver {
+        fn status(&self) -> Result<WalStatus, WalStatus> {
+            Ok(WalStatus {
+                last_flushed_wal_id: self.next_flushed_wal_id.fetch_add(1, Ordering::SeqCst),
+                last_flushed_seq: None,
+                estimated_bytes: 0,
+                buffered_wal_entries_count: 0,
+                closed_reason: None,
+            })
+        }
+
+        fn subscribe(&self, _listener: WalStatusListener) -> Result<(), WalError> {
+            Ok(())
+        }
+    }
+
+    #[rstest::rstest]
+    #[case(false)]
+    #[case(true)]
+    #[tokio::test]
+    async fn manifest_write_retry_samples_new_wal_end(#[case] checkpoint: bool) {
+        let next_flushed_wal_id = Arc::new(AtomicU64::new(0));
+        let harness = setup_harness_with_wal_observer(
+            "/tmp/test_manifest_write_retry_samples_new_wal_end",
+            Arc::new(FailPointRegistry::new()),
+            None,
+            Box::new(AdvancingWalObserver {
+                next_flushed_wal_id: Arc::clone(&next_flushed_wal_id),
+            }),
+        )
+        .await;
+        let manifest_store = ManifestStore::new(
+            &Path::from(harness.path.clone()),
+            Arc::clone(&harness.object_store),
+        );
+        let mut handler = new_handler_from_harness(harness);
+        handler.load_manifest().await.unwrap();
+        handler
+            .manifest
+            .update(handler.manifest.prepare_dirty().unwrap())
+            .await
+            .unwrap();
+        next_flushed_wal_id.store(10, Ordering::SeqCst);
+
+        if checkpoint {
+            handler
+                .write_manifest_update_safely(&[&CheckpointOptions::default()])
+                .await
+                .unwrap();
+        } else {
+            handler.write_current_manifest_safely().await.unwrap();
+        }
+
+        assert_eq!(next_flushed_wal_id.load(Ordering::SeqCst), 12);
+        assert_eq!(handler.db.state.read().state().core().next_wal_sst_id, 12);
+        assert_eq!(
+            manifest_store
+                .read_latest_manifest()
+                .await
+                .unwrap()
+                .manifest
+                .core
+                .next_wal_sst_id,
+            12
+        );
+    }
+
+    #[rstest::rstest]
+    #[case(false)]
+    #[case(true)]
+    #[tokio::test]
+    async fn replay_leaves_wal_end_to_manifest_writer(#[case] sample_before_replay: bool) {
+        let harness = setup_harness_with_wal_observer(
+            "/tmp/test_replay_leaves_wal_end_to_manifest_writer",
+            Arc::new(FailPointRegistry::new()),
+            None,
+            FakeWalWriter::new(10).observer(),
+        )
+        .await;
+        let handler = new_handler_from_harness(harness);
+        if sample_before_replay {
+            handler.prepare_local_manifest_for_write();
+        }
+        let next_wal_id_before_replay = handler.db.state.read().state().core().next_wal_sst_id;
+        let table = crate::mem_table::WritableKVTable::new();
+        table.put(RowEntry::new_value(b"key", b"value", 1));
+        handler
+            .db
+            .replay_memtable(
+                0,
+                crate::wal_replay::ReplayedMemtable {
+                    table,
+                    last_tick: 0,
+                    last_seq: 1,
+                    last_wal_id: 3,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            handler.db.state.read().state().core().next_wal_sst_id,
+            next_wal_id_before_replay
+        );
+        assert_eq!(
+            handler
+                .prepare_local_manifest_for_write()
+                .value
+                .core
+                .next_wal_sst_id,
+            11
+        );
+        assert_eq!(handler.db.state.read().state().core().next_wal_sst_id, 11);
+    }
+
+    #[tokio::test]
+    async fn prepare_local_manifest_for_write_reports_to_status_manager() {
+        let harness = setup_harness_with_wal_observer(
+            "/tmp/test_prepare_local_manifest_for_write_reports_to_status_manager",
+            Arc::new(FailPointRegistry::new()),
+            None,
+            FakeWalWriter::new(10).observer(),
+        )
+        .await;
+        let handler = new_handler_from_harness(harness);
+        let mut status_rx = handler.db.status_manager.subscribe();
+
+        let prepared = handler.prepare_local_manifest_for_write();
+
+        // Subscribers see the prepared manifest before the manifest writer writes it.
+        assert!(status_rx.has_changed().unwrap());
+        let current_manifest = status_rx.borrow_and_update().current_manifest.clone();
+        assert_eq!(current_manifest.core().next_wal_sst_id, 11);
+        assert_eq!(current_manifest, VersionedManifest::from(prepared));
     }
 
     #[tokio::test]

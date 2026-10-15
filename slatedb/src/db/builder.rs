@@ -192,12 +192,14 @@ pub struct DbBuilder<P: Into<Path>> {
     fp_registry: Arc<FailPointRegistry>,
     seed: Option<u64>,
     sst_block_size: Option<SstBlockSize>,
+    sst_block_alignment: bool,
     merge_operator: Option<MergeOperatorType>,
     block_transformer: Option<Arc<dyn BlockTransformer>>,
     filter_policies: Vec<Arc<dyn FilterPolicy>>,
     metrics_recorder: Arc<dyn MetricsRecorder>,
     segment_extractor: Option<Arc<dyn crate::prefix_extractor::PrefixExtractor>>,
     wal_writer_init: Option<Box<dyn wal::WriterInit>>,
+    expected_epoch: Option<u64>,
 }
 
 impl<P: Into<Path>> DbBuilder<P> {
@@ -223,13 +225,26 @@ impl<P: Into<Path>> DbBuilder<P> {
             fp_registry: Arc::new(FailPointRegistry::new()),
             seed: None,
             sst_block_size: None,
+            sst_block_alignment: false,
             merge_operator: None,
             block_transformer: None,
             filter_policies: default_filter_policies(),
             metrics_recorder: Arc::new(NoopMetricsRecorder::new()),
             segment_extractor: None,
             wal_writer_init: None,
+            expected_epoch: None,
         }
+    }
+
+    /// Attempts to claim writer epoch `expected_epoch + 1`.
+    ///
+    /// If a different writer epoch is observed, opening fails with
+    /// [`crate::CloseReason::Fenced`]. Compactor epoch changes are tolerated.
+    /// Without this option, opening retries claims against newer writers.
+    /// `expected_epoch` must be less than `u64::MAX`.
+    pub fn with_expected_epoch(mut self, expected_epoch: u64) -> Self {
+        self.expected_epoch = Some(expected_epoch);
+        self
     }
 
     /// Set the segment extractor (RFC-0024). When configured, every
@@ -404,6 +419,29 @@ impl<P: Into<Path>> DbBuilder<P> {
         self
     }
 
+    /// Pads every data block of a compacted SST with zeros to the block size
+    /// set by [`Self::with_sst_block_size`]. An entry too large for a block
+    /// gets a block of its own, padded to the next multiple of the block
+    /// size.
+    ///
+    /// The padding rounds up to the block size, not to the 4KB disk block. A
+    /// block size above 4KB therefore over-pads a large entry. Keep the block
+    /// size at 4KB to pad a large entry to the tightest disk-aligned size.
+    ///
+    /// A [`BlockTransformer`] that adds bytes to a block must report them
+    /// through [`BlockTransformer::encoded_overhead`], or every full block
+    /// spills into a second block-sized unit.
+    ///
+    /// Readers that predate the `encoded_len` index field cannot read padded
+    /// SSTs, so upgrade every reader before a writer enables this. Once
+    /// padded SSTs exist, the readers cannot be rolled back.
+    ///
+    /// Defaults to `false`.
+    pub fn with_sst_block_alignment(mut self, aligned: bool) -> Self {
+        self.sst_block_alignment = aligned;
+        self
+    }
+
     /// Sets the merge operator to use for the database. The merge operator allows
     /// applications to bypass the traditional read/modify/write cycle by expressing
     /// partial updates using an associative operator.
@@ -461,6 +499,12 @@ impl<P: Into<Path>> DbBuilder<P> {
     /// Builds and opens the database.
     pub async fn build(self) -> Result<Db, crate::Error> {
         self.settings.validate()?;
+        if self.sst_block_alignment && self.settings.compression_codec.is_some() {
+            return Err(SlateDBError::InvalidConfiguration(
+                "sst_block_alignment cannot be combined with compression_codec".into(),
+            )
+            .into());
+        }
 
         let path = self.path.into();
         // TODO: proper URI generation, for now it works just as a flag
@@ -553,6 +597,7 @@ impl<P: Into<Path>> DbBuilder<P> {
             filter_policies: self.filter_policies.clone(),
             compression_codec: self.settings.compression_codec,
             block_size: self.sst_block_size.unwrap_or_default().as_bytes(),
+            block_alignment: self.sst_block_alignment,
             block_transformer: self.block_transformer.clone(),
             block_format,
             ..SsTableFormat::default()
@@ -663,7 +708,7 @@ impl<P: Into<Path>> DbBuilder<P> {
             manifest,
             replay_iterator,
             mut wal_writer,
-        } = fencer.fence(stored_manifest).await?;
+        } = fencer.fence(stored_manifest, self.expected_epoch).await?;
         let (wal_writer, wal_observer) = if DbInner::wal_enabled_in_options(&self.settings) {
             let wal_observer = wal_writer.observer();
             (Some(wal_writer), wal_observer)
@@ -900,6 +945,7 @@ pub struct AdminBuilder<P: Into<Path>> {
     #[cfg(feature = "compaction_filters")]
     compaction_filter_supplier: Option<Arc<dyn CompactionFilterSupplier>>,
     merge_operator: Option<MergeOperatorType>,
+    block_transformer: Option<Arc<dyn BlockTransformer>>,
 }
 
 impl<P: Into<Path>> AdminBuilder<P> {
@@ -916,6 +962,7 @@ impl<P: Into<Path>> AdminBuilder<P> {
             #[cfg(feature = "compaction_filters")]
             compaction_filter_supplier: None,
             merge_operator: None,
+            block_transformer: None,
         }
     }
 
@@ -967,6 +1014,13 @@ impl<P: Into<Path>> AdminBuilder<P> {
         self
     }
 
+    /// Sets the block transformer the database's SSTs are written with, so the
+    /// compactor and compaction worker this admin runs can read and rewrite them.
+    pub fn with_block_transformer(mut self, block_transformer: Arc<dyn BlockTransformer>) -> Self {
+        self.block_transformer = Some(block_transformer);
+        self
+    }
+
     /// Builds and returns an Admin instance.
     pub fn build(self) -> Admin {
         // Store the raw object stores here. Admin wraps them in a
@@ -1002,6 +1056,7 @@ impl<P: Into<Path>> AdminBuilder<P> {
             #[cfg(feature = "compaction_filters")]
             compaction_filter_supplier: self.compaction_filter_supplier,
             merge_operator: self.merge_operator,
+            block_transformer: self.block_transformer,
         }
     }
 }
@@ -1211,6 +1266,7 @@ pub struct CompactorBuilder<P: Into<Path>> {
     compaction_runtime: Handle,
     options: CompactorOptions,
     scheduler_supplier: Option<Arc<dyn CompactionSchedulerSupplier>>,
+    expected_epoch: Option<u64>,
     rand: Arc<DbRand>,
     metrics_recorder: Arc<dyn MetricsRecorder>,
     system_clock: Arc<dyn SystemClock>,
@@ -1219,6 +1275,8 @@ pub struct CompactorBuilder<P: Into<Path>> {
     fp_registry: Arc<FailPointRegistry>,
     block_transformer: Option<Arc<dyn BlockTransformer>>,
     filter_policies: Vec<Arc<dyn FilterPolicy>>,
+    sst_block_size: Option<SstBlockSize>,
+    sst_block_alignment: bool,
     #[cfg(feature = "compaction_filters")]
     compaction_filter_supplier: Option<Arc<dyn CompactionFilterSupplier>>,
 }
@@ -1232,6 +1290,7 @@ impl<P: Into<Path>> CompactorBuilder<P> {
             compaction_runtime: Handle::current(),
             options: CompactorOptions::default(),
             scheduler_supplier: None,
+            expected_epoch: None,
             rand: Arc::new(DbRand::default()),
             metrics_recorder: Arc::new(NoopMetricsRecorder::new()),
             system_clock: Arc::new(DefaultSystemClock::default()),
@@ -1240,6 +1299,8 @@ impl<P: Into<Path>> CompactorBuilder<P> {
             fp_registry: Arc::new(FailPointRegistry::new()),
             block_transformer: None,
             filter_policies: default_filter_policies(),
+            sst_block_size: None,
+            sst_block_alignment: false,
             #[cfg(feature = "compaction_filters")]
             compaction_filter_supplier: None,
         }
@@ -1252,6 +1313,7 @@ impl<P: Into<Path>> CompactorBuilder<P> {
             compaction_runtime: self.compaction_runtime,
             options: self.options,
             scheduler_supplier: self.scheduler_supplier,
+            expected_epoch: self.expected_epoch,
             rand: self.rand,
             metrics_recorder: self.metrics_recorder,
             system_clock: self.system_clock,
@@ -1260,6 +1322,8 @@ impl<P: Into<Path>> CompactorBuilder<P> {
             fp_registry: self.fp_registry,
             block_transformer: self.block_transformer,
             filter_policies: self.filter_policies,
+            sst_block_size: self.sst_block_size,
+            sst_block_alignment: self.sst_block_alignment,
             #[cfg(feature = "compaction_filters")]
             compaction_filter_supplier: self.compaction_filter_supplier,
         }
@@ -1275,6 +1339,17 @@ impl<P: Into<Path>> CompactorBuilder<P> {
     /// Sets the options to use for the compactor.
     pub fn with_options(mut self, options: CompactorOptions) -> Self {
         self.options = options;
+        self
+    }
+
+    /// Attempts to claim compactor epoch `expected_epoch + 1`.
+    ///
+    /// If a different compactor epoch is observed, startup fails with
+    /// [`crate::CloseReason::Fenced`]. Writer epoch changes are tolerated.
+    /// Without this option, startup retries claims against newer compactors.
+    /// `expected_epoch` must be less than `u64::MAX`.
+    pub fn with_expected_epoch(mut self, expected_epoch: u64) -> Self {
+        self.expected_epoch = Some(expected_epoch);
         self
     }
 
@@ -1361,6 +1436,25 @@ impl<P: Into<Path>> CompactorBuilder<P> {
         self
     }
 
+    /// Sets the SST block size the worker uses when it rewrites SSTs.
+    ///
+    /// Must match the writer's `DbBuilder::with_sst_block_size` configuration
+    /// so that SSTs rewritten by the worker are encoded consistently with
+    /// those produced by the DB. Defaults to [`SstBlockSize::default`].
+    pub fn with_sst_block_size(mut self, block_size: SstBlockSize) -> Self {
+        self.sst_block_size = Some(block_size);
+        self
+    }
+
+    /// Pads every data block of a compacted SST with zeros to the block size
+    /// set by [`Self::with_sst_block_size`].
+    ///
+    /// Defaults to `false`.
+    pub fn with_sst_block_alignment(mut self, aligned: bool) -> Self {
+        self.sst_block_alignment = aligned;
+        self
+    }
+
     /// Builds and returns a Compactor instance.
     pub fn build(self) -> Compactor {
         let path: Path = self.path.into();
@@ -1388,6 +1482,8 @@ impl<P: Into<Path>> CompactorBuilder<P> {
         let sst_format = SsTableFormat {
             filter_policies: self.filter_policies.clone(),
             block_transformer: self.block_transformer.clone(),
+            block_size: self.sst_block_size.unwrap_or_default().as_bytes(),
+            block_alignment: self.sst_block_alignment,
             ..SsTableFormat::default()
         };
         let table_store = Arc::new(TableStore::new(
@@ -1409,6 +1505,7 @@ impl<P: Into<Path>> CompactorBuilder<P> {
             table_store,
             self.options,
             scheduler_supplier,
+            self.expected_epoch,
             self.compaction_runtime,
             self.rand,
             &recorder,
@@ -1453,6 +1550,7 @@ impl<P: Into<Path>> CompactorBuilder<P> {
             stats.clone(),
             self.system_clock.clone(),
             recorder.clone(),
+            self.expected_epoch,
         )
         .await?;
         let worker = options.worker.clone().map(|worker_options| {
@@ -1498,6 +1596,7 @@ pub struct CompactionWorkerBuilder<P: Into<Path>> {
     block_transformer: Option<Arc<dyn BlockTransformer>>,
     filter_policies: Vec<Arc<dyn FilterPolicy>>,
     sst_block_size: Option<SstBlockSize>,
+    sst_block_alignment: bool,
     #[cfg(feature = "compaction_filters")]
     compaction_filter_supplier: Option<Arc<dyn CompactionFilterSupplier>>,
 }
@@ -1517,6 +1616,7 @@ impl<P: Into<Path>> CompactionWorkerBuilder<P> {
             block_transformer: None,
             filter_policies: default_filter_policies(),
             sst_block_size: None,
+            sst_block_alignment: false,
             #[cfg(feature = "compaction_filters")]
             compaction_filter_supplier: None,
         }
@@ -1579,11 +1679,20 @@ impl<P: Into<Path>> CompactionWorkerBuilder<P> {
 
     /// Sets the SST block size the worker uses when it rewrites SSTs.
     ///
-    /// Must match the writer's `DbBuilder::with_sst_block_size` configuration so
-    /// that SSTs rewritten by the worker are encoded consistently with those
-    /// produced by the DB. Defaults to [`SstBlockSize::default`].
+    /// Must match the writer's `DbBuilder::with_sst_block_size` configuration
+    /// so that SSTs rewritten by the worker are encoded consistently with
+    /// those produced by the DB. Defaults to [`SstBlockSize::default`].
     pub fn with_sst_block_size(mut self, block_size: SstBlockSize) -> Self {
         self.sst_block_size = Some(block_size);
+        self
+    }
+
+    /// Pads every data block of a compacted SST with zeros to the block size
+    /// set by [`Self::with_sst_block_size`].
+    ///
+    /// Defaults to `false`.
+    pub fn with_sst_block_alignment(mut self, aligned: bool) -> Self {
+        self.sst_block_alignment = aligned;
         self
     }
 
@@ -1597,6 +1706,12 @@ impl<P: Into<Path>> CompactionWorkerBuilder<P> {
     }
 
     pub async fn build(self) -> Result<CompactionWorker, crate::Error> {
+        if self.sst_block_alignment && self.options.compression_codec.is_some() {
+            return Err(SlateDBError::InvalidConfiguration(
+                "sst_block_alignment cannot be combined with compression_codec".into(),
+            )
+            .into());
+        }
         let path: Path = self.path.into();
         let manifest_store = Arc::new(ManifestStore::new(&path, self.main_object_store.clone()));
         let compactions_store =
@@ -1609,6 +1724,7 @@ impl<P: Into<Path>> CompactionWorkerBuilder<P> {
                 block_size: self.sst_block_size.unwrap_or_default().as_bytes(),
                 min_filter_keys: self.options.min_filter_keys,
                 compression_codec: self.options.compression_codec,
+                block_alignment: self.sst_block_alignment,
                 ..SsTableFormat::default()
             },
             path,
@@ -2364,6 +2480,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_expected_writer_epoch_returns_closed_fenced() {
+        let result = crate::Db::builder("epoch-mismatch", Arc::new(InMemory::new()))
+            .with_expected_epoch(1)
+            .build()
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(error) if error.kind() == ErrorKind::Closed(crate::CloseReason::Fenced)
+        ));
+    }
+
+    #[tokio::test]
     async fn test_db_builder_uses_custom_wal_writer_init() {
         let called = Arc::new(AtomicBool::new(false));
         let db = crate::Db::builder(
@@ -2735,5 +2864,26 @@ mod tests {
             Some(b"v1".as_ref())
         );
         db.close().await.expect("failed to close db");
+    }
+
+    #[tokio::test]
+    async fn admin_hands_its_hooks_to_the_compactor_and_worker_it_runs() {
+        use super::AdminBuilder;
+        use crate::config::CompactionWorkerOptions;
+        use crate::test_utils::{IdentityBlockTransformer, StringConcatMergeOperator};
+
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let admin = AdminBuilder::new("/tmp/admin_hooks", object_store)
+            .with_merge_operator(Arc::new(StringConcatMergeOperator))
+            .with_block_transformer(Arc::new(IdentityBlockTransformer))
+            .build();
+
+        let compactor = admin.compactor_builder(CompactorOptions::default());
+        assert!(compactor.merge_operator.is_some());
+        assert!(compactor.block_transformer.is_some());
+
+        let worker = admin.compaction_worker_builder(CompactionWorkerOptions::default());
+        assert!(worker.merge_operator.is_some());
+        assert!(worker.block_transformer.is_some());
     }
 }

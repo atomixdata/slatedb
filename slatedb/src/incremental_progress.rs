@@ -86,7 +86,7 @@ impl IncrementalProgress {
                 // them ends at that key. Cut such an SST to end before the key. An SST
                 // that holds only the boundary key drops out.
                 if sst.info.last_entry.as_ref() == Some(&boundary) {
-                    if let Some(cut_view) = view.try_with_visible_range(interval.to_range()) {
+                    if let Some(cut_view) = cut_view(&view, interval.to_range()) {
                         output.push(cut_view);
                     }
                 } else {
@@ -178,8 +178,7 @@ impl IncrementalProgress {
                     let mut piece = if &range == view.compacted_effective_range() {
                         view.clone()
                     } else {
-                        view.try_with_visible_range(range)
-                            .expect("retained range intersects its SST")
+                        cut_view(view, range).expect("retained range intersects its SST")
                     };
                     if index > 0 {
                         piece.id = rand.rng().gen_ulid(clock);
@@ -201,6 +200,24 @@ impl IncrementalProgress {
         }
         Ok(())
     }
+}
+
+/// Returns `view` cut to `range`, with the same view ID. Returns `None` if the SST
+/// has no keys in `range`.
+///
+/// [`SsTableView::try_with_visible_range`] gives a cut view a new ID. An incremental
+/// commit keeps the ID, so the same progress applied twice gives the same views.
+fn cut_view(view: &SsTableView, range: BytesRange) -> Option<SsTableView> {
+    view.sst
+        .info
+        .physical_range()
+        .expect("SST always has a first entry.")
+        .intersect(&range)?;
+    Some(SsTableView::new_projected(
+        view.id,
+        view.sst.clone(),
+        Some(range),
+    ))
 }
 
 /// A durable interval `[start, end)`: the key range of one subcompaction whose output
@@ -399,6 +416,7 @@ mod tests {
             &ProjectionConfig::from_global_range(BytesRange::from_slice(
                 b"b".as_slice()..b"y".as_slice(),
             )),
+            &DbRand::default(),
         )
         .unwrap();
         let retained = &projected.core.tree.compacted[1];
@@ -410,6 +428,7 @@ mod tests {
             &ProjectionConfig::from_global_range(BytesRange::from_slice(
                 b"m".as_slice()..=b"m".as_slice(),
             )),
+            &DbRand::default(),
         )
         .unwrap();
         assert_eq!(
