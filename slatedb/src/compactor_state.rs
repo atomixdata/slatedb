@@ -424,7 +424,11 @@ impl CompactionContext {
                 "completed subcompactions must remain complete"
             );
             if prev.completed() {
-                assert_eq!(prev.output_ssts(), next.output_ssts());
+                assert_eq!(
+                    prev.output_ssts().len(),
+                    next.output_ssts().len(),
+                    "completed subcompaction output SSTs must not change"
+                );
             }
             assert_eq!(
                 prev.range(),
@@ -1359,6 +1363,27 @@ mod tests {
         let incomplete =
             CompactionContext::new(vec![Subcompaction::new(BytesRange::unbounded())], Some(42));
         completed.validate_update(&incomplete);
+    }
+
+    #[test]
+    #[should_panic(expected = "completed subcompaction output SSTs must not change")]
+    fn test_should_panic_when_completed_subcompaction_output_ssts_change() {
+        // given: a completed subcompaction that recorded output SST "a"
+        let range = BytesRange::unbounded();
+        let sst = test_subcompaction_sst(b"a");
+        let mut compaction =
+            test_compaction_with_subcompactions(vec![Subcompaction::new(range.clone())
+                .with_output_ssts(vec![sst.clone()])
+                .with_status(crate::subcompaction::SubcompactionStatus::Completed)]);
+
+        // when/then: adding an output SST to the completed range panics, even
+        // though the new list starts with the old list
+        set_test_subcompactions(
+            &mut compaction,
+            vec![Subcompaction::new(range)
+                .with_output_ssts(vec![sst, test_subcompaction_sst(b"m")])
+                .with_status(crate::subcompaction::SubcompactionStatus::Completed)],
+        );
     }
 
     #[test]

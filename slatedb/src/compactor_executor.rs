@@ -642,17 +642,12 @@ impl TokioCompactionExecutorInner {
             self.send_compaction_progress(id, 0, ctx.clone());
         }
 
-        let mut completed = ctx
-            .subcompactions()
-            .iter()
-            .map(|s| s.completed())
-            .collect::<Vec<_>>();
         let (sub_tx, mut sub_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut sub_tasks = Vec::new();
         for args in subcompaction_args {
             // A resumed job can have completed ranges. Their output is already
             // stored, so they do not run again.
-            if completed[args.index] {
+            if ctx.subcompactions()[args.index].completed() {
                 continue;
             }
             let this = self.clone();
@@ -702,7 +697,7 @@ impl TokioCompactionExecutorInner {
         drop(sub_tx);
 
         let mut first_error: Option<SlateDBError> = None;
-        while !completed.iter().all(|done| *done) {
+        while !ctx.subcompactions().iter().all(Subcompaction::completed) {
             let Some(event) = sub_rx.recv().await else {
                 break;
             };
@@ -723,7 +718,6 @@ impl TokioCompactionExecutorInner {
                     Ok(output_ssts) => {
                         ctx.set_output_ssts(index, output_ssts);
                         ctx.mark_completed(index);
-                        completed[index] = true;
                         let total_bytes = bytes_processed_by_sub.iter().sum();
                         self.send_compaction_progress(id, total_bytes, ctx.clone());
                     }
@@ -744,7 +738,7 @@ impl TokioCompactionExecutorInner {
         if let Some(e) = first_error {
             return Err(e);
         }
-        if !completed.iter().all(|done| *done) {
+        if !ctx.subcompactions().iter().all(Subcompaction::completed) {
             // The event channel closed before every subcompaction reported a
             // successful result; treat the job as failed so it can be
             // rescheduled.
