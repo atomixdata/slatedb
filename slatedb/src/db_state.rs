@@ -212,8 +212,8 @@ impl SsTableView {
     ///   view, the result includes that key. Two adjacent SSTs can split the versions
     ///   of one key, for example `[a, m]` followed by `[m, z]`.
     /// - Gap before the next view: the result stays inside the visible range of this
-    ///   view. A partial commit can leave a view `[a, g)` before a view that starts at
-    ///   `m`, and the result must not show `[g, m)` again.
+    ///   view. An incremental commit can leave a view `[a, g)` before a view that
+    ///   starts at `m`, and the result must not show `[g, m)` again.
     ///
     /// TODO: If every SST records `last_entry`, this function can return
     /// `self.effective_range.intersect(range)` and no longer needs `next_view`.

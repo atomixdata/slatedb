@@ -1023,16 +1023,15 @@ impl CompactorState {
         self.manifest = remote_manifest;
     }
 
-    /// Applies the stored progress of `job` to the in-memory manifest.
+    /// Applies `progress` of `job` to the in-memory manifest.
     ///
-    /// Cuts the durable intervals of `job` out of its input views and adds the
-    /// matching output views to its destination run. New views from split input views
-    /// get IDs from `rand` and `clock`. Parent SST IDs that no view uses anymore leave
-    /// `external_dbs`. Returns whether the manifest changed. The caller writes it.
+    /// [`IncrementalProgress::apply_to_manifest_core`] describes how the views
+    /// change. This method also removes parent SST IDs that no view uses anymore
+    /// from `external_dbs`.
     ///
-    /// Returns `InvalidCompaction` and leaves the state unchanged if the segment or an
-    /// input run of `job` is missing from the manifest.
-    pub(crate) fn apply_incremental_progress(
+    /// Returns whether the manifest changed. The caller writes the manifest. If this
+    /// method returns an error, the manifest does not change.
+    pub(crate) fn apply_incremental_progress_to_manifest(
         &mut self,
         job: &Compaction,
         progress: &IncrementalProgress,
@@ -1040,7 +1039,7 @@ impl CompactorState {
         clock: &dyn SystemClock,
     ) -> Result<bool, SlateDBError> {
         let mut core = self.db_state().clone();
-        progress.apply_to_manifest(&mut core, job, rand, clock)?;
+        progress.apply_to_manifest_core(&mut core, job.spec(), rand, clock)?;
         let changed = &core != self.db_state();
         self.manifest.value.core = core;
         self.manifest.value.prune_external_sst_ids();

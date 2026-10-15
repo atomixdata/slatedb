@@ -528,12 +528,17 @@ pub(crate) struct CompactorEventHandler {
     /// Cached handles for per-worker `worker_last_heartbeat_ms` gauges. Handles are
     /// retained for every worker id observed by this coordinator process.
     worker_heartbeat_gauges: HashMap<String, Arc<dyn GaugeFn>>,
-    /// Time of the last successful manifest write that included partial progress.
-    /// The next partial commit waits until `INCREMENTAL_COMMIT_INTERVAL` passes. A
-    /// write with only final commits does not change it. The value lives only in
-    /// memory, so a restarted coordinator can make a partial commit on its first poll.
+    /// Time of the most recent successful manifest write that included incremental
+    /// progress.
+    ///
+    /// The next incremental commit waits until [`INCREMENTAL_COMMIT_INTERVAL`]
+    /// passes.
+    ///
+    /// A write with only final commits does not wait for or change this value.
+    /// The value lives only in memory, so a restarted coordinator can make an
+    /// incremental commit on its first poll.
     last_incremental_commit: Option<chrono::DateTime<chrono::Utc>>,
-    /// Turns on partial commits. Only tests set it for now.
+    /// Turns on incremental commits. Only tests set it for now.
     enable_incremental_compaction: bool,
 }
 
@@ -859,42 +864,59 @@ impl CompactorEventHandler {
         }
     }
 
-    /// Commits finished jobs and any partial progress due on this poll.
+    /// Commits finished jobs and any incremental progress due on this poll.
     ///
     /// `Compacted` is the distributed intermediate state written by a worker after it
     /// finishes execution. The coordinator is solely responsible for transitioning
     /// `Compacted → Completed` (or `Compacted → Failed`) by writing the manifest first
     /// and then updating `.compactions`. See RFC-0025 §Manifest Commit Protocol.
-    /// Eligible `Running` jobs commit their durable progress in the same manifest write.
+    /// The `Running` jobs that [`Self::jobs_due_for_incremental_commit`] returns commit
+    /// their durable progress in the same manifest write.
     ///
     /// Recovery: on coordinator restart, `Compacted` entries are left intact in
     /// `.compactions`, and the first call to this method after startup handles them.
-    /// The coordinator can stop before or after the final manifest write of a job:
-    /// - If all inputs of the job are sorted runs and the destination is one of them,
-    ///   [`Self::final_commit_is_applied`] looks for the final commit in the manifest.
-    ///   If it finds the commit, the entry becomes `Completed` without another manifest
-    ///   write. If not, this method retries the final commit.
-    /// - For other jobs, such as jobs with L0 inputs, this method retries the final
-    ///   commit. If the manifest write happened before the stop, the sources are
-    ///   already absent, `validate_compaction` fails, and the entry becomes `Failed`
-    ///   even though the compaction succeeded. This is safe, because the manifest
-    ///   already holds the result of the compaction.
-    ///
-    /// The presence of the destination SR alone does not prove that the final commit
-    /// happened, because its ID can equal a source SR ID (e.g. `[L0:1, SR:1] -> SR:1`).
+    /// If [`Self::final_commit_is_applied`] finds the final commit of a job in the
+    /// manifest, the entry becomes `Completed` without another manifest write.
+    /// Otherwise, this method retries the final commit. See
+    /// [`Self::final_commit_is_applied`] for the jobs that the check covers and for
+    /// the result of a retry after the final manifest write.
     async fn commit_compacted_entries(&mut self) -> Result<(), SlateDBError> {
-        let compacted = self
+        let finished_jobs = self
             .state()
             .compactions_with_status(&[CompactionStatus::Compacted])
             .cloned()
             .collect::<Vec<_>>();
-        let incremental = self.incremental_jobs_due();
-        if compacted.is_empty() && incremental.is_empty() {
+        let incremental_jobs = self.jobs_due_for_incremental_commit();
+        if finished_jobs.is_empty() && incremental_jobs.is_empty() {
             return Ok(());
         }
 
+        let final_changed = self.apply_final_commits(&finished_jobs);
+        let incremental_changed = self.apply_incremental_commits(&incremental_jobs)?;
+        self.log_compaction_state();
+
+        if final_changed || incremental_changed {
+            self.state_writer.write_manifest_safely().await?;
+            if incremental_changed {
+                self.last_incremental_commit = Some(self.system_clock.now());
+            }
+        }
+        // Each `Compacted` entry is now `Completed` or `Failed`.
+        if !finished_jobs.is_empty() {
+            self.state_writer.write_compactions_safely().await?;
+        }
+
+        Ok(())
+    }
+
+    /// Applies the final commit of each `Compacted` job in `jobs` to the in-memory
+    /// manifest, and marks each entry `Completed` or `Failed`.
+    ///
+    /// Returns whether the manifest changed. The caller writes the manifest and
+    /// `.compactions`.
+    fn apply_final_commits(&mut self, jobs: &[Compaction]) -> bool {
         let mut manifest_changed = false;
-        for compaction in &compacted {
+        for compaction in jobs {
             let id = compaction.id();
             if self.final_commit_is_applied(compaction) {
                 self.state_mut()
@@ -932,29 +954,22 @@ impl CompactorEventHandler {
                 }
             }
         }
-
-        let incremental_changed = self.apply_partial_commits(&incremental)?;
-        manifest_changed |= incremental_changed;
-        self.log_compaction_state();
-        if manifest_changed {
-            self.state_writer.write_manifest_safely().await?;
-            if incremental_changed {
-                self.last_incremental_commit = Some(self.system_clock.now());
-            }
-        }
-        // Each `Compacted` entry became `Completed` or `Failed` above.
-        if !compacted.is_empty() {
-            self.state_writer.write_compactions_safely().await?;
-        }
-
-        Ok(())
+        manifest_changed
     }
 
-    /// Returns the running jobs that can commit partial progress now.
+    /// Returns the running jobs that can commit incremental progress now.
+    ///
+    /// A running job can commit incremental progress only when:
+    /// - It is not a drain, because a drain produces no output.
+    /// - It has no L0 inputs. L0 inputs leave the manifest only in the
+    ///   final commit, which keeps the L0 watermark logic unchanged.
+    /// - Its destination is one of its input runs, because incremental output
+    ///   goes into that run.
+    /// - It has a context, which holds the range plan and stored output.
     ///
     /// The list is empty when incremental compaction is off or when less than
-    /// `INCREMENTAL_COMMIT_INTERVAL` passed since the last partial commit.
-    fn incremental_jobs_due(&self) -> Vec<Compaction> {
+    /// `INCREMENTAL_COMMIT_INTERVAL` passed since the last incremental commit.
+    fn jobs_due_for_incremental_commit(&self) -> Vec<Compaction> {
         let due = self.enable_incremental_compaction
             && self.last_incremental_commit.is_none_or(|last| {
                 (self.system_clock.now() - last)
@@ -967,13 +982,6 @@ impl CompactorEventHandler {
         }
         self.state()
             .compactions_with_status(&[CompactionStatus::Running])
-            // A running job can commit partial progress only when:
-            // - It is not a drain, because a drain produces no output.
-            // - It has no L0 inputs. L0 inputs leave the manifest only in the
-            //   final commit, which keeps the L0 watermark logic unchanged.
-            // - Its destination is one of its input runs, because partial output
-            //   goes into that run.
-            // - It has a context, which holds the range plan and stored output.
             .filter(|job| {
                 !job.spec().is_drain()
                     && !job.spec().has_l0_sources()
@@ -987,16 +995,19 @@ impl CompactorEventHandler {
     /// Applies the stored progress of `jobs` to the in-memory manifest.
     ///
     /// Returns whether the manifest changed. The caller writes the manifest.
-    fn apply_partial_commits(&mut self, jobs: &[Compaction]) -> Result<bool, SlateDBError> {
+    fn apply_incremental_commits(&mut self, jobs: &[Compaction]) -> Result<bool, SlateDBError> {
         let mut changed = false;
         for job in jobs {
             let progress = IncrementalProgress::from_compaction(job);
-            changed |= self.state_writer.state.apply_incremental_progress(
-                job,
-                &progress,
-                &self.rand,
-                self.system_clock.as_ref(),
-            )?;
+            changed |= self
+                .state_writer
+                .state
+                .apply_incremental_progress_to_manifest(
+                    job,
+                    &progress,
+                    &self.rand,
+                    self.system_clock.as_ref(),
+                )?;
         }
         Ok(changed)
     }
@@ -1004,12 +1015,20 @@ impl CompactorEventHandler {
     /// Returns whether the manifest already holds the final commit of `job`.
     ///
     /// This happens when the coordinator stops after the final manifest write but
-    /// before it records `Completed`. The check applies only to a `Compacted`
-    /// compaction job whose inputs are all sorted runs and whose destination is one
-    /// of those runs.
-    /// All other input runs must be gone, and the destination run must hold exactly
-    /// the output SSTs of the job, in order. The destination run alone proves
-    /// nothing, because it keeps the ID of an input run.
+    /// before it records `Completed`. Then [`Self::apply_final_commits`] marks the
+    /// entry `Completed` without another manifest write.
+    ///
+    /// The check applies only to a `Compacted` compaction job whose inputs are all
+    /// sorted runs and whose destination is one of those runs. All other input runs
+    /// must be gone, and the destination run must hold exactly the output SSTs of the
+    /// job, in order. The destination run alone proves nothing, because it keeps the
+    /// ID of an input run (for example, `[SR:1, SR:2] -> SR:1`).
+    ///
+    /// For other jobs, such as jobs with L0 inputs, this method returns `false`, and
+    /// the caller retries the final commit. If the manifest write happened before the
+    /// stop, the sources are already absent, `validate_compaction` fails, and the entry
+    /// becomes `Failed` even though the compaction succeeded. This is safe, because
+    /// the manifest already holds the result of the compaction.
     fn final_commit_is_applied(&self, job: &Compaction) -> bool {
         let spec = job.spec();
         if job.status() != CompactionStatus::Compacted
@@ -1027,14 +1046,16 @@ impl CompactorEventHandler {
         };
         // A final commit removes the other inputs and leaves only the full output.
         // Checking the views also handles jobs with only one input run.
-        spec.sources().iter().all(|source| {
+        let other_inputs_removed = spec.sources().iter().all(|source| {
             let id = source.unwrap_sorted_run();
             id == destination || tree.compacted.iter().all(|run| run.id != id)
-        }) && output
+        });
+        let output_matches = output
             .sst_views()
             .iter()
             .cloned()
-            .eq(job.output_ssts().into_iter().map(SsTableView::identity))
+            .eq(job.output_ssts().into_iter().map(SsTableView::identity));
+        other_inputs_removed && output_matches
     }
 
     /// Validates a Submitted compaction against the current manifest before starting it.
@@ -1347,7 +1368,7 @@ impl CompactorEventHandler {
                 // A job that already ran can come back as Submitted with its context.
                 // A worker that stops or fails returns the job to Scheduled, and a
                 // coordinator restart moves Scheduled jobs back to Submitted. Keep the
-                // context, so the next worker resumes the job. After partial commits,
+                // context, so the next worker resumes the job. After incremental commits,
                 // the job needs it to find its own output in the destination run.
                 self.state_mut().update_compaction(&compaction.id(), |c| {
                     c.set_status(CompactionStatus::Scheduled)
@@ -6564,13 +6585,20 @@ mod tests {
         let job = seed_incremental_job(&mut fixture).await;
         let before = fixture.manifest_store.read_latest_manifest().await.unwrap();
         fixture.handler.commit_compacted_entries().await.unwrap();
-        let partial = fixture.manifest_store.read_latest_manifest().await.unwrap();
-        assert_eq!(partial.id(), before.id() + 2);
+        let incremental_manifest = fixture.manifest_store.read_latest_manifest().await.unwrap();
+        assert_eq!(incremental_manifest.id(), before.id() + 2);
         assert_eq!(
-            partial.core().checkpoints.last().unwrap().manifest_id,
+            incremental_manifest
+                .core()
+                .checkpoints
+                .last()
+                .unwrap()
+                .manifest_id,
             before.id() + 1
         );
-        assert!(partial.core().tree.compacted[0].sst_views().is_empty());
+        assert!(incremental_manifest.core().tree.compacted[0]
+            .sst_views()
+            .is_empty());
         assert_eq!(
             fixture
                 .handler
@@ -6590,7 +6618,7 @@ mod tests {
                 .await
                 .unwrap()
                 .id(),
-            partial.id()
+            incremental_manifest.id()
         );
         let finished = job
             .clone()
@@ -6602,7 +6630,7 @@ mod tests {
             .insert_compaction_for_test(finished);
         fixture.handler.commit_compacted_entries().await.unwrap();
         let final_manifest = fixture.manifest_store.read_latest_manifest().await.unwrap();
-        assert_eq!(final_manifest.id(), partial.id() + 2);
+        assert_eq!(final_manifest.id(), incremental_manifest.id() + 2);
         assert_eq!(final_manifest.core().tree.compacted.len(), 1);
     }
 
@@ -6948,7 +6976,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mixed_batch_commits_partial_progress_without_an_sst_release() {
+    async fn mixed_batch_commits_incremental_progress_without_an_sst_release() {
         let mut fixture = CompactorEventHandlerTestFixture::new().await;
         let job = seed_incremental_job(&mut fixture).await;
         let mut input = fake_output_sst();

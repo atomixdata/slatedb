@@ -2226,9 +2226,9 @@ mod tests {
             .with_ctx(Some(CompactionContext::new(snapshot, Some(0))));
             let progress = IncrementalProgress::from_compaction(&job);
             progress
-                .apply_to_manifest(
+                .apply_to_manifest_core(
                     &mut core,
-                    &job,
+                    job.spec(),
                     &DbRand::default(),
                     &DefaultSystemClock::new(),
                 )
@@ -2264,7 +2264,7 @@ mod tests {
                 break;
             }
         }
-        let job = resume_job.expect("expected partial progress that releases inputs");
+        let job = resume_job.expect("expected incremental progress that releases inputs");
         for id in released {
             table_store.delete_sst(&id).await.unwrap();
         }

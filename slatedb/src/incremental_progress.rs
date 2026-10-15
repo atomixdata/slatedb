@@ -1,6 +1,6 @@
-//! Builds the manifest views for a partial commit of a running compaction job.
+//! Builds the manifest views for an incremental commit of a running compaction job.
 //!
-//! A partial commit publishes output that a worker fully stored before the job
+//! An incremental commit publishes output that a worker fully stored before the job
 //! finishes. For each subcompaction, the coordinator finds the durable interval, which
 //! is the key range whose output is complete. It removes those keys from the input
 //! views of the job and adds views of the output SSTs to the destination run.
@@ -14,7 +14,7 @@ use slatedb_common::clock::SystemClock;
 use slatedb_common::DbRand;
 
 use crate::bytes_range::BytesRange;
-use crate::compactor_state::{Compaction, SourceId};
+use crate::compactor_state::{Compaction, CompactionSpec, SourceId};
 use crate::db_state::{SortedRun, SsTableId, SsTableView};
 use crate::error::SlateDBError;
 use crate::manifest::ManifestCore;
@@ -31,7 +31,7 @@ pub(crate) struct IncrementalProgress {
     /// that key.
     output: Vec<SsTableView>,
     /// IDs of all recorded output SSTs, including SSTs left out of `output`.
-    /// `apply_to_manifest` uses them to remove output views of earlier commits.
+    /// `apply_to_manifest_core` uses them to remove output views of earlier commits.
     output_ids: HashSet<SsTableId>,
 }
 
@@ -102,7 +102,7 @@ impl IncrementalProgress {
         }
     }
 
-    /// Rebuilds the input runs of `job` in `core` from this progress.
+    /// Rebuilds the input runs of the job with `spec` in `core` from this progress.
     ///
     /// The result depends only on the current input views and this progress, so a
     /// commit with more progress replaces the views of an earlier commit, and the
@@ -116,21 +116,27 @@ impl IncrementalProgress {
     /// Input runs stay in the manifest, even when empty, so recovery can still find
     /// them by ID. Updates only `core`. The caller writes the manifest.
     ///
-    /// Returns `InvalidCompaction` if `job` is a drain, has no inputs or L0 inputs, or
-    /// has a destination outside its inputs, or if its segment or an input run is
-    /// missing from `core`.
-    pub(crate) fn apply_to_manifest(
+    /// Panics if `spec` has L0 inputs or if its destination is not one of its input
+    /// runs. The coordinator passes only jobs that can commit incremental progress.
+    ///
+    /// Returns `InvalidCompaction` if the segment or an input run of `spec` is missing
+    /// from `core`. This can happen when another job removed an input run that both
+    /// jobs share.
+    pub(crate) fn apply_to_manifest_core(
         &self,
         core: &mut ManifestCore,
-        job: &Compaction,
+        spec: &CompactionSpec,
         rand: &DbRand,
         clock: &dyn SystemClock,
     ) -> Result<(), SlateDBError> {
-        let spec = job.spec();
-        if spec.is_drain() || spec.has_l0_sources() || spec.sources().is_empty() {
-            return Err(SlateDBError::InvalidCompaction);
-        }
-        let destination = spec.destination().ok_or(SlateDBError::InvalidCompaction)?;
+        assert!(
+            !spec.has_l0_sources() && spec.reuses_input_run(),
+            "an incremental commit needs a job with only sorted-run inputs and an input \
+             run as destination"
+        );
+        let destination = spec
+            .destination()
+            .expect("reuses_input_run requires a destination");
         let sources: HashSet<u32> = spec
             .sources()
             .iter()
@@ -143,9 +149,6 @@ impl IncrementalProgress {
             .iter()
             .all(|id| tree.compacted.iter().any(|sr| sr.id == *id))
         {
-            return Err(SlateDBError::InvalidCompaction);
-        }
-        if !sources.contains(&destination) {
             return Err(SlateDBError::InvalidCompaction);
         }
         // Rebuild each input run of the job. Other runs stay unchanged.
@@ -186,7 +189,7 @@ impl IncrementalProgress {
             }
             // The destination run also gets the output views, sorted by start key.
             if run.id == destination {
-                views.extend(self.output.clone());
+                views.extend(self.output.iter().cloned());
                 // Stable sorting preserves version order when output SSTs start at the same key.
                 views.sort_by(|left, right| {
                     left.compacted_effective_range()
@@ -201,7 +204,7 @@ impl IncrementalProgress {
 }
 
 /// A durable interval `[start, end)`: the key range of one subcompaction whose output
-/// is fully stored, so a partial commit can publish it.
+/// is fully stored, so an incremental commit can publish it.
 ///
 /// A `Completed` subcompaction has its whole planned range as its durable interval.
 /// An unfinished subcompaction has the prefix of its planned range that ends before
@@ -337,9 +340,9 @@ mod tests {
             output: vec![output],
         };
         progress
-            .apply_to_manifest(
+            .apply_to_manifest_core(
                 &mut core,
-                &job,
+                job.spec(),
                 &DbRand::default(),
                 &DefaultSystemClock::new(),
             )
@@ -367,9 +370,9 @@ mod tests {
         );
         let before = core.clone();
         progress
-            .apply_to_manifest(
+            .apply_to_manifest_core(
                 &mut core,
-                &job,
+                job.spec(),
                 &DbRand::default(),
                 &DefaultSystemClock::new(),
             )
@@ -378,7 +381,7 @@ mod tests {
     }
 
     #[test]
-    fn clone_projection_preserves_partial_input_gaps_and_boundary_versions() {
+    fn clone_projection_preserves_incremental_input_gaps_and_boundary_versions() {
         use crate::manifest::{Manifest, ProjectionConfig};
         let original = view(b"a", b"z");
         let left = original.with_visible_range(BytesRange::from_slice(..b"g".as_slice()));
@@ -504,9 +507,9 @@ mod tests {
         )));
         let progress = IncrementalProgress::from_compaction(&job);
         progress
-            .apply_to_manifest(
+            .apply_to_manifest_core(
                 &mut core,
-                &job,
+                job.spec(),
                 &DbRand::default(),
                 &DefaultSystemClock::new(),
             )
@@ -531,9 +534,9 @@ mod tests {
         job.set_ctx(Some(ctx));
         let completed = IncrementalProgress::from_compaction(&job);
         completed
-            .apply_to_manifest(
+            .apply_to_manifest_core(
                 &mut core,
-                &job,
+                job.spec(),
                 &DbRand::default(),
                 &DefaultSystemClock::new(),
             )
@@ -550,9 +553,9 @@ mod tests {
         );
         let before = core.clone();
         completed
-            .apply_to_manifest(
+            .apply_to_manifest_core(
                 &mut core,
-                &job,
+                job.spec(),
                 &DbRand::default(),
                 &DefaultSystemClock::new(),
             )
