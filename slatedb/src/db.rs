@@ -2135,12 +2135,15 @@ impl WriteHandle {
 
     /// Waits until this write has been durably persisted.
     ///
-    /// If the database closes before the write becomes durable, this returns a
-    /// closed error carrying the database's [`CloseReason`].
+    /// If the database closes before durability is confirmed, this returns a
+    /// closed error carrying the database's [`CloseReason`]. The outcome is
+    /// then unknown: the write can still be stored and appear after the
+    /// database reopens.
     ///
     /// # Errors
     ///
-    /// Returns a closed error if the database closes first.
+    /// Returns a closed error if the database closes before durability is
+    /// confirmed.
     pub async fn await_durable(&self) -> Result<(), crate::Error> {
         (self.durability_waiter)(self.seq).await
     }
@@ -6801,7 +6804,7 @@ mod tests {
         assert_eq!(result.kind(), crate::ErrorKind::Closed(CloseReason::Panic));
         assert!(result
             .to_string()
-            .contains("background task panicked. name=`wal_writer`"));
+            .contains("background task panicked. name=`wal_uploader`"));
 
         // Close, which flushes the latest manifest to the object store
         // TODO: it might make sense to return an error if there're unflushed wals in memory
