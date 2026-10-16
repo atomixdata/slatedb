@@ -224,6 +224,7 @@ impl GarbageCollector {
     /// * `options` - Configuration options for the garbage collector.
     /// * `stat_registry` - Registry for tracking garbage collection metrics.
     /// * `system_clock` - Clock implementation for time-based decisions.
+    /// * `writer_epoch` - The epoch of the writer this collector runs in, if any.
     ///
     /// # Returns
     ///
@@ -239,6 +240,7 @@ impl GarbageCollector {
         system_clock: Arc<dyn SystemClock>,
         gc_filter: Option<Arc<dyn GcFilter>>,
         wal_gc: Option<Arc<dyn WalGc>>,
+        writer_epoch: Option<u64>,
     ) -> Self {
         let stats = Arc::new(GcStats::new(recorder));
         // The standalone GC lifecycle does not surface a closed result yet, so the
@@ -258,7 +260,9 @@ impl GarbageCollector {
                         gc_filter.clone(),
                         system_clock.clone(),
                     )
-                    .with_collect_by_id(options.wal_collect_by_id),
+                    // GC by ID relies on the writer epoch check, so a
+                    // standalone collector lists.
+                    .with_collect_by_id(options.wal_collect_by_id && writer_epoch.is_some()),
                 )
             });
             WalGcTask::new(
@@ -267,6 +271,7 @@ impl GarbageCollector {
                 WalGcMode::Regular.resource(),
                 wal_options.min_age,
                 wal_options.dry_run,
+                writer_epoch,
             )
         });
         let wal_fence_gc_task = options.wal_fence_options.map(|wal_fence_options| {
@@ -283,6 +288,7 @@ impl GarbageCollector {
                 WalGcMode::Fence.resource(),
                 wal_fence_options.min_age,
                 wal_fence_options.dry_run,
+                writer_epoch,
             )
         });
         let compacted_gc_task = options.compacted_options.map(|compacted_options| {
@@ -1222,6 +1228,7 @@ mod tests {
             Arc::new(DefaultSystemClock::default()),
             None,
             None,
+            None,
         );
 
         gc.run_gc_once().await;
@@ -1296,6 +1303,7 @@ mod tests {
             Arc::new(DefaultSystemClock::default()),
             None,
             None,
+            None,
         );
 
         gc.run_gc_once().await;
@@ -1363,6 +1371,7 @@ mod tests {
             gc_opts,
             &MetricsRecorderHelper::noop(),
             Arc::new(DefaultSystemClock::default()),
+            None,
             None,
             None,
         );
@@ -1447,6 +1456,7 @@ mod tests {
             gc_opts,
             &MetricsRecorderHelper::noop(),
             Arc::new(DefaultSystemClock::default()),
+            None,
             None,
             None,
         );
@@ -1937,6 +1947,7 @@ mod tests {
             Arc::new(DefaultSystemClock::default()),
             None,
             None,
+            None,
         );
 
         gc.run_gc_once().await;
@@ -2018,6 +2029,7 @@ mod tests {
             Arc::new(DefaultSystemClock::default()),
             None,
             None,
+            None,
         );
 
         // Send a WAL GC message. Correct behavior: only WAL GC runs.
@@ -2094,6 +2106,7 @@ mod tests {
             Arc::new(DefaultSystemClock::default()),
             None,
             None,
+            None,
         );
         gc.run_gc_once().await;
 
@@ -2146,6 +2159,7 @@ mod tests {
             gc_opts,
             &recorder,
             Arc::new(DefaultSystemClock::default()),
+            None,
             None,
             None,
         );
@@ -2204,6 +2218,7 @@ mod tests {
             gc_opts,
             &recorder,
             Arc::new(DefaultSystemClock::default()),
+            None,
             None,
             None,
         );
@@ -2542,6 +2557,7 @@ mod tests {
                 allowed_locations: HashSet::new(),
             })),
             None,
+            None,
         );
 
         // Run every directory GC task with candidates present for each task type.
@@ -2646,6 +2662,7 @@ mod tests {
             Some(Arc::new(LocationGcFilter {
                 allowed_locations: HashSet::from([path_resolver.wal_sst_path(&allowed_wal_id)]),
             })),
+            None,
             None,
         );
 
@@ -2777,6 +2794,7 @@ mod tests {
             gc_opts,
             &recorder,
             Arc::new(DefaultSystemClock::default()),
+            None,
             None,
             None,
         );

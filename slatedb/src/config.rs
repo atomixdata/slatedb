@@ -1710,10 +1710,12 @@ pub struct GarbageCollectorOptions {
     /// with a remote WAL on an object store that lists about one file per
     /// millisecond.
     ///
-    /// GC by ID cannot see object sizes, so it also deletes zero-byte WAL fence
-    /// objects that a later writer wrote below the replay boundary. It keeps
-    /// the fences that its first listing found. Enable it only when one writer
-    /// at a time uses the database. See `wal_fence_options` for the risk.
+    /// GC by ID cannot see object sizes, so it relies on two things to keep
+    /// WAL fences. It keeps the fences that its first listing found, and it
+    /// stops once the latest manifest belongs to a newer writer, whose fences
+    /// all lie above the last replay boundary this writer published. Only a
+    /// collector that runs in a writer has an epoch to check, so a standalone
+    /// collector ignores this option and lists.
     #[serde(default)]
     pub wal_collect_by_id: bool,
 }

@@ -880,6 +880,7 @@ impl<P: Into<Path>> DbBuilder<P> {
                     manifest_store.clone(),
                     compactions_store.clone(),
                     gc_object_store,
+                    manifest.local_epoch(),
                 );
             // Garbage collector only uses tickers, so pass in a dummy rx channel
             let (_, rx) = async_channel::unbounded();
@@ -1135,6 +1136,7 @@ impl<P: Into<Path>> GarbageCollectorBuilder<P> {
         manifest_store: Arc<ManifestStore>,
         compactions_store: Arc<CompactionsStore>,
         object_store: Arc<dyn ObjectStore>,
+        writer_epoch: u64,
     ) -> GarbageCollector {
         let recorder = MetricsRecorderHelper::new(
             self.metrics_recorder,
@@ -1151,6 +1153,7 @@ impl<P: Into<Path>> GarbageCollectorBuilder<P> {
             self.system_clock,
             self.gc_filter,
             self.wal_gc,
+            Some(writer_epoch),
         )
     }
 
@@ -1214,6 +1217,7 @@ impl<P: Into<Path>> GarbageCollectorBuilder<P> {
             self.system_clock,
             self.gc_filter,
             self.wal_gc,
+            None,
         )
     }
 }

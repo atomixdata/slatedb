@@ -6,6 +6,7 @@ use crate::{
     wal::{WalFileRange, WalGc},
 };
 use chrono::{DateTime, Utc};
+use log::warn;
 use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::sync::Arc;
@@ -18,6 +19,8 @@ pub(crate) struct WalGcTask {
     resource: &'static str,
     min_age: Duration,
     dry_run: bool,
+    /// The epoch of the writer this collector runs in, if any.
+    writer_epoch: Option<u64>,
 }
 
 impl std::fmt::Debug for WalGcTask {
@@ -35,6 +38,7 @@ impl WalGcTask {
         resource: &'static str,
         min_age: Duration,
         dry_run: bool,
+        writer_epoch: Option<u64>,
     ) -> Self {
         Self {
             manifest_store,
@@ -42,6 +46,7 @@ impl WalGcTask {
             resource,
             min_age,
             dry_run,
+            writer_epoch,
         }
     }
 
@@ -76,6 +81,19 @@ impl GcTask for WalGcTask {
     /// delegate collection to the configured WAL implementation.
     async fn collect(&self, _utc_now: DateTime<Utc>) -> Result<(), SlateDBError> {
         let latest_manifest = self.manifest_store.read_latest_manifest().await?;
+        // A newer writer fences the WAL IDs above the last replay boundary this
+        // writer published, then moves the boundary past them. Collect only up
+        // to boundaries this writer published, so those fences stay.
+        if let Some(writer_epoch) = self.writer_epoch {
+            let latest_epoch = latest_manifest.manifest.writer_epoch;
+            if latest_epoch != writer_epoch {
+                warn!(
+                    "skipping {} GC: writer epoch {} was fenced by epoch {}",
+                    self.resource, writer_epoch, latest_epoch
+                );
+                return Ok(());
+            }
+        }
         let active_manifests = self
             .manifest_store
             .read_referenced_manifests(latest_manifest.id, &latest_manifest.manifest)
@@ -97,14 +115,21 @@ impl GcTask for WalGcTask {
 mod tests {
     use super::*;
     use crate::checkpoint::Checkpoint;
+    use crate::format::sst::SsTableFormat;
+    use crate::garbage_collector::stats::GcStats;
     use crate::manifest::store::StoredManifest;
     use crate::manifest::ManifestCore;
+    use crate::tablestore::TableStoreKind;
+    use crate::wal::slatedb::gc::{SlateDbWalGc, WalGcMode};
+    use crate::wal::slatedb::store::WalTableStore;
     use crate::wal::WalError;
+    use crate::RowEntry;
     use async_trait::async_trait;
     use object_store::memory::InMemory;
     use object_store::path::Path;
     use object_store::ObjectStore;
-    use slatedb_common::clock::DefaultSystemClock;
+    use slatedb_common::clock::{DefaultSystemClock, MockSystemClock};
+    use slatedb_common::metrics::MetricsRecorderHelper;
     use std::sync::Mutex;
     use std::time::Duration;
     use uuid::Uuid;
@@ -190,7 +215,14 @@ mod tests {
         stored_manifest.update(dirty).await.unwrap();
 
         let wal_gc = Arc::new(RecordingWalGc::default());
-        let task = WalGcTask::new(manifest_store, wal_gc.clone(), "WAL", Duration::ZERO, false);
+        let task = WalGcTask::new(
+            manifest_store,
+            wal_gc.clone(),
+            "WAL",
+            Duration::ZERO,
+            false,
+            None,
+        );
 
         task.collect(Utc::now()).await.unwrap();
 
@@ -201,5 +233,102 @@ mod tests {
                 WalFileRange(Bound::Included(5), Bound::Unbounded),
             ]]
         );
+    }
+
+    async fn write_wal(wal_store: &WalTableStore, wal_id: u64) -> Result<(), SlateDBError> {
+        let mut sst = wal_store.table_builder();
+        sst.add(RowEntry::new_value(b"key", b"value", wal_id))
+            .await
+            .unwrap();
+        let sst = sst.build().await.unwrap();
+        wal_store.write_sst(wal_id.into(), &sst).await.map(|_| ())
+    }
+
+    async fn wal_ids(wal_store: &WalTableStore) -> Vec<u64> {
+        wal_store
+            .list_wal_ssts(..)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|wal| wal.id.value())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_collect_keeps_newer_writer_fences() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("/test/wal-gc-takeover");
+        let manifest_store = Arc::new(ManifestStore::new(&path, object_store.clone()));
+        let wal_store = Arc::new(WalTableStore::new(
+            object_store,
+            SsTableFormat::default(),
+            path,
+            TableStoreKind::GC,
+        ));
+
+        // Writer 1 wrote WALs 1-5 and flushed through 3.
+        for wal_id in 1..=5 {
+            write_wal(&wal_store, wal_id).await.unwrap();
+        }
+        let mut core = ManifestCore::new();
+        core.replay_after_wal_id = 3;
+        let mut stored_manifest = StoredManifest::create_new_db(
+            manifest_store.clone(),
+            core,
+            Arc::new(DefaultSystemClock::new()),
+        )
+        .await
+        .unwrap();
+        let mut dirty = stored_manifest.prepare_dirty().unwrap();
+        dirty.value.writer_epoch = 1;
+        stored_manifest.update(dirty).await.unwrap();
+
+        let clock = Arc::new(MockSystemClock::new());
+        clock.set(Utc::now().timestamp_millis() + 60_000);
+        let wal_gc = Arc::new(
+            SlateDbWalGc::new(
+                wal_store.clone(),
+                Arc::new(GcStats::new(&MetricsRecorderHelper::noop())),
+                WalGcMode::Regular,
+                None,
+                clock,
+            )
+            .with_collect_by_id(true),
+        );
+        let task = WalGcTask::new(
+            manifest_store,
+            wal_gc,
+            "WAL",
+            Duration::ZERO,
+            false,
+            Some(1),
+        );
+        task.collect(Utc::now()).await.unwrap();
+        assert_eq!(wal_ids(&wal_store).await, vec![3, 4, 5]);
+
+        // Writer 2 claims epoch 2, fences 6 and 7, writes 8 and 9 and flushes
+        // through 9, while writer 1 is still running.
+        let mut dirty = stored_manifest.prepare_dirty().unwrap();
+        dirty.value.writer_epoch = 2;
+        stored_manifest.update(dirty).await.unwrap();
+        for wal_id in [6, 7] {
+            wal_store.write_wal_fence(wal_id.into()).await.unwrap();
+        }
+        for wal_id in [8, 9] {
+            write_wal(&wal_store, wal_id).await.unwrap();
+        }
+        let mut dirty = stored_manifest.prepare_dirty().unwrap();
+        dirty.value.core.replay_after_wal_id = 9;
+        stored_manifest.update(dirty).await.unwrap();
+
+        // Writer 1's GC must not collect up to writer 2's boundary.
+        task.collect(Utc::now()).await.unwrap();
+        assert_eq!(wal_ids(&wal_store).await, vec![3, 4, 5, 6, 7, 8, 9]);
+
+        // So writer 1's delayed upload of WAL 6 still finds the fence.
+        assert!(matches!(
+            write_wal(&wal_store, 6).await,
+            Err(SlateDBError::Fenced)
+        ));
     }
 }
