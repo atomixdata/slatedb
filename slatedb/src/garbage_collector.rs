@@ -113,6 +113,13 @@ pub struct GarbageCollector {
 
 #[async_trait]
 impl MessageHandler<GcMessage> for GarbageCollector {
+    // Deletes are idempotent and a pass keeps no state that must be persisted,
+    // so shutdown can stop one midway. Paced WAL deletes make a pass last tens
+    // of seconds, which would otherwise hold up closing the database.
+    fn cancel_on_shutdown(&self) -> bool {
+        true
+    }
+
     fn tickers(&mut self) -> Vec<MessageTickerDef<GcMessage>> {
         let mut tickers: Vec<MessageTickerDef<GcMessage>> = Vec::new();
 
