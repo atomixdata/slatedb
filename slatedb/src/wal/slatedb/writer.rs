@@ -905,6 +905,7 @@ mod tests {
     use crate::format::sst::SsTableFormat;
     use crate::object_store_tag::TableStoreKind;
     use crate::oracle::DbOracle;
+    use crate::test_utils::GatedObjectStore;
     use crate::types::{RowEntry, ValueDeletable};
     use crate::wal::slatedb::sst_iterator::{WalSstIterator, WalSstIteratorOptions};
     use bytes::Bytes;
@@ -1041,36 +1042,40 @@ mod tests {
         assert!(buffer.size() > 100_000);
     }
 
-    async fn setup_wal_buffer() -> (
+    type TestWal = (
         SlateDbWalWriter,
         Arc<WalTableStore>,
         Arc<DbStatusManager>,
         Arc<DefaultMetricsRecorder>,
-    ) {
+    );
+
+    async fn setup_wal_buffer() -> TestWal {
         setup_wal_buffer_with_flush_interval(Duration::from_millis(10)).await
     }
 
-    async fn setup_wal_buffer_with_flush_interval(
-        flush_interval: Duration,
-    ) -> (
-        SlateDbWalWriter,
-        Arc<WalTableStore>,
-        Arc<DbStatusManager>,
-        Arc<DefaultMetricsRecorder>,
-    ) {
+    async fn setup_wal_buffer_with_flush_interval(flush_interval: Duration) -> TestWal {
         setup_wal_buffer_with_args(flush_interval, Arc::new(|_status| {})).await
     }
 
     async fn setup_wal_buffer_with_args(
         flush_interval: Duration,
         listener: wal::WalStatusListener,
-    ) -> (
-        SlateDbWalWriter,
-        Arc<WalTableStore>,
-        Arc<DbStatusManager>,
-        Arc<DefaultMetricsRecorder>,
-    ) {
-        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    ) -> TestWal {
+        setup_wal_buffer_with_max_inflight_uploads(
+            Some(flush_interval),
+            listener,
+            Arc::new(InMemory::new()),
+            1,
+        )
+        .await
+    }
+
+    async fn setup_wal_buffer_with_max_inflight_uploads(
+        flush_interval: Option<Duration>,
+        listener: wal::WalStatusListener,
+        object_store: Arc<dyn ObjectStore>,
+        max_inflight_uploads: usize,
+    ) -> TestWal {
         let table_store = Arc::new(WalTableStore::new(
             object_store,
             SsTableFormat::default(),
@@ -1092,9 +1097,9 @@ mod tests {
             0, // recent_flushed_wal_id
             table_store.clone(),
             1000,                 // max_wal_bytes_size
-            1,                    // max_inflight_uploads
+            max_inflight_uploads, // max_inflight_uploads
             4096,                 // max_wal_flushes_before_l0_flush
-            Some(flush_interval), // max_flush_interval
+            flush_interval,       // max_flush_interval
             task_executor.clone(),
         )
         .await
@@ -1270,7 +1275,7 @@ mod tests {
 
         let actual_flushes = lookup_metric(&recorder, stats::WAL_BUFFER_FLUSHES).unwrap();
 
-        // With the flush_requested flag, the number of size-triggered requests
+        // With epoch deduplication, the number of size-triggered requests
         // should be bounded by the number of WALs, not by the number of writes.
         // Before the fix this was ~41 requests for 2 flushes (with 100 writes).
         assert!(
@@ -1284,6 +1289,509 @@ mod tests {
             size_triggered_requests,
             actual_flushes,
         );
+    }
+
+    async fn wait_for_uploads(store: &GatedObjectStore, count: usize) {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            store.put_opts_gate.wait_for_arrivals(count),
+        )
+        .await
+        .expect("upload did not reach the object store");
+    }
+
+    fn setup_coordinator(
+        max_inflight_uploads: usize,
+    ) -> (
+        WalFlushHandler,
+        async_channel::Receiver<WalUploadWork>,
+        Arc<DefaultMetricsRecorder>,
+    ) {
+        let recorder = Arc::new(DefaultMetricsRecorder::new());
+        let helper = MetricsRecorderHelper::new(recorder.clone(), MetricLevel::default());
+        let status = DbStatusManager::new(0);
+        let (flush_tx, _) = SafeSender::unbounded_channel(status.result_reader());
+        let (upload_tx, upload_rx) = SafeSender::unbounded_channel(status.result_reader());
+        let inner = SlateDbWalWriterInner {
+            current_wal: WalBuffer::new(),
+            immutable_wals: VecDeque::new(),
+            next_wal_id: 1,
+            flush_epoch: 1,
+            last_flushed_wal_id: 0,
+            last_flushed_seq: None,
+            flush_task_exited_reason: None,
+            flush_tx,
+        };
+        let table_store = Arc::new(WalTableStore::new(
+            Arc::new(InMemory::new()),
+            SsTableFormat::default(),
+            Path::from("/root"),
+            TableStoreKind::Main,
+        ));
+        (
+            WalFlushHandler {
+                max_flush_interval: None,
+                inner: Arc::new(parking_lot::RwLock::new(inner)),
+                table_store,
+                stats: Arc::new(WalBufferStats::new(&helper)),
+                listener: None,
+                upload_tx,
+                max_inflight_uploads,
+                unpublished_uploads: BTreeSet::new(),
+                flush_requested: false,
+                queued_flushes: Vec::new(),
+                ongoing_flushes: VecDeque::new(),
+            },
+            upload_rx,
+            recorder,
+        )
+    }
+
+    async fn request_coordinator_flush(
+        handler: &mut WalFlushHandler,
+        seq: u64,
+    ) -> oneshot::Receiver<Result<(), WalError>> {
+        // Keep each batch intact, including batches with more than one row.
+        handler
+            .inner
+            .write()
+            .append(&[
+                make_entry("a", "1", seq, None),
+                make_entry("b", "2", seq, None),
+            ])
+            .unwrap();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        handler
+            .handle(WalFlushWork::RequestFlush {
+                reply_tx: Some(reply_tx),
+            })
+            .await
+            .unwrap();
+        reply_rx
+    }
+
+    async fn request_empty_coordinator_flush(
+        handler: &mut WalFlushHandler,
+    ) -> oneshot::Receiver<Result<(), WalError>> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        handler
+            .handle(WalFlushWork::RequestFlush {
+                reply_tx: Some(reply_tx),
+            })
+            .await
+            .unwrap();
+        reply_rx
+    }
+
+    async fn complete_coordinator_upload(handler: &mut WalFlushHandler, wal_id: u64) {
+        handler
+            .handle(WalFlushWork::UploadComplete {
+                wal_id,
+                result: Ok(()),
+            })
+            .await
+            .unwrap();
+    }
+
+    fn assert_no_reply(reply: &mut oneshot::Receiver<Result<(), WalError>>) {
+        assert!(matches!(
+            reply.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_publishes_uploads_in_wal_order() {
+        let (mut handler, uploads, recorder) = setup_coordinator(3);
+        let (listener, events) = recording_listener();
+        handler.listener = Some(listener);
+        let first_reply = request_coordinator_flush(&mut handler, 1).await;
+        let mut second_reply = request_coordinator_flush(&mut handler, 2).await;
+        let mut third_reply = request_coordinator_flush(&mut handler, 3).await;
+        let first = uploads.recv().await.unwrap();
+        let second = uploads.recv().await.unwrap();
+        let third = uploads.recv().await.unwrap();
+        assert_eq!(
+            lookup_metric(&recorder, stats::WAL_INFLIGHT_UPLOADS),
+            Some(3)
+        );
+
+        // A later upload stays unpublished until every earlier upload succeeds.
+        complete_coordinator_upload(&mut handler, third.wal_id).await;
+        assert_eq!(handler.inner.read().last_flushed_wal_id, 0);
+        assert!(events.lock().unwrap().is_empty());
+        assert_no_reply(&mut third_reply);
+
+        // Publication covers the ready prefix only.
+        complete_coordinator_upload(&mut handler, first.wal_id).await;
+        assert_eq!(handler.inner.read().last_flushed_wal_id, 1);
+        first_reply.await.unwrap().unwrap();
+        assert_no_reply(&mut second_reply);
+        assert_no_reply(&mut third_reply);
+
+        // The published file frees a slot. Dropping the reply future does not
+        // cancel the upload.
+        drop(request_coordinator_flush(&mut handler, 4).await);
+        let fourth = uploads.recv().await.unwrap();
+        assert_eq!(fourth.wal_id, 4);
+
+        // Files 2, 3, and 4 use every slot, so the next request waits.
+        let fifth_reply = request_coordinator_flush(&mut handler, 5).await;
+        assert!(uploads.try_recv().is_err());
+        assert_eq!(
+            lookup_metric(&recorder, stats::WAL_INFLIGHT_UPLOADS_FULL),
+            Some(1)
+        );
+
+        // Publishing files 2 and 3 frees slots, so the waiting request starts.
+        complete_coordinator_upload(&mut handler, second.wal_id).await;
+        second_reply.await.unwrap().unwrap();
+        third_reply.await.unwrap().unwrap();
+        assert_eq!(handler.inner.read().last_flushed_wal_id, 3);
+        let fifth = uploads.recv().await.unwrap();
+        assert_eq!(fifth.wal_id, 5);
+        assert_eq!(fifth.wal.len(), 2);
+
+        complete_coordinator_upload(&mut handler, fourth.wal_id).await;
+        complete_coordinator_upload(&mut handler, fifth.wal_id).await;
+        fifth_reply.await.unwrap().unwrap();
+        let progress: Vec<_> = events
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|event| {
+                let WalEvent::WalFlushed(status) = event else {
+                    panic!("unexpected event");
+                };
+                (status.last_flushed_wal_id, status.last_flushed_seq)
+            })
+            .collect();
+        assert_eq!(
+            progress,
+            (1..=5).map(|id| (id, Some(id))).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            lookup_metric(&recorder, stats::WAL_INFLIGHT_UPLOADS),
+            Some(0)
+        );
+        assert_eq!(
+            handler.inner.read().estimated_bytes(&handler.table_store),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn test_empty_flush_waits_for_pending_upload_or_replies_at_once() {
+        let (mut handler, uploads, _) = setup_coordinator(2);
+        let first_reply = request_coordinator_flush(&mut handler, 1).await;
+        let work = uploads.recv().await.unwrap();
+
+        // An empty request waits for the pending upload and does not resend it.
+        let mut waiting_reply = request_empty_coordinator_flush(&mut handler).await;
+        assert!(uploads.try_recv().is_err());
+        assert_eq!(handler.inner.read().next_wal_id, 2);
+        assert_no_reply(&mut waiting_reply);
+        complete_coordinator_upload(&mut handler, work.wal_id).await;
+        first_reply.await.unwrap().unwrap();
+        waiting_reply.await.unwrap().unwrap();
+
+        // With everything published, an empty request gets its reply at once.
+        let mut idle_reply = request_empty_coordinator_flush(&mut handler).await;
+        assert!(matches!(idle_reply.try_recv(), Ok(Ok(()))));
+        assert!(uploads.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn test_flush_requests_coalesce_during_upload() {
+        let store = Arc::new(GatedObjectStore::new(Arc::new(InMemory::new())));
+        store.put_opts_gate.close();
+        let (mut writer, _, _, _) = setup_wal_buffer_with_max_inflight_uploads(
+            Some(Duration::MAX),
+            Arc::new(|_| {}),
+            store.clone(),
+            1,
+        )
+        .await;
+        writer
+            .append(&[make_entry("a", "1", 1, None)])
+            .await
+            .unwrap();
+        let mut first = writer.flush().await.unwrap();
+        wait_for_uploads(&store, 1).await;
+
+        writer
+            .append(&[make_entry("b", "2", 2, None)])
+            .await
+            .unwrap();
+        writer.send_flush_request(None).unwrap();
+        let mut second = writer.flush().await.unwrap();
+        writer
+            .append(&[make_entry("c", "3", 3, None)])
+            .await
+            .unwrap();
+        let mut third = writer.flush().await.unwrap();
+        assert_eq!(store.put_opts_gate.arrivals(), 1);
+        assert!(first.as_mut().now_or_never().is_none());
+        assert!(second.as_mut().now_or_never().is_none());
+        assert!(third.as_mut().now_or_never().is_none());
+
+        store.put_opts_gate.admit(1);
+        tokio::time::timeout(Duration::from_secs(5), first)
+            .await
+            .unwrap()
+            .unwrap();
+        wait_for_uploads(&store, 2).await;
+        assert_eq!(writer.status().unwrap().last_flushed_seq, Some(1));
+        {
+            let inner = writer.inner.read();
+            assert_eq!(inner.immutable_wals.len(), 1);
+            assert_eq!(inner.immutable_wals.front().unwrap().1.last_seq(), Some(3));
+            assert_eq!(inner.next_wal_id, 3);
+        }
+        assert!(second.as_mut().now_or_never().is_none());
+        assert!(third.as_mut().now_or_never().is_none());
+
+        writer
+            .append(&[make_entry("d", "4", 4, None)])
+            .await
+            .unwrap();
+        store.put_opts_gate.admit(1);
+        tokio::time::timeout(Duration::from_secs(5), second)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), third)
+            .await
+            .unwrap()
+            .unwrap();
+        let status = writer.status().unwrap();
+        assert_eq!(status.last_flushed_seq, Some(3));
+        assert_eq!(status.buffered_wal_entries_count, 1);
+        store.put_opts_gate.release();
+        writer.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_size_flushes_progress_while_upload_slots_are_full() {
+        let store = Arc::new(GatedObjectStore::new(Arc::new(InMemory::new())));
+        store.put_opts_gate.close();
+        let (mut writer, _, status, recorder) =
+            setup_wal_buffer_with_max_inflight_uploads(None, Arc::new(|_| {}), store.clone(), 2)
+                .await;
+        let value = "v".repeat(writer.max_wal_bytes_size);
+        for seq in 1..=2 {
+            writer
+                .append(&[make_entry("key", &value, seq, None)])
+                .await
+                .unwrap();
+            wait_for_uploads(&store, seq as usize).await;
+        }
+        for seq in 3..=20 {
+            writer
+                .append(&[make_entry("key", &value, seq, None)])
+                .await
+                .unwrap();
+        }
+        // One size request per frozen buffer, plus one deferred request for the
+        // current buffer.
+        assert_eq!(
+            lookup_metric(&recorder, stats::WAL_BUFFER_FLUSH_REQUESTS).unwrap(),
+            3
+        );
+        assert_eq!(store.put_opts_gate.arrivals(), 2);
+        store.put_opts_gate.release();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            status
+                .subscribe()
+                .wait_for(|status| status.durable_seq >= 20)
+                .await
+                .unwrap();
+        })
+        .await
+        .unwrap();
+        assert_eq!(writer.status().unwrap().last_flushed_seq, Some(20));
+        assert_eq!(
+            lookup_metric(&recorder, stats::WAL_BUFFER_FLUSHES).unwrap(),
+            3
+        );
+        writer.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_failed_upload_blocks_later_success_and_fails_every_request() {
+        let (mut handler, uploads, _) = setup_coordinator(2);
+        let published = request_coordinator_flush(&mut handler, 1).await;
+        let work = uploads.recv().await.unwrap();
+        complete_coordinator_upload(&mut handler, work.wal_id).await;
+        published.await.unwrap().unwrap();
+        let second = request_coordinator_flush(&mut handler, 2).await;
+        let third = request_coordinator_flush(&mut handler, 3).await;
+        let queued = request_coordinator_flush(&mut handler, 4).await;
+        let second_work = uploads.recv().await.unwrap();
+        let third_work = uploads.recv().await.unwrap();
+        complete_coordinator_upload(&mut handler, third_work.wal_id).await;
+        let error = handler
+            .handle(WalFlushWork::UploadComplete {
+                wal_id: second_work.wal_id,
+                result: Err(SlateDBError::Fenced),
+            })
+            .await
+            .unwrap_err();
+        let (reply_tx, incoming) = oneshot::channel();
+        handler
+            .cleanup(
+                Box::pin(futures::stream::iter([WalFlushWork::RequestFlush {
+                    reply_tx: Some(reply_tx),
+                }])),
+                Err(error),
+            )
+            .await
+            .unwrap();
+        for reply in [second, third, queued, incoming] {
+            assert!(matches!(reply.await.unwrap(), Err(WalError::Fenced)));
+        }
+        let inner = handler.inner.read();
+        assert_eq!(inner.last_flushed_wal_id, 1);
+        assert_eq!(inner.last_flushed_seq, Some(1));
+        assert!(uploads.try_recv().is_err());
+    }
+
+    async fn assert_worker_failure(panic: bool) {
+        let store = Arc::new(GatedObjectStore::new(Arc::new(InMemory::new())));
+        let (mut writer, _, _, _) =
+            setup_wal_buffer_with_max_inflight_uploads(None, Arc::new(|_| {}), store.clone(), 2)
+                .await;
+        writer
+            .append(&[make_entry("a", "1", 1, None)])
+            .await
+            .unwrap();
+        writer.flush().await.unwrap().await.unwrap();
+        store.put_opts_gate.close();
+        let mut replies = Vec::new();
+        for seq in 2..=3 {
+            writer
+                .append(&[make_entry("key", "v", seq, None)])
+                .await
+                .unwrap();
+            replies.push(writer.flush().await.unwrap());
+            wait_for_uploads(&store, seq as usize).await;
+        }
+        writer
+            .append(&[make_entry("queued", "v", 4, None)])
+            .await
+            .unwrap();
+        replies.push(writer.flush().await.unwrap());
+        if panic {
+            store
+                .put_opts_gate
+                .set_error(|| panic!("parallel upload panic"));
+        } else {
+            store
+                .put_opts_gate
+                .set_error(|| object_store::Error::NotSupported {
+                    source: "parallel upload failure".into(),
+                });
+        }
+        store.put_opts_gate.release();
+        for reply in replies {
+            let error = tokio::time::timeout(Duration::from_secs(5), reply)
+                .await
+                .unwrap()
+                .unwrap_err();
+            match error {
+                WalError::InternalError(source) if panic => assert!(matches!(
+                    source.downcast_ref::<SlateDBError>(),
+                    Some(SlateDBError::BackgroundTaskPanic(name)) if name == WAL_UPLOAD_TASK_NAME
+                )),
+                WalError::Unavailable(source) if !panic => {
+                    let Some(SlateDBError::ObjectStoreError(source)) = source.downcast_ref() else {
+                        panic!("expected the original object store error");
+                    };
+                    assert!(matches!(
+                        source.as_ref(),
+                        object_store::Error::NotSupported { .. }
+                    ));
+                }
+                error => panic!("unexpected WAL error: {error:?}"),
+            }
+        }
+        let status = writer.status().unwrap_err();
+        assert_eq!(status.last_flushed_wal_id, 1);
+        assert_eq!(status.last_flushed_seq, Some(1));
+        assert!(writer.close().await.is_err());
+        assert_eq!(store.put_opts_gate.arrivals(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_worker_error_fails_requests_and_preserves_published_progress() {
+        assert_worker_failure(false).await;
+    }
+
+    #[tokio::test]
+    async fn test_worker_panic_fails_requests_and_preserves_published_progress() {
+        assert_worker_failure(true).await;
+    }
+
+    #[tokio::test]
+    async fn test_close_fails_requests_and_joins_running_uploads() {
+        let backing_store = Arc::new(InMemory::new());
+        let store = Arc::new(GatedObjectStore::new(backing_store.clone()));
+        let (mut writer, _, _, _) =
+            setup_wal_buffer_with_max_inflight_uploads(None, Arc::new(|_| {}), store.clone(), 2)
+                .await;
+        writer
+            .append(&[make_entry("a", "1", 1, None)])
+            .await
+            .unwrap();
+        writer.flush().await.unwrap().await.unwrap();
+        store.put_opts_gate.close();
+        let observer = writer.observer();
+        let mut replies = Vec::new();
+        for seq in 2..=3 {
+            writer
+                .append(&[make_entry("key", "v", seq, None)])
+                .await
+                .unwrap();
+            replies.push(writer.flush().await.unwrap());
+            wait_for_uploads(&store, seq as usize).await;
+        }
+        writer
+            .append(&[make_entry("queued", "v", 4, None)])
+            .await
+            .unwrap();
+        replies.push(writer.flush().await.unwrap());
+        // Dropping one reply future must not cancel the shared upload or
+        // prevent shutdown.
+        drop(writer.flush().await.unwrap());
+        let close = tokio::spawn(async move { writer.close().await });
+        for reply in replies {
+            let error = tokio::time::timeout(Duration::from_secs(5), reply)
+                .await
+                .unwrap()
+                .unwrap_err();
+            assert!(matches!(error, WalError::Closed));
+        }
+        assert!(!close.is_finished());
+        store.put_opts_gate.admit(1);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while backing_store.list(None).count().await < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        // One worker finished, but close must still join the other upload.
+        assert!(!close.is_finished());
+        store.put_opts_gate.release();
+        tokio::time::timeout(Duration::from_secs(5), close)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let status = observer.status().unwrap_err();
+        assert_eq!(status.last_flushed_wal_id, 1);
+        assert_eq!(status.last_flushed_seq, Some(1));
+        assert_eq!(backing_store.list(None).count().await, 3);
     }
 
     fn recording_listener() -> (wal::WalStatusListener, Arc<Mutex<Vec<WalEvent>>>) {
@@ -1301,14 +1809,16 @@ mod tests {
         let (listener, events) = recording_listener();
         let (mut wal_buffer, _, _, _) = setup_wal_buffer_with_args(Duration::MAX, listener).await;
 
-        // when: Append an entry and explicitly flush it, driving the background flush task.
+        // when: Append an entry and explicitly flush it, which drives the
+        // coordinator and an upload worker.
         wal_buffer
             .append(&[make_entry("key1", "value1", 1, None)])
             .await
             .unwrap();
         wal_buffer.flush().await.unwrap().completion.await.unwrap();
 
-        // then: the listener should have been notified that wal 1 was flushed.
+        // then: the listener should have been notified that wal 1 was
+        // published.
         let recorded = events.lock().unwrap().clone();
         let mut flushed: Vec<_> = recorded
             .iter()
