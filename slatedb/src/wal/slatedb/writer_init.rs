@@ -10,6 +10,7 @@ use crate::wal::{WalError, WriterInitResult, WriterManifest};
 use crate::{wal, Settings};
 use async_trait::async_trait;
 use fail_parallel::{fail_point_send, FailPointTx};
+use log::warn;
 use slatedb_common::metrics::MetricsRecorderHelper;
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,6 +20,7 @@ use super::store::WalTableStore;
 #[derive(Clone, Copy)]
 pub(crate) struct SlateDbWalWriterInitOptions {
     max_wal_bytes_size: usize,
+    max_inflight_wal_uploads: usize,
     max_wal_flushes_before_l0_flush: u64,
     max_flush_interval: Option<Duration>,
 }
@@ -27,10 +29,30 @@ impl From<&Settings> for SlateDbWalWriterInitOptions {
     fn from(settings: &Settings) -> Self {
         Self {
             max_wal_bytes_size: settings.l0_sst_size_bytes,
+            max_inflight_wal_uploads: usable_max_inflight_wal_uploads(
+                settings.max_inflight_wal_uploads,
+            ),
             max_wal_flushes_before_l0_flush: settings.max_wal_flushes_before_l0_flush,
             max_flush_interval: settings.flush_interval,
         }
     }
+}
+
+/// Returns the maximum number of in-flight WAL uploads that this build can use.
+///
+/// Recovery and fencing still require serial uploads in production. Only
+/// `bench-internal` builds use a configured value above 1.
+fn usable_max_inflight_wal_uploads(configured: usize) -> usize {
+    if cfg!(feature = "bench-internal") {
+        return configured;
+    }
+    if configured > 1 {
+        warn!(
+            "ignoring max_inflight_wal_uploads without the bench-internal feature [max_inflight_wal_uploads={}]",
+            configured
+        );
+    }
+    1
 }
 
 pub(crate) struct SlateDbWalWriterInit {
@@ -38,6 +60,7 @@ pub(crate) struct SlateDbWalWriterInit {
     recorder: MetricsRecorderHelper,
     table_store: Arc<WalTableStore>,
     max_wal_bytes_size: usize,
+    max_inflight_wal_uploads: usize,
     max_wal_flushes_before_l0_flush: u64,
     max_flush_interval: Option<Duration>,
     empty_wal_id: u64,
@@ -66,6 +89,7 @@ impl SlateDbWalWriterInit {
             recorder,
             table_store,
             max_wal_bytes_size: options.max_wal_bytes_size,
+            max_inflight_wal_uploads: options.max_inflight_wal_uploads,
             max_wal_flushes_before_l0_flush: options.max_wal_flushes_before_l0_flush,
             max_flush_interval: options.max_flush_interval,
             empty_wal_id,
@@ -131,6 +155,7 @@ impl wal::WriterInit for SlateDbWalWriterInit {
                     empty_wal_id,
                     self.table_store.clone(),
                     self.max_wal_bytes_size,
+                    self.max_inflight_wal_uploads,
                     self.max_wal_flushes_before_l0_flush,
                     self.max_flush_interval,
                     self.task_executor.clone(),

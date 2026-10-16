@@ -114,6 +114,7 @@ impl SlateDbWalWriter {
         last_flushed_wal_id: u64,
         table_store: Arc<WalTableStore>,
         max_wal_bytes_size: usize,
+        _max_inflight_uploads: usize,
         max_wal_flushes_before_l0_flush: u64,
         max_flush_interval: Option<Duration>,
         task_executor: Arc<MessageHandlerExecutor>,
@@ -860,6 +861,7 @@ mod tests {
             0, // recent_flushed_wal_id
             table_store.clone(),
             1000,                 // max_wal_bytes_size
+            1,                    // max_inflight_uploads
             4096,                 // max_wal_flushes_before_l0_flush
             Some(flush_interval), // max_flush_interval
             task_executor.clone(),
