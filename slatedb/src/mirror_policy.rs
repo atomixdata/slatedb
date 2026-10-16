@@ -24,6 +24,7 @@ use slatedb_mirror::{MirrorHandle, MirrorPolicy, ReadRoute, WriteRoute};
 use slatedb_txn_obj::ObjectCodec;
 
 use crate::compactions_store::CompactionsStore;
+use crate::compactor_state::Compactions;
 use crate::flatbuffer_types::FlatBufferManifestCodec;
 use crate::manifest::Manifest;
 use crate::object_store_tag::{ObjectStoreCallTag, SstType};
@@ -99,9 +100,11 @@ pub struct SlateDbMirrorPolicyBuilder {
 
 impl SlateDbMirrorPolicyBuilder {
     /// Sets how often the policy reads the compaction state to prefetch the
-    /// output of running compactions. `None` disables prefetching, so new
-    /// compaction output is downloaded when a manifest that references it is
-    /// read. The default is 5 seconds.
+    /// output of running compactions, including the partial output a worker
+    /// needs to resume a compaction that another worker started. `None`
+    /// disables prefetching, so new compaction output is downloaded when a
+    /// manifest that references it is read, and a compaction that another
+    /// worker left partly done cannot be resumed. The default is 5 seconds.
     pub fn with_compactions_poll_interval(mut self, interval: Option<Duration>) -> Self {
         self.compactions_poll_interval = interval;
         self
@@ -253,16 +256,28 @@ impl MirrorPolicy for SlateDbMirrorPolicy {
                     continue;
                 }
             };
-            let resolver = PathResolver::from_root(root);
-            mirror.prefetch(
-                compactions
-                    .compactions
-                    .iter_active()
-                    .flat_map(|compaction| compaction.output_ssts())
-                    .map(|sst| resolver.sst_path(&sst.id)),
-            );
+            mirror.prefetch(active_compaction_ssts(&root, &compactions.compactions));
         }
     }
+}
+
+/// The SSTs that active compactions have written: their recorded outputs and
+/// their subcompactions' partial outputs, which a worker resuming a compaction
+/// that another worker started reads back.
+fn active_compaction_ssts(root: &Path, compactions: &Compactions) -> HashSet<Path> {
+    let resolver = PathResolver::from_root(root.clone());
+    compactions
+        .iter_active()
+        .flat_map(|compaction| {
+            compaction.output_ssts().into_iter().chain(
+                compaction
+                    .subcompactions()
+                    .iter()
+                    .flat_map(|subcompaction| subcompaction.output_ssts().iter().cloned()),
+            )
+        })
+        .map(|sst| resolver.sst_path(&sst.id))
+        .collect()
 }
 
 /// Returns the tag of a compacted SST call. WAL SSTs and untagged calls have
@@ -320,6 +335,10 @@ fn policy_error(message: String) -> object_store::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bytes_range::BytesRange;
+    use crate::compactor_state::{
+        Compaction, CompactionContext, CompactionSpec, CompactionStatus, SourceId,
+    };
     use crate::config::{DbReaderOptions, FlushOptions, FlushType};
     use crate::db_state::{SsTableHandle, SsTableId, SsTableInfo, SsTableView};
     use crate::error::RetryReason;
@@ -327,6 +346,7 @@ mod tests {
     use crate::manifest::store::ManifestStore;
     use crate::manifest::ManifestCore;
     use crate::object_store_tag::TableStoreKind;
+    use crate::subcompaction::Subcompaction;
     use crate::{Db, DbReader, DbReaderMode};
     use object_store::memory::InMemory;
     use object_store::{ObjectStore, UpdateVersion};
@@ -419,6 +439,45 @@ mod tests {
             version: None,
         });
         assert!(route(&sst, Some(compacted_tag()), update).is_err());
+    }
+
+    #[test]
+    fn test_active_compaction_ssts() {
+        let root = Path::from("db");
+        let resolver = PathResolver::from_root(root.clone());
+        let sst = || {
+            SsTableHandle::new(
+                SsTableId::from(Ulid::new()),
+                SST_FORMAT_VERSION_LATEST,
+                SsTableInfo::default(),
+            )
+        };
+        let spec = || CompactionSpec::new(vec![SourceId::SortedRun(1)], 1);
+        let (partial, recorded, finished) = (sst(), sst(), sst());
+        // A compaction whose worker died partway through has output only in
+        // its subcompactions.
+        let resumable =
+            Compaction::new(Ulid::new(), spec()).with_ctx(Some(CompactionContext::new(
+                vec![
+                    Subcompaction::new(BytesRange::from_slice(..b"m".as_slice()))
+                        .with_output_ssts(vec![partial.clone()]),
+                    Subcompaction::new(BytesRange::from_slice(b"m".as_slice()..)),
+                ],
+                None,
+            )));
+        let compacted = Compaction::new(Ulid::new(), spec())
+            .with_status(CompactionStatus::Compacted)
+            .with_output_ssts(vec![recorded.clone()]);
+        let done = Compaction::new(Ulid::new(), spec())
+            .with_status(CompactionStatus::Completed)
+            .with_output_ssts(vec![finished]);
+        let compactions = Compactions::new(1).with_compactions(vec![resumable, compacted, done]);
+
+        let expected: HashSet<Path> = [partial, recorded]
+            .iter()
+            .map(|sst| resolver.sst_path(&sst.id))
+            .collect();
+        assert_eq!(active_compaction_ssts(&root, &compactions), expected);
     }
 
     async fn mirror(
