@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::ops::{Range, RangeBounds};
+use std::ops::{Bound, Range, RangeBounds};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -317,13 +317,27 @@ impl WalTableStore {
         Ok((object_size, data))
     }
 
+    /// Lists the WAL SSTs whose IDs fall in `id_range`, sorted by ID.
+    ///
+    /// WAL file names are zero-padded IDs, so a range with a start lists only
+    /// the objects after the ID before it. The WAL directory holds every WAL
+    /// that GC hasn't deleted yet, tens of thousands at high write rates, and
+    /// some object stores list only about a thousand keys a second.
     pub(crate) async fn list_wal_ssts<R: RangeBounds<WalFileId>>(
         &self,
         id_range: R,
     ) -> Result<Vec<IdentifiedObjectMetadata<WalFileId>>, SlateDBError> {
         let mut wal_list = Vec::new();
         let wal_path = self.path_resolver.wal_path();
-        let mut files_stream = self.object_store.list(Some(&wal_path));
+        let offset = match id_range.start_bound() {
+            Bound::Included(id) => id.value().checked_sub(1).map(|prev| self.path(prev.into())),
+            Bound::Excluded(id) => Some(self.path(*id)),
+            Bound::Unbounded => None,
+        };
+        let mut files_stream = match &offset {
+            Some(offset) => self.object_store.list_with_offset(Some(&wal_path), offset),
+            None => self.object_store.list(Some(&wal_path)),
+        };
 
         while let Some(file) = files_stream.next().await.transpose()? {
             match self.path_resolver.parse_wal_file_id(&file.location) {
@@ -615,6 +629,56 @@ mod tests {
             Path::from("test-db"),
             TableStoreKind::Main,
         )
+    }
+
+    #[tokio::test]
+    async fn test_list_wal_ssts() {
+        let store = test_store();
+        // Ten and up cross a digit, which the zero-padded names keep in order.
+        for id in 1..=12u64 {
+            store.write_wal_fence(id.into()).await.unwrap();
+        }
+        let ids = |wals: Vec<IdentifiedObjectMetadata<WalFileId>>| {
+            wals.into_iter()
+                .map(|wal| wal.id.value())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            ids(store.list_wal_ssts(..).await.unwrap()),
+            (1..=12).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            ids(store.list_wal_ssts(WalFileId::from(9)..).await.unwrap()),
+            vec![9, 10, 11, 12]
+        );
+        assert_eq!(
+            ids(store
+                .list_wal_ssts(WalFileId::from(10)..=WalFileId::from(11))
+                .await
+                .unwrap()),
+            vec![10, 11]
+        );
+        assert_eq!(
+            ids(store
+                .list_wal_ssts((Bound::Excluded(WalFileId::from(10)), Bound::Unbounded))
+                .await
+                .unwrap()),
+            vec![11, 12]
+        );
+        assert_eq!(
+            ids(store.list_wal_ssts(..WalFileId::from(3)).await.unwrap()),
+            vec![1, 2]
+        );
+        assert_eq!(
+            ids(store.list_wal_ssts(WalFileId::from(0)..).await.unwrap()).len(),
+            12
+        );
+        assert!(store
+            .list_wal_ssts(WalFileId::from(13)..)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
