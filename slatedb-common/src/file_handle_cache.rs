@@ -1,79 +1,46 @@
 //! A cache of open files and a helper for positional reads.
 
-use lru::LruCache;
 use std::fs::File;
-use std::hash::{Hash, Hasher};
-use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 /// A cache of open file descriptors, keyed by filesystem path.
 ///
-/// Paths hash to shards, each a `Mutex` protecting an `LruCache` for O(1)
-/// lookup, promotion, and eviction, so that concurrent readers of different
-/// files rarely wait for each other. Each read specifies its own offset, so
-/// threads can share a handle without a lock for each file. On Unix, these
-/// reads do not move the file cursor.
+/// Backed by `quick_cache`: a hit takes only its shard's read lock and marks
+/// the handle referenced with an atomic, so concurrent readers of the same
+/// files do not serialize on a lock as they would on an LRU's reordering.
+/// Each read specifies its own offset, so threads can share a handle without
+/// a lock for each file. On Unix, these reads do not move the file cursor.
 #[derive(Clone)]
 pub struct FileHandleCache {
-    shards: Arc<[Shard]>,
+    inner: Arc<quick_cache::sync::Cache<PathBuf, Arc<File>>>,
 }
-
-type Shard = Mutex<LruCache<PathBuf, Arc<File>>>;
-
-/// Handles per shard below which the cache adds no more shards, so that small
-/// caches keep one exact LRU order.
-const HANDLES_PER_SHARD: usize = 64;
-const MAX_SHARDS: usize = 16;
 
 impl std::fmt::Debug for FileHandleCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let (len, cap) = self.shards.iter().fold((0, 0), |(len, cap), shard| {
-            let shard = shard.lock().expect("lock should not be poisoned");
-            (len + shard.len(), cap + shard.cap().get())
-        });
         f.debug_struct("FileHandleCache")
-            .field("len", &len)
-            .field("cap", &cap)
-            .field("shards", &self.shards.len())
+            .field("len", &self.inner.len())
+            .field("cap", &self.inner.capacity())
             .finish()
     }
 }
 
 impl FileHandleCache {
-    /// Creates a cache that retains at most about `max_handles` open files
-    /// (exactly that many when it is below 128, since the capacity is split
-    /// evenly over the shards).
+    /// Creates a cache that retains at most `max_handles` open files.
     ///
     /// # Panics
     ///
     /// Panics if `max_handles` is zero.
     pub fn new(max_handles: usize) -> Self {
         assert!(max_handles > 0, "max_handles must be > 0");
-        let shards = (max_handles / HANDLES_PER_SHARD).clamp(1, MAX_SHARDS);
-        let per_shard = NonZeroUsize::new(max_handles.div_ceil(shards))
-            .expect("a shard holds at least one handle");
         Self {
-            shards: (0..shards)
-                .map(|_| Mutex::new(LruCache::new(per_shard)))
-                .collect(),
+            inner: Arc::new(quick_cache::sync::Cache::new(max_handles)),
         }
-    }
-
-    fn shard(&self, path: &Path) -> &Shard {
-        let mut hasher = std::hash::DefaultHasher::new();
-        path.hash(&mut hasher);
-        let index = usize::try_from(hasher.finish() % self.shards.len() as u64)
-            .expect("a shard index fits in usize");
-        &self.shards[index]
     }
 
     /// Returns the number of handles retained by the cache.
     pub fn len(&self) -> usize {
-        self.shards
-            .iter()
-            .map(|shard| shard.lock().expect("lock should not be poisoned").len())
-            .sum()
+        self.inner.len()
     }
 
     /// Returns whether the cache retains no handles.
@@ -97,33 +64,18 @@ impl FileHandleCache {
     /// as-is, including `NotFound`.
     /// The returned `Arc` keeps the file open after its cache entry is evicted.
     pub fn try_get_or_open(&self, path: &Path) -> Result<Arc<File>, std::io::Error> {
-        let shard = self.shard(path);
-        let cached = shard
-            .lock()
-            .expect("lock should not be poisoned")
-            .get(path)
-            .cloned();
-        // The validity check is a syscall, so it runs without the lock.
-        if let Some(handle) = cached {
+        if let Some(handle) = self.inner.get(path) {
             if Self::is_valid(&handle, path) {
                 return Ok(handle);
             }
             // Stale entry: remove it, unless another reader already replaced
             // it, so we reopen below.
-            let mut cache = shard.lock().expect("lock should not be poisoned");
-            if cache
-                .peek(path)
-                .is_some_and(|current| Arc::ptr_eq(current, &handle))
-            {
-                cache.pop(path);
-            }
+            self.inner
+                .remove_if(path, |current| Arc::ptr_eq(current, &handle));
         }
 
         let handle = Arc::new(File::open(path)?);
-        shard
-            .lock()
-            .expect("lock should not be poisoned")
-            .push(path.to_path_buf(), handle.clone());
+        self.inner.insert(path.to_path_buf(), handle.clone());
         Ok(handle)
     }
 
@@ -150,10 +102,7 @@ impl FileHandleCache {
     /// Remove a cached handle, e.g. after eviction or after a write replaces
     /// the file (since the cached fd would still reference the old inode).
     pub fn invalidate(&self, path: &Path) {
-        self.shard(path)
-            .lock()
-            .expect("lock should not be poisoned")
-            .pop(path);
+        self.inner.remove(path);
     }
 }
 
@@ -217,7 +166,7 @@ mod tests {
     }
 
     #[test]
-    fn should_evict_least_recently_used_handle_and_keep_active_readers() {
+    fn should_evict_within_capacity_and_keep_active_readers() {
         let dir = tempfile::tempdir().unwrap();
         let cache = FileHandleCache::new(2);
         let paths = ["a", "b", "c"].map(|name| {
@@ -225,30 +174,23 @@ mod tests {
             std::fs::write(&path, name).unwrap();
             path
         });
-        let a = cache.get_or_open(&paths[0]).unwrap().unwrap();
-        let b = cache.get_or_open(&paths[1]).unwrap().unwrap();
-        assert!(Arc::ptr_eq(
-            &a,
-            &cache.get_or_open(&paths[0]).unwrap().unwrap()
-        ));
-        cache.get_or_open(&paths[2]).unwrap().unwrap();
-        assert_eq!(cache.len(), 2);
-        assert!(!Arc::ptr_eq(
-            &b,
-            &cache.get_or_open(&paths[1]).unwrap().unwrap()
-        ));
+        let handles = paths
+            .clone()
+            .map(|path| cache.get_or_open(&path).unwrap().unwrap());
+        assert!(cache.len() <= 2);
 
-        let mut buf = [0];
-        read_exact_at_offset(&b, &mut buf, 0).unwrap();
-        assert_eq!(&buf, b"b");
+        // Every handle still reads, whether or not the cache kept it.
+        for (handle, name) in handles.iter().zip(["a", "b", "c"]) {
+            let mut buf = [0];
+            read_exact_at_offset(handle, &mut buf, 0).unwrap();
+            assert_eq!(&buf, name.as_bytes());
+        }
     }
 
     #[test]
-    fn should_shard_large_caches_and_keep_their_capacity() {
+    fn should_return_cached_handles_to_concurrent_readers() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(FileHandleCache::new(2).shards.len(), 1);
         let cache = FileHandleCache::new(1024);
-        assert_eq!(cache.shards.len(), MAX_SHARDS);
         let paths: Vec<_> = (0..200)
             .map(|i| {
                 let path = dir.path().join(format!("f{i}"));
@@ -260,14 +202,19 @@ mod tests {
             .iter()
             .map(|path| cache.get_or_open(path).unwrap().unwrap())
             .collect();
-        // Every handle stays cached and is returned again from its shard.
         assert_eq!(cache.len(), paths.len());
-        for (path, handle) in paths.iter().zip(&handles) {
-            assert!(Arc::ptr_eq(
-                handle,
-                &cache.get_or_open(path).unwrap().unwrap()
-            ));
-        }
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    for (path, handle) in paths.iter().zip(&handles) {
+                        assert!(Arc::ptr_eq(
+                            handle,
+                            &cache.get_or_open(path).unwrap().unwrap()
+                        ));
+                    }
+                });
+            }
+        });
     }
 
     #[test]

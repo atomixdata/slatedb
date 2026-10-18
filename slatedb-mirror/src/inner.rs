@@ -15,7 +15,7 @@ use object_store::path::Path;
 use object_store::{
     GetOptions, GetResult, GetResultPayload, ObjectStore, ObjectStoreExt, PutPayload,
 };
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use slatedb_common::clock::SystemClock;
 use tokio::runtime::Handle;
 use tokio_util::sync::CancellationToken;
@@ -56,8 +56,9 @@ pub(crate) struct Inner {
     /// Cancelled when the `ObjectStoreMirror` is dropped. Stops background
     /// tasks.
     pub(crate) shutdown: CancellationToken,
-    /// Every complete local copy, by object path.
-    pub(crate) entries: Mutex<HashMap<Path, Arc<LocalObject>>>,
+    /// Every complete local copy, by object path. Read on every local read and
+    /// written only when a copy is added or removed, so readers share it.
+    pub(crate) entries: RwLock<HashMap<Path, Arc<LocalObject>>>,
     pub(crate) prefixes: Mutex<PrefixMap>,
     pub(crate) ordering: PathOrdering,
     pub(crate) downloads: Downloads,
@@ -89,7 +90,7 @@ impl Inner {
             retry,
             runtime,
             shutdown: CancellationToken::new(),
-            entries: Mutex::new(entries),
+            entries: RwLock::new(entries),
             prefixes: Mutex::new(prefixes),
             ordering: PathOrdering::default(),
             downloads: Downloads::new(download_concurrency),
@@ -103,7 +104,7 @@ impl Inner {
     }
 
     pub(crate) fn local(&self, path: &Path) -> Option<Arc<LocalObject>> {
-        self.entries.lock().get(path).cloned()
+        self.entries.read().get(path).cloned()
     }
 
     /// Returns a guard for a new temporary data file for `name`.
@@ -168,7 +169,7 @@ impl Inner {
         temp.disarm();
         let object = Arc::new(object);
         self.entries
-            .lock()
+            .write()
             .insert(path.clone(), Arc::clone(&object));
         Ok(object)
     }
@@ -207,7 +208,7 @@ impl Inner {
     /// Removes the local copy of `path`, if there is one. The caller must hold
     /// `path`'s turn in the ordering.
     pub(crate) async fn remove_local(&self, path: &Path) -> Result<(), MirrorError> {
-        if self.entries.lock().remove(path).is_none() {
+        if self.entries.write().remove(path).is_none() {
             return Ok(());
         }
         self.remove_files(path).await
@@ -260,7 +261,7 @@ impl Inner {
             .register(path, OpKind::Delete)
             .expect("deletes are always queued");
         ticket.ready().await;
-        self.entries.lock().remove(path);
+        self.entries.write().remove(path);
         self.remove_files(path).await
     }
 

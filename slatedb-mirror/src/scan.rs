@@ -240,7 +240,7 @@ mod tests {
         // Both files stay on disk, but the maps lose track of them. Without the
         // prefix map, the scan reads each `.meta` for its path.
         let inner = mirror.inner();
-        inner.entries.lock().clear();
+        inner.entries.write().clear();
         *inner.prefixes.lock() = PrefixMap::default();
         store.delete(&Path::from(SST)).await.unwrap();
 

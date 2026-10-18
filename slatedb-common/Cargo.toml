@@ -12,9 +12,9 @@ async-trait = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
 log = { workspace = true }
-lru = { workspace = true }
 object_store = { workspace = true }
 parking_lot = { workspace = true }
+quick_cache = { workspace = true }
 rand = { workspace = true }
 rand_xoshiro = { workspace = true }
 serde = { workspace = true, features = ["derive"], optional = true }
