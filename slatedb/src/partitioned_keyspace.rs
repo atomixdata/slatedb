@@ -38,6 +38,37 @@ pub(crate) fn partition_point<T: RangePartitionedKeySpace, P: Fn(&[u8]) -> bool>
     part_point
 }
 
+/// Like [`partition_point`], given that `pred` holds for every partition before `from`.
+///
+/// Searches forward from `from` with doubling steps, then bisects the last step, so a
+/// partition point a few partitions past `from` costs a few comparisons rather than a
+/// search of the whole keyspace.
+fn partition_point_from<T: RangePartitionedKeySpace, P: Fn(&[u8]) -> bool>(
+    keyspace: &T,
+    from: usize,
+    pred: P,
+) -> usize {
+    let partitions = keyspace.partitions();
+    // `pred` holds before `low` and fails at `high` (or `high` is the end).
+    let mut low = from;
+    let mut step = 1;
+    let mut high = from;
+    while high < partitions && pred(keyspace.partition_first_key(high)) {
+        low = high + 1;
+        high = from.saturating_add(step).min(partitions);
+        step = step.saturating_mul(2);
+    }
+    while low < high {
+        let mid = low + (high - low) / 2;
+        if pred(keyspace.partition_first_key(mid)) {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    low
+}
+
 /// Returns the first partition that could include keys that are greater than or equal to
 /// the specified key.
 pub(crate) fn first_partition_including_or_after_key<T: RangePartitionedKeySpace>(
@@ -95,11 +126,23 @@ pub(crate) fn partitions_covering_range<T: RangePartitionedKeySpace>(
         }
         Bound::Unbounded => 0,
     };
+    // Partitions before `start_idx` start below the start key, so when the end key is not
+    // below the start key they start at or below the end key too, and the search for the
+    // end can begin at `start_idx`. Ranges usually span few partitions.
+    let end_search_from = match (start, end) {
+        (Bound::Included(s) | Bound::Excluded(s), Bound::Included(e) | Bound::Excluded(e))
+            if s <= e =>
+        {
+            start_idx
+        }
+        _ => 0,
+    };
+    let last_including = |k: &[u8]| {
+        partition_point_from(keyspace, end_search_from, |first_key| first_key <= k).checked_sub(1)
+    };
     let end_idx_exclusive = match end {
-        Bound::Included(k) => last_partition_including_key(keyspace, k)
-            .map(|p| p + 1)
-            .unwrap_or(start_idx),
-        Bound::Excluded(k) => match last_partition_including_key(keyspace, k) {
+        Bound::Included(k) => last_including(k).map(|p| p + 1).unwrap_or(start_idx),
+        Bound::Excluded(k) => match last_including(k) {
             None => start_idx,
             Some(p) if k == keyspace.partition_first_key(p) => p,
             Some(p) => p + 1,
@@ -112,10 +155,59 @@ pub(crate) fn partitions_covering_range<T: RangePartitionedKeySpace>(
 #[cfg(test)]
 mod tests {
     use crate::partitioned_keyspace::{
-        first_partition_including_key, last_partition_including_key, partition_point,
+        first_partition_including_key, first_partition_including_or_after_key,
+        last_partition_including_key, partition_point, partitions_covering_range,
         RangePartitionedKeySpace,
     };
+    use proptest::collection::vec;
+    use proptest::prelude::*;
     use rstest::rstest;
+    use std::ops::Bound;
+
+    fn bound_strategy() -> impl Strategy<Value = Bound<Vec<u8>>> {
+        prop_oneof![
+            Just(Bound::Unbounded),
+            vec(0u8..4, 0..3).prop_map(Bound::Included),
+            vec(0u8..4, 0..3).prop_map(Bound::Excluded),
+        ]
+    }
+
+    #[test]
+    fn test_partitions_covering_range_matches_full_searches() {
+        // Small alphabets and short keys give duplicate first keys and range bounds
+        // equal to first keys.
+        proptest!(|(
+            mut first_keys in vec(vec(0u8..4, 0..3), 1..40),
+            start in bound_strategy(),
+            end in bound_strategy(),
+        )| {
+            first_keys.sort();
+            let keyspace = TestKeyspace {
+                partitions: first_keys.iter().map(Vec::as_slice).collect(),
+            };
+            let start = start.as_ref().map(Vec::as_slice);
+            let end = end.as_ref().map(Vec::as_slice);
+
+            let start_idx = match start {
+                Bound::Included(k) | Bound::Excluded(k) => {
+                    first_partition_including_or_after_key(&keyspace, k)
+                }
+                Bound::Unbounded => 0,
+            };
+            let end_idx = match end {
+                Bound::Included(k) => last_partition_including_key(&keyspace, k)
+                    .map(|p| p + 1)
+                    .unwrap_or(start_idx),
+                Bound::Excluded(k) => match last_partition_including_key(&keyspace, k) {
+                    None => start_idx,
+                    Some(p) if k == keyspace.partition_first_key(p) => p,
+                    Some(p) => p + 1,
+                },
+                Bound::Unbounded => keyspace.partitions(),
+            };
+            prop_assert_eq!(partitions_covering_range(&keyspace, start, end), start_idx..end_idx);
+        });
+    }
 
     #[test]
     fn test_partition_point() {
