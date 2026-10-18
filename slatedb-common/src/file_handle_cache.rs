@@ -1,50 +1,79 @@
 //! A cache of open files and a helper for positional reads.
 
 use lru::LruCache;
+use std::fs::File;
+use std::hash::{Hash, Hasher};
 use std::num::NonZeroUsize;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 /// A cache of open file descriptors, keyed by filesystem path.
 ///
-/// Uses a `Mutex` protecting an `LruCache` for O(1) lookup, promotion, and
-/// eviction. Each read specifies its own offset, so threads can share a
-/// handle without a lock for each file. On Unix, these reads do not move
-/// the file cursor.
+/// Paths hash to shards, each a `Mutex` protecting an `LruCache` for O(1)
+/// lookup, promotion, and eviction, so that concurrent readers of different
+/// files rarely wait for each other. Each read specifies its own offset, so
+/// threads can share a handle without a lock for each file. On Unix, these
+/// reads do not move the file cursor.
 #[derive(Clone)]
 pub struct FileHandleCache {
-    inner: Arc<std::sync::Mutex<LruCache<std::path::PathBuf, Arc<std::fs::File>>>>,
+    shards: Arc<[Shard]>,
 }
+
+type Shard = Mutex<LruCache<PathBuf, Arc<File>>>;
+
+/// Handles per shard below which the cache adds no more shards, so that small
+/// caches keep one exact LRU order.
+const HANDLES_PER_SHARD: usize = 64;
+const MAX_SHARDS: usize = 16;
 
 impl std::fmt::Debug for FileHandleCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let inner = self.inner.lock().expect("lock should not be poisoned");
+        let (len, cap) = self.shards.iter().fold((0, 0), |(len, cap), shard| {
+            let shard = shard.lock().expect("lock should not be poisoned");
+            (len + shard.len(), cap + shard.cap().get())
+        });
         f.debug_struct("FileHandleCache")
-            .field("len", &inner.len())
-            .field("cap", &inner.cap())
+            .field("len", &len)
+            .field("cap", &cap)
+            .field("shards", &self.shards.len())
             .finish()
     }
 }
 
 impl FileHandleCache {
-    /// Creates a cache that retains at most `max_handles` open files.
+    /// Creates a cache that retains at most about `max_handles` open files
+    /// (exactly that many when it is below 128, since the capacity is split
+    /// evenly over the shards).
     ///
     /// # Panics
     ///
     /// Panics if `max_handles` is zero.
     pub fn new(max_handles: usize) -> Self {
+        assert!(max_handles > 0, "max_handles must be > 0");
+        let shards = (max_handles / HANDLES_PER_SHARD).clamp(1, MAX_SHARDS);
+        let per_shard = NonZeroUsize::new(max_handles.div_ceil(shards))
+            .expect("a shard holds at least one handle");
         Self {
-            inner: Arc::new(std::sync::Mutex::new(LruCache::new(
-                NonZeroUsize::new(max_handles).expect("max_handles must be > 0"),
-            ))),
+            shards: (0..shards)
+                .map(|_| Mutex::new(LruCache::new(per_shard)))
+                .collect(),
         }
+    }
+
+    fn shard(&self, path: &Path) -> &Shard {
+        let mut hasher = std::hash::DefaultHasher::new();
+        path.hash(&mut hasher);
+        let index = usize::try_from(hasher.finish() % self.shards.len() as u64)
+            .expect("a shard index fits in usize");
+        &self.shards[index]
     }
 
     /// Returns the number of handles retained by the cache.
     pub fn len(&self) -> usize {
-        self.inner
-            .lock()
-            .expect("lock should not be poisoned")
-            .len()
+        self.shards
+            .iter()
+            .map(|shard| shard.lock().expect("lock should not be poisoned").len())
+            .sum()
     }
 
     /// Returns whether the cache retains no handles.
@@ -55,10 +84,7 @@ impl FileHandleCache {
     /// Look up a cached file handle, or open the file and cache it.
     /// Returns `Ok(None)` if the file does not exist on disk.
     /// The returned `Arc` keeps the file open after its cache entry is evicted.
-    pub fn get_or_open(
-        &self,
-        path: &std::path::Path,
-    ) -> Result<Option<Arc<std::fs::File>>, std::io::Error> {
+    pub fn get_or_open(&self, path: &Path) -> Result<Option<Arc<File>>, std::io::Error> {
         match self.try_get_or_open(path) {
             Ok(handle) => Ok(Some(handle)),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -70,22 +96,34 @@ impl FileHandleCache {
     /// Unlike [`Self::get_or_open`], returns the error from opening the file
     /// as-is, including `NotFound`.
     /// The returned `Arc` keeps the file open after its cache entry is evicted.
-    pub fn try_get_or_open(
-        &self,
-        path: &std::path::Path,
-    ) -> Result<Arc<std::fs::File>, std::io::Error> {
-        let mut cache = self.inner.lock().expect("lock should not be poisoned");
-        if let Some(handle) = cache.get(path) {
-            if Self::is_valid(handle, path) {
-                return Ok(handle.clone());
+    pub fn try_get_or_open(&self, path: &Path) -> Result<Arc<File>, std::io::Error> {
+        let shard = self.shard(path);
+        let cached = shard
+            .lock()
+            .expect("lock should not be poisoned")
+            .get(path)
+            .cloned();
+        // The validity check is a syscall, so it runs without the lock.
+        if let Some(handle) = cached {
+            if Self::is_valid(&handle, path) {
+                return Ok(handle);
             }
-            // Stale entry — remove it so we reopen below.
-            cache.pop(path);
+            // Stale entry: remove it, unless another reader already replaced
+            // it, so we reopen below.
+            let mut cache = shard.lock().expect("lock should not be poisoned");
+            if cache
+                .peek(path)
+                .is_some_and(|current| Arc::ptr_eq(current, &handle))
+            {
+                cache.pop(path);
+            }
         }
 
-        let handle = Arc::new(std::fs::File::open(path)?);
-
-        cache.push(path.to_path_buf(), handle.clone());
+        let handle = Arc::new(File::open(path)?);
+        shard
+            .lock()
+            .expect("lock should not be poisoned")
+            .push(path.to_path_buf(), handle.clone());
         Ok(handle)
     }
 
@@ -99,21 +137,23 @@ impl FileHandleCache {
     /// On non-Unix platforms (e.g. Windows), we fall back to checking whether
     /// the path still exists on disk.
     #[cfg(unix)]
-    fn is_valid(handle: &std::fs::File, _path: &std::path::Path) -> bool {
+    fn is_valid(handle: &File, _path: &Path) -> bool {
         use std::os::unix::fs::MetadataExt;
         handle.metadata().is_ok_and(|m| m.nlink() > 0)
     }
 
     #[cfg(not(unix))]
-    fn is_valid(_handle: &std::fs::File, path: &std::path::Path) -> bool {
+    fn is_valid(_handle: &File, path: &Path) -> bool {
         path.exists()
     }
 
     /// Remove a cached handle, e.g. after eviction or after a write replaces
     /// the file (since the cached fd would still reference the old inode).
-    pub fn invalidate(&self, path: &std::path::Path) {
-        let mut cache = self.inner.lock().expect("lock should not be poisoned");
-        cache.pop(path);
+    pub fn invalidate(&self, path: &Path) {
+        self.shard(path)
+            .lock()
+            .expect("lock should not be poisoned")
+            .pop(path);
     }
 }
 
@@ -121,11 +161,7 @@ impl FileHandleCache {
 ///
 /// Concurrent readers can share the file because each read specifies its offset.
 /// On Unix, reads do not move the file cursor. On Windows, they do.
-pub fn read_exact_at_offset(
-    file: &std::fs::File,
-    buf: &mut [u8],
-    offset: u64,
-) -> std::io::Result<()> {
+pub fn read_exact_at_offset(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::FileExt;
@@ -205,6 +241,33 @@ mod tests {
         let mut buf = [0];
         read_exact_at_offset(&b, &mut buf, 0).unwrap();
         assert_eq!(&buf, b"b");
+    }
+
+    #[test]
+    fn should_shard_large_caches_and_keep_their_capacity() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(FileHandleCache::new(2).shards.len(), 1);
+        let cache = FileHandleCache::new(1024);
+        assert_eq!(cache.shards.len(), MAX_SHARDS);
+        let paths: Vec<_> = (0..200)
+            .map(|i| {
+                let path = dir.path().join(format!("f{i}"));
+                std::fs::write(&path, b"x").unwrap();
+                path
+            })
+            .collect();
+        let handles: Vec<_> = paths
+            .iter()
+            .map(|path| cache.get_or_open(path).unwrap().unwrap())
+            .collect();
+        // Every handle stays cached and is returned again from its shard.
+        assert_eq!(cache.len(), paths.len());
+        for (path, handle) in paths.iter().zip(&handles) {
+            assert!(Arc::ptr_eq(
+                handle,
+                &cache.get_or_open(path).unwrap().unwrap()
+            ));
+        }
     }
 
     #[test]
