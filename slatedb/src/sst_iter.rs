@@ -10,7 +10,7 @@ use tokio::task::JoinHandle;
 
 use crate::block_iterator::DataBlockIterator;
 use crate::bytes_range::BytesRange;
-use crate::db_state::{SsTableId, SsTableView};
+use crate::db_state::{SsTableHandle, SsTableId, SsTableView};
 use crate::db_stats::DbStats;
 use crate::error::SlateDBError;
 use crate::filter_policy::{FilterContext, FilterQuery, FilterTarget, NamedFilter};
@@ -27,7 +27,17 @@ use crate::{
 
 enum FetchTask {
     InFlight(JoinHandle<Result<VecDeque<Arc<Block>>, SlateDBError>>),
+    /// A fetch run inline when it is awaited, with no task of its own.
+    Deferred(DeferredFetch),
     Finished(VecDeque<Arc<Block>>),
+}
+
+struct DeferredFetch {
+    table: SsTableHandle,
+    index: Arc<SsTableIndexOwned>,
+    blocks: Range<usize>,
+    cache_blocks: bool,
+    segment: Option<Bytes>,
 }
 
 #[derive(Clone, Debug)]
@@ -460,6 +470,35 @@ impl<'a> InternalSstIterator<'a> {
     /// For descending order: Fetches blocks backward from `next_block_idx_to_fetch - 1`,
     /// decrementing `next_block_idx_to_fetch` as blocks are scheduled. Stops when reaching
     /// `block_idx_range.start`.
+    /// Fetching one block at a time with no eager prefetch overlaps nothing, so
+    /// the fetch runs inline when awaited: a cached block then costs no task
+    /// spawn and no cross-thread wakeup. Prefetching iterators spawn tasks so
+    /// that their fetches run concurrently.
+    fn fetch_task(
+        &self,
+        table: SsTableHandle,
+        index: Arc<SsTableIndexOwned>,
+        blocks: Range<usize>,
+    ) -> FetchTask {
+        let cache_blocks = self.options.cache_blocks;
+        let segment = self.options.segment.clone();
+        if self.options.max_fetch_tasks <= 1 && !self.options.eager_spawn {
+            return FetchTask::Deferred(DeferredFetch {
+                table,
+                index,
+                blocks,
+                cache_blocks,
+                segment,
+            });
+        }
+        let table_store = self.table_store.clone();
+        FetchTask::InFlight(tokio::spawn(async move {
+            table_store
+                .read_blocks_using_index(&table, index, blocks, cache_blocks, segment)
+                .await
+        }))
+    }
+
     fn spawn_fetches(&mut self) {
         let Some(index) = self.index.as_ref() else {
             return;
@@ -480,23 +519,9 @@ impl<'a> InternalSstIterator<'a> {
                         IterationOrder::Ascending,
                     );
                     blocks.end = blocks.end.min(self.block_idx_range.end);
-                    let table_store = self.table_store.clone();
-                    let index = index.clone();
-                    let cache_blocks = self.options.cache_blocks;
-                    let segment = self.options.segment.clone();
                     let blocks_end = blocks.end;
-                    self.fetch_tasks
-                        .push_back(FetchTask::InFlight(tokio::spawn(async move {
-                            table_store
-                                .read_blocks_using_index(
-                                    &table,
-                                    index,
-                                    blocks,
-                                    cache_blocks,
-                                    segment,
-                                )
-                                .await
-                        })));
+                    let task = self.fetch_task(table, index.clone(), blocks);
+                    self.fetch_tasks.push_back(task);
                     self.next_block_idx_to_fetch = blocks_end;
                 }
             }
@@ -514,23 +539,9 @@ impl<'a> InternalSstIterator<'a> {
                         IterationOrder::Descending,
                     );
                     blocks.start = blocks.start.max(self.block_idx_range.start);
-                    let table_store = self.table_store.clone();
-                    let index = index.clone();
-                    let cache_blocks = self.options.cache_blocks;
-                    let segment = self.options.segment.clone();
                     let blocks_start = blocks.start;
-                    self.fetch_tasks
-                        .push_back(FetchTask::InFlight(tokio::spawn(async move {
-                            table_store
-                                .read_blocks_using_index(
-                                    &table,
-                                    index,
-                                    blocks,
-                                    cache_blocks,
-                                    segment,
-                                )
-                                .await
-                        })));
+                    let task = self.fetch_task(table, index.clone(), blocks);
+                    self.fetch_tasks.push_back(task);
                     self.next_block_idx_to_fetch = blocks_start;
                 }
             }
@@ -556,6 +567,19 @@ impl<'a> InternalSstIterator<'a> {
                         let blocks = jh
                             .await
                             .map_err(|join_err| block_fetch_join_error(join_err, sst_id))??;
+                        *fetch_task = FetchTask::Finished(blocks);
+                    }
+                    FetchTask::Deferred(fetch) => {
+                        let blocks = self
+                            .table_store
+                            .read_blocks_using_index(
+                                &fetch.table,
+                                fetch.index.clone(),
+                                fetch.blocks.clone(),
+                                fetch.cache_blocks,
+                                fetch.segment.clone(),
+                            )
+                            .await?;
                         *fetch_task = FetchTask::Finished(blocks);
                     }
                     FetchTask::Finished(blocks) => {
@@ -3124,14 +3148,18 @@ mod tests {
 
         // Initialization walks `advance_block` -> `next_iter(true)` ->
         // `spawn_fetches`, so the first fetch is spawned onto - and cancelled
-        // by - the dead runtime while its context is entered.
+        // by - the dead runtime while its context is entered. Fetches are only
+        // spawned when the iterator prefetches more than one task.
         let result = {
             let _guard = dead_handle.enter();
             SstIterator::new_owned_initialized(
                 ..,
                 sst,
                 table_store.clone(),
-                SstIteratorOptions::default(),
+                SstIteratorOptions {
+                    max_fetch_tasks: 2,
+                    ..SstIteratorOptions::default()
+                },
             )
             .await
         };
@@ -3140,6 +3168,44 @@ mod tests {
             panic!("a cancelled prefetch task must be reported as an error");
         };
         assert!(matches!(err, SlateDBError::BackgroundTaskCancelled(_)));
+    }
+
+    #[tokio::test]
+    async fn test_next_iter_single_block_fetch_runs_inline() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let table_store = Arc::new(TableStore::new(
+            object_store,
+            SsTableFormat::default(),
+            Path::from(""),
+            None,
+            TableStoreKind::Main,
+            BlockCachePolicy::default(),
+        ));
+        let sst = build_single_block_sst(&table_store, &[b"key1", b"key2"]).await;
+
+        // Spawning onto a runtime that is shut down cancels the task, so this
+        // only succeeds if the default single-block fetch spawns nothing.
+        let dead = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .build()
+            .unwrap();
+        let dead_handle = dead.handle().clone();
+        dead.shutdown_background();
+        let mut iter = {
+            let _guard = dead_handle.enter();
+            SstIterator::new_owned_initialized(
+                ..,
+                sst,
+                table_store.clone(),
+                SstIteratorOptions::default(),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+        };
+        assert_eq!(iter.next().await.unwrap().unwrap().key.as_ref(), b"key1");
+        assert_eq!(iter.next().await.unwrap().unwrap().key.as_ref(), b"key2");
+        assert!(iter.next().await.unwrap().is_none());
     }
 
     /// A [`Filter`] backed by a closure, so a test can express a verdict rule

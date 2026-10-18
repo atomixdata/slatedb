@@ -123,7 +123,7 @@ impl SsTableIndexOwned {
 
     /// Returns the size of the SSTable index in bytes, including the first-key directory.
     pub(crate) fn size(&self) -> usize {
-        self.data.len() + std::mem::size_of_val(&*self.first_keys)
+        self.data.len() + size_of_val(&*self.first_keys)
     }
 }
 
