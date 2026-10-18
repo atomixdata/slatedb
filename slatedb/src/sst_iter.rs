@@ -470,10 +470,10 @@ impl<'a> InternalSstIterator<'a> {
     /// For descending order: Fetches blocks backward from `next_block_idx_to_fetch - 1`,
     /// decrementing `next_block_idx_to_fetch` as blocks are scheduled. Stops when reaching
     /// `block_idx_range.start`.
-    /// Fetching one block at a time with no eager prefetch overlaps nothing, so
-    /// the fetch runs inline when awaited: a cached block then costs no task
-    /// spawn and no cross-thread wakeup. Prefetching iterators spawn tasks so
-    /// that their fetches run concurrently.
+    /// A fetch queued first is awaited right away, so spawning it overlaps
+    /// nothing: it runs inline when awaited, and a cached block then costs no
+    /// task spawn and no cross-thread wakeup. Prefetches queued behind it get
+    /// tasks of their own so that they run concurrently.
     fn fetch_task(
         &self,
         table: SsTableHandle,
@@ -482,7 +482,7 @@ impl<'a> InternalSstIterator<'a> {
     ) -> FetchTask {
         let cache_blocks = self.options.cache_blocks;
         let segment = self.options.segment.clone();
-        if self.options.max_fetch_tasks <= 1 && !self.options.eager_spawn {
+        if self.fetch_tasks.is_empty() {
             return FetchTask::Deferred(DeferredFetch {
                 table,
                 index,
@@ -3126,15 +3126,21 @@ mod tests {
     #[tokio::test]
     async fn test_next_iter_prefetch_task_cancelled() {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let format = SsTableFormat {
+            block_size: 128,
+            ..SsTableFormat::default()
+        };
         let table_store = Arc::new(TableStore::new(
             object_store,
-            SsTableFormat::default(),
+            format,
             Path::from(""),
             None,
             TableStoreKind::Main,
             BlockCachePolicy::default(),
         ));
-        let sst = build_single_block_sst(&table_store, &[b"key1", b"key2"]).await;
+        let key_gen = OrderedBytesGenerator::new_with_byte_range(&[b'a'; 16], b'a', b'z');
+        let val_gen = OrderedBytesGenerator::new_with_byte_range(&[1u8; 16], 1u8, 26u8);
+        let (sst, _) = build_sst_with_n_blocks(2, table_store.clone(), key_gen, val_gen).await;
 
         // A runtime that is shut down before anything is spawned on it.
         // `shutdown_background` rather than a plain drop, which would itself
@@ -3146,11 +3152,10 @@ mod tests {
         let dead_handle = dead.handle().clone();
         dead.shutdown_background();
 
-        // Initialization walks `advance_block` -> `next_iter(true)` ->
-        // `spawn_fetches`, so the first fetch is spawned onto - and cancelled
-        // by - the dead runtime while its context is entered. Fetches are only
-        // spawned when the iterator prefetches more than one task.
-        let result = {
+        // Initialization fetches the first block inline and spawns the
+        // prefetch of the second onto - and has it cancelled by - the dead
+        // runtime while its context is entered.
+        let mut iter = {
             let _guard = dead_handle.enter();
             SstIterator::new_owned_initialized(
                 ..,
@@ -3162,10 +3167,16 @@ mod tests {
                 },
             )
             .await
+            .unwrap()
+            .unwrap()
         };
 
-        let Err(err) = result else {
-            panic!("a cancelled prefetch task must be reported as an error");
+        let err = loop {
+            match iter.next().await {
+                Ok(Some(_)) => {}
+                Ok(None) => panic!("a cancelled prefetch task must be reported as an error"),
+                Err(err) => break err,
+            }
         };
         assert!(matches!(err, SlateDBError::BackgroundTaskCancelled(_)));
     }
