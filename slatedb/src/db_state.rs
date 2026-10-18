@@ -611,11 +611,15 @@ impl SortedRun {
             .sst_views
             .last()
             .expect("non-empty: first exists, so last exists");
-        let span = BytesRange::new(
-            first.compacted_effective_range().start_bound().cloned(),
-            last.compacted_effective_range().end_bound().cloned(),
+        let span = ComparableRange::new(
+            borrowed_range(first.compacted_effective_range())
+                .start_bound()
+                .cloned(),
+            borrowed_range(last.compacted_effective_range())
+                .end_bound()
+                .cloned(),
         );
-        span.intersect(range).is_some()
+        span.intersect(&borrowed_range(range)).is_some()
     }
 
     pub(crate) fn find_last_sst_with_range_covering_key(&self, key: &[u8]) -> Option<usize> {
@@ -1334,6 +1338,31 @@ mod tests {
         );
 
         assert!(sorted_run.tables_covering_point_key(b"0").is_empty());
+    }
+
+    #[test]
+    fn test_sorted_run_overlaps_range() {
+        let sorted_run = SortedRun::new(
+            0,
+            [
+                create_compacted_sst_view_with_bounds(b"c", Some(b"f")),
+                create_compacted_sst_view_with_bounds(b"h", Some(b"k")),
+            ],
+        );
+        let range = |start: std::ops::Bound<&[u8]>, end: std::ops::Bound<&[u8]>| {
+            BytesRange::new(
+                start.map(Bytes::copy_from_slice),
+                end.map(Bytes::copy_from_slice),
+            )
+        };
+
+        assert!(sorted_run.overlaps_range(&range(Included(b"d"), Included(b"e"))));
+        assert!(sorted_run.overlaps_range(&range(Included(b"f"), Excluded(b"h"))));
+        assert!(sorted_run.overlaps_range(&range(Unbounded, Included(b"c"))));
+        assert!(sorted_run.overlaps_range(&range(Included(b"k"), Unbounded)));
+        assert!(!sorted_run.overlaps_range(&range(Unbounded, Excluded(b"c"))));
+        assert!(!sorted_run.overlaps_range(&range(Excluded(b"k"), Unbounded)));
+        assert!(!SortedRun::new(0, []).overlaps_range(&range(Unbounded, Unbounded)));
     }
 
     #[test]
