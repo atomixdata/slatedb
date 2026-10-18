@@ -1,5 +1,4 @@
 use async_trait::async_trait;
-use bytes::{Bytes, BytesMut};
 
 use crate::block_iterator::BlockLike;
 use crate::error::SlateDBError;
@@ -14,7 +13,11 @@ struct AscendingState<B: BlockLike> {
     current_restart_idx: usize,
     offset_in_block: usize,
     entries_since_restart: usize,
-    current_key: Bytes,
+    /// The key the entry at `offset_in_block` is delta-encoded against: the
+    /// previous entry's key (or the restart key at a restart point). Reused as
+    /// a buffer, so moving between entries copies no `Bytes` and allocates
+    /// nothing once it has grown.
+    current_key: Vec<u8>,
     exhausted: bool,
 }
 
@@ -34,9 +37,9 @@ impl<B: BlockLike> BlockIteratorV2<B> {
         match ordering {
             IterationOrder::Ascending => {
                 let initial_key = if block.offsets().is_empty() {
-                    Bytes::new()
+                    Vec::new()
                 } else {
-                    Self::decode_first_key_at_restart(&block, 0)
+                    Self::restart_key(&block, 0).to_vec()
                 };
 
                 BlockIteratorV2 {
@@ -68,11 +71,11 @@ impl<B: BlockLike> BlockIteratorV2<B> {
         }
     }
 
-    fn decode_first_key_at_restart(block: &B, restart_idx: usize) -> Bytes {
+    /// The full key of the entry at a restart point, read in place.
+    fn restart_key(block: &B, restart_idx: usize) -> &[u8] {
         let restart_offset = block.offsets()[restart_idx] as usize;
-        let mut data = block.data().slice(restart_offset..);
-        let codec = SstRowCodecV2::new();
-        let (shared_bytes, key_suffix) = codec.decode_key_only(&mut data);
+        let (shared_bytes, key_suffix) =
+            SstRowCodecV2::new().decode_key_in_place(&block.data()[restart_offset..]);
         assert_eq!(shared_bytes, 0, "restart point should have shared_bytes=0");
         key_suffix
     }
@@ -88,7 +91,9 @@ impl<B: BlockLike> AscendingState<B> {
         self.current_restart_idx = restart_idx;
         self.offset_in_block = self.block.offsets()[restart_idx] as usize;
         self.entries_since_restart = 0;
-        self.current_key = BlockIteratorV2::decode_first_key_at_restart(&self.block, restart_idx);
+        self.current_key.clear();
+        self.current_key
+            .extend_from_slice(BlockIteratorV2::restart_key(&self.block, restart_idx));
         self.exhausted = false;
     }
 
@@ -112,18 +117,6 @@ impl<B: BlockLike> AscendingState<B> {
         ))
     }
 
-    fn decode_key_at_offset(&self, offset: usize, prev_key: &[u8]) -> Bytes {
-        let mut data = self.block.data().slice(offset..);
-        let codec = SstRowCodecV2::new();
-        let (shared_bytes, key_suffix) = codec.decode_key_only(&mut data);
-        let shared = shared_bytes as usize;
-
-        let mut full_key = BytesMut::with_capacity(shared + key_suffix.len());
-        full_key.extend_from_slice(&prev_key[..shared]);
-        full_key.extend_from_slice(&key_suffix);
-        full_key.freeze()
-    }
-
     fn is_empty(&self) -> bool {
         self.exhausted || self.offset_in_block >= self.block.data().len()
     }
@@ -142,9 +135,9 @@ impl<B: BlockLike> AscendingState<B> {
 
         while low < high {
             let mid = low + (high - low) / 2;
-            let restart_key = BlockIteratorV2::decode_first_key_at_restart(&self.block, mid);
+            let restart_key = BlockIteratorV2::restart_key(&self.block, mid);
 
-            if restart_key.as_ref() < target {
+            if restart_key < target {
                 low = mid + 1;
             } else {
                 high = mid;
@@ -163,16 +156,9 @@ impl<B: BlockLike> AscendingState<B> {
             return 0;
         }
 
-        let low = self.binary_search_restarts(target);
-
-        if low < restarts.len() {
-            let restart_key = BlockIteratorV2::decode_first_key_at_restart(&self.block, low);
-            if restart_key.as_ref() == target {
-                return low.saturating_sub(1);
-            }
-        }
-
-        low.saturating_sub(1)
+        // A restart whose key equals `target` also starts from the previous
+        // restart, which this already is.
+        self.binary_search_restarts(target).saturating_sub(1)
     }
 
     /// Find the restart region to begin a descending scan for `target`.
@@ -188,14 +174,13 @@ impl<B: BlockLike> AscendingState<B> {
         let low = self.binary_search_restarts(target);
 
         if low < restarts.len() {
-            let restart_key = BlockIteratorV2::decode_first_key_at_restart(&self.block, low);
-            if restart_key.as_ref() == target {
+            let restart_key = BlockIteratorV2::restart_key(&self.block, low);
+            if restart_key == target {
                 // Scan forward to find the last restart with the same first key.
                 let mut last = low;
                 while last + 1 < restarts.len() {
-                    let next_key =
-                        BlockIteratorV2::decode_first_key_at_restart(&self.block, last + 1);
-                    if next_key.as_ref() != target {
+                    let next_key = BlockIteratorV2::restart_key(&self.block, last + 1);
+                    if next_key != target {
                         break;
                     }
                     last += 1;
@@ -214,16 +199,18 @@ impl<B: BlockLike> AscendingState<B> {
             .map(|&off| off as usize)
             .unwrap_or_else(|| self.block.data().len())
     }
+}
 
-    fn advance_past_current_entry(&mut self) -> Result<(), SlateDBError> {
-        let mut data = self.block.data().slice(self.offset_in_block..);
-        let codec = SstRowCodecV2::new();
-        codec.decode(&mut data)?;
-        let bytes_consumed = self.block.data().len() - self.offset_in_block - data.len();
-        self.offset_in_block += bytes_consumed;
-        self.entries_since_restart += 1;
-        Ok(())
+/// Compares the key made of `prefix` followed by `suffix` with `target`,
+/// without joining them.
+fn compare_split_key(prefix: &[u8], suffix: &[u8], target: &[u8]) -> std::cmp::Ordering {
+    if prefix.len() > target.len() {
+        // Equal on `target`'s length means the key is longer, so greater.
+        return prefix.cmp(target);
     }
+    prefix
+        .cmp(&target[..prefix.len()])
+        .then_with(|| suffix.cmp(&target[prefix.len()..]))
 }
 
 #[async_trait]
@@ -242,7 +229,8 @@ impl<B: BlockLike> RowEntryIterator for BlockIteratorV2<B> {
                 let (entry, new_offset) = state.decode_entry_at_current_offset()?;
 
                 // Update current key before advancing
-                state.current_key = entry.key.clone();
+                state.current_key.clear();
+                state.current_key.extend_from_slice(&entry.key);
                 state.offset_in_block = new_offset;
                 state.entries_since_restart += 1;
 
@@ -275,33 +263,37 @@ impl<B: BlockLike> RowEntryIterator for BlockIteratorV2<B> {
                 }
 
                 let start_restart_idx = state.find_restart_for_key_ascending(next_key);
+                let codec = SstRowCodecV2::new();
 
                 // Iterate through restart regions starting from binary search result.
+                // Like RocksDB's block iterator, each entry's key is compared in
+                // place against `current_key` (the previous key) plus its suffix,
+                // and `current_key` is only extended by the delta as the scan
+                // moves past an entry. The restart entry shares nothing with
+                // `current_key`, so the first comparison needs no previous key.
                 for restart_idx in start_restart_idx..state.block.offsets().len() {
                     state.seek_to_restart(restart_idx);
-
-                    if state.exhausted || state.current_key.as_ref() >= next_key {
+                    if state.exhausted {
                         return Ok(());
                     }
 
-                    // Scan entries within this restart region
                     let region_end = state.restart_region_end(restart_idx);
-                    let mut prev_key = state.current_key.clone();
-
-                    while state.offset_in_block < region_end
-                        && state.offset_in_block < state.block.data().len()
-                    {
-                        let current_key =
-                            state.decode_key_at_offset(state.offset_in_block, &prev_key);
-
-                        if current_key.as_ref() >= next_key {
-                            state.current_key = prev_key;
+                    let data_len = state.block.data().len();
+                    while state.offset_in_block < region_end && state.offset_in_block < data_len {
+                        let entry = &state.block.data()[state.offset_in_block..];
+                        let (shared, suffix) = codec.decode_key_in_place(entry);
+                        let order =
+                            compare_split_key(&state.current_key[..shared], suffix, next_key);
+                        if order != std::cmp::Ordering::Less {
+                            // Positioned at this entry, with `current_key` the
+                            // previous key (the restart key at a restart point).
                             return Ok(());
                         }
-
-                        state.advance_past_current_entry()?;
-                        prev_key = current_key;
-                        state.current_key = prev_key.clone();
+                        let entry_len = codec.encoded_len(entry)?;
+                        state.current_key.truncate(shared);
+                        state.current_key.extend_from_slice(suffix);
+                        state.offset_in_block += entry_len;
+                        state.entries_since_restart += 1;
                     }
                 }
 
@@ -332,9 +324,9 @@ impl<B: BlockLike> DescendingBlockIteratorV2<B> {
     pub(crate) fn new(block: B) -> Self {
         let num_restarts = block.offsets().len();
         let initial_key = if num_restarts == 0 {
-            Bytes::new()
+            Vec::new()
         } else {
-            BlockIteratorV2::decode_first_key_at_restart(&block, 0)
+            BlockIteratorV2::restart_key(&block, 0).to_vec()
         };
 
         DescendingBlockIteratorV2 {
@@ -367,7 +359,8 @@ impl<B: BlockLike> DescendingBlockIteratorV2<B> {
 
         while self.ascending.offset_in_block < region_end && !self.ascending.is_empty() {
             let (entry, new_offset) = self.ascending.decode_entry_at_current_offset()?;
-            self.ascending.current_key = entry.key.clone();
+            self.ascending.current_key.clear();
+            self.ascending.current_key.extend_from_slice(&entry.key);
             self.ascending.offset_in_block = new_offset;
             self.ascending.entries_since_restart += 1;
             self.cached_entries.push(entry);
@@ -547,6 +540,7 @@ mod tests {
     use crate::format::block::Block;
     use crate::format::sst::BlockBuilder;
     use crate::types::ValueDeletable;
+    use bytes::Bytes;
 
     fn make_entry(key: &[u8], value: &[u8], seq: u64) -> RowEntry {
         RowEntry::new(

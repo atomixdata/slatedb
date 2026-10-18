@@ -219,16 +219,30 @@ impl SstRowCodecV2 {
         })
     }
 
-    /// Decode only the key portion for seek optimization.
-    /// Returns (shared_bytes, key_suffix).
-    pub(crate) fn decode_key_only(&self, data: &mut impl Buf) -> (u32, Bytes) {
-        let shared_bytes = decode_varint(data);
-        let unshared_bytes = decode_varint(data) as usize;
-        let _value_len = decode_varint(data);
+    /// Reads the key of the entry at the start of `data` in place, for seeks.
+    /// Returns the number of bytes it shares with the previous key and its
+    /// suffix, borrowed from `data`.
+    pub(crate) fn decode_key_in_place<'a>(&self, data: &'a [u8]) -> (usize, &'a [u8]) {
+        let mut buf = data;
+        let shared_bytes = decode_varint(&mut buf) as usize;
+        let unshared_bytes = decode_varint(&mut buf) as usize;
+        let _value_len = decode_varint(&mut buf);
+        (shared_bytes, &buf[..unshared_bytes])
+    }
 
-        let key_suffix = data.copy_to_bytes(unshared_bytes);
-
-        (shared_bytes, key_suffix)
+    /// Returns the encoded length of the entry at the start of `data`, reading
+    /// only its header and flags.
+    pub(crate) fn encoded_len(&self, data: &[u8]) -> Result<usize, SlateDBError> {
+        let mut buf = data;
+        let _shared_bytes = decode_varint(&mut buf);
+        let unshared_bytes = decode_varint(&mut buf) as usize;
+        let value_len = decode_varint(&mut buf) as usize;
+        // Key suffix, value, then the u64 seq before the flags.
+        let flags_at = data.len() - buf.len() + unshared_bytes + value_len + 8;
+        let flags = self.decode_flags(data[flags_at])?;
+        let timestamps = usize::from(flags.contains(RowFlags::HAS_EXPIRE_TS))
+            + usize::from(flags.contains(RowFlags::HAS_CREATE_TS));
+        Ok(flags_at + 1 + 8 * timestamps)
     }
 
     fn decode_flags(&self, flags: u8) -> Result<RowFlags, SlateDBError> {
@@ -342,12 +356,15 @@ mod tests {
         codec.encode(&mut buf, &entry);
 
         // when: decoding key only
-        let mut slice = buf.as_slice();
-        let (decoded_shared, decoded_suffix) = codec.decode_key_only(&mut slice);
+        let (decoded_shared, decoded_suffix) = codec.decode_key_in_place(&buf);
 
         // then: key info is correct
-        assert_eq!(decoded_shared, shared_bytes);
-        assert_eq!(decoded_suffix.as_ref(), key_suffix.as_slice());
+        assert_eq!(decoded_shared, shared_bytes as usize);
+        assert_eq!(decoded_suffix, key_suffix.as_slice());
+        // and the encoded length matches what a full decode consumes
+        let mut slice = buf.as_slice();
+        codec.decode(&mut slice).unwrap();
+        assert_eq!(codec.encoded_len(&buf).unwrap(), buf.len() - slice.len());
     }
 
     #[test]
@@ -419,13 +436,13 @@ mod tests {
         let original_len = buf.len();
 
         // when: decoding key only
-        let mut slice = buf.as_slice();
-        let _ = codec.decode_key_only(&mut slice);
+        let (_, suffix) = codec.decode_key_in_place(&buf);
 
-        // then: buffer is advanced past the varints and key_suffix
-        // shared_bytes(1) + unshared_bytes(1) + value_len(1) + key_suffix(3) = 6 bytes consumed
-        let consumed = original_len - slice.len();
-        assert_eq!(consumed, 6); // 1 + 1 + 1 + 3 = 6
+        // then: the suffix starts after the varints and spans the key suffix
+        // shared_bytes(1) + unshared_bytes(1) + value_len(1) + key_suffix(3) = 6 bytes
+        let end = suffix.as_ptr() as usize + suffix.len() - buf.as_ptr() as usize;
+        assert_eq!(end, 6); // 1 + 1 + 1 + 3 = 6
+        assert!(end <= original_len);
     }
 
     #[test]
