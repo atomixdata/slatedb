@@ -82,12 +82,29 @@ fn verifier_options() -> VerifierOptions {
 #[derive(PartialEq, Eq, Clone)]
 pub(crate) struct SsTableIndexOwned {
     data: Bytes,
+    /// Each block's first key as `(offset, len)` into `data`, built once when the index is
+    /// decoded. Like RocksDB's restart array, a search probe is then one read from this array
+    /// and an in-place key comparison, instead of the table and vector lookups of
+    /// `block_meta().get(i).first_key()`.
+    first_keys: Box<[(u32, u32)]>,
 }
 
 impl SsTableIndexOwned {
     pub(crate) fn new(data: Bytes) -> Result<Self, InvalidFlatbuffer> {
-        flatbuffers::root_with_opts::<SsTableIndex>(&verifier_options(), &data)?;
-        Ok(Self { data })
+        let index = flatbuffers::root_with_opts::<SsTableIndex>(&verifier_options(), &data)?;
+        let base = data.as_ptr() as usize;
+        let first_keys = index
+            .block_meta()
+            .iter()
+            .map(|meta| {
+                let key = meta.first_key().bytes();
+                let offset = u32::try_from(key.as_ptr() as usize - base)
+                    .expect("an SST index is smaller than 4 GiB");
+                let len = u32::try_from(key.len()).expect("a block key is smaller than 4 GiB");
+                (offset, len)
+            })
+            .collect();
+        Ok(Self { data, first_keys })
     }
 
     pub(crate) fn borrow(&self) -> SsTableIndex<'_> {
@@ -104,9 +121,21 @@ impl SsTableIndexOwned {
             .expect("clamped buffer could not be decoded to index")
     }
 
-    /// Returns the size of the SSTable index in bytes.
+    /// Returns the size of the SSTable index in bytes, including the first-key directory.
     pub(crate) fn size(&self) -> usize {
-        self.data.len()
+        self.data.len() + std::mem::size_of_val(&*self.first_keys)
+    }
+}
+
+impl RangePartitionedKeySpace for SsTableIndexOwned {
+    fn partitions(&self) -> usize {
+        self.first_keys.len()
+    }
+
+    fn partition_first_key(&self, partition: usize) -> &[u8] {
+        let (offset, len) = self.first_keys[partition];
+        let start = offset as usize;
+        &self.data[start..start + len as usize]
     }
 }
 
@@ -1563,6 +1592,80 @@ mod tests {
 
     use super::root_generated::CompactionStatus as FbCompactionStatus;
     use super::{root_generated, COMPACTIONS_FORMAT_VERSION, MANIFEST_FORMAT_VERSION};
+
+    /// Builds an index whose blocks start with `first_keys`.
+    fn index_with_first_keys(first_keys: &[&[u8]]) -> SsTableIndexOwned {
+        use super::{BlockMeta, BlockMetaArgs, SsTableIndex, SsTableIndexArgs};
+        let mut builder = flatbuffers::FlatBufferBuilder::new();
+        let block_metas: Vec<_> = first_keys
+            .iter()
+            .enumerate()
+            .map(|(i, key)| {
+                let first_key = builder.create_vector(key);
+                BlockMeta::create(
+                    &mut builder,
+                    &BlockMetaArgs {
+                        offset: i as u64 * 4096,
+                        first_key: Some(first_key),
+                        encoded_len: 4096,
+                    },
+                )
+            })
+            .collect();
+        let block_metas = builder.create_vector(&block_metas);
+        let index = SsTableIndex::create(
+            &mut builder,
+            &SsTableIndexArgs {
+                block_meta: Some(block_metas),
+            },
+        );
+        builder.finish(index, None);
+        SsTableIndexOwned::new(Bytes::copy_from_slice(builder.finished_data())).unwrap()
+    }
+
+    #[test]
+    fn test_partition_first_key() {
+        use crate::partitioned_keyspace::{
+            first_partition_including_key, last_partition_including_key, partitions_covering_range,
+            RangePartitionedKeySpace,
+        };
+        use std::ops::Bound;
+        let keys: Vec<&[u8]> = vec![b"a", b"c", b"c", b"ca", b"f", b"zz"];
+        let index = index_with_first_keys(&keys);
+        let flat = index.borrow();
+        assert_eq!(index.partitions(), keys.len());
+        for (i, key) in keys.iter().enumerate() {
+            assert_eq!(index.partition_first_key(i), *key);
+        }
+        // Searches over the directory agree with searches over the flatbuffer.
+        for probe in [
+            &b""[..],
+            b"a",
+            b"b",
+            b"c",
+            b"ca",
+            b"cb",
+            b"f",
+            b"g",
+            b"zz",
+            b"zzz",
+        ] {
+            assert_eq!(
+                first_partition_including_key(&index, probe),
+                first_partition_including_key(&flat, probe)
+            );
+            assert_eq!(
+                last_partition_including_key(&index, probe),
+                last_partition_including_key(&flat, probe)
+            );
+            assert_eq!(
+                partitions_covering_range(&index, Bound::Included(probe), Bound::Excluded(b"d")),
+                partitions_covering_range(&flat, Bound::Included(probe), Bound::Excluded(b"d"))
+            );
+        }
+        // The directory is counted in the index's cache weight.
+        assert_eq!(index.size(), index.data().len() + keys.len() * 8);
+    }
 
     #[test]
     fn test_should_encode_decode_manifest_checkpoints() {

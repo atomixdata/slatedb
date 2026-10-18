@@ -163,7 +163,7 @@ async fn warm_data(
     let index = ensure_index(table_store, handle, index_cell, segment).await?;
     for r in &intersections {
         let block_range = partitions_covering_range(
-            &index.borrow(),
+            &*index,
             r.start_bound().map(|b| b.as_ref()),
             r.end_bound().map(|b| b.as_ref()),
         );
@@ -327,8 +327,7 @@ mod tests {
             .await
             .expect("read_index");
         let block_idx =
-            partitions_covering_range(&index.borrow(), Bound::Included(key), Bound::Included(key))
-                .start;
+            partitions_covering_range(&*index, Bound::Included(key), Bound::Included(key)).start;
         let offset = index.borrow().block_meta().get(block_idx).offset();
         let cache = table_store.cache().expect("cache configured").clone();
         let cache_key: CachedKey = (sst_id, offset).into();

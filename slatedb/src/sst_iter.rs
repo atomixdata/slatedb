@@ -658,7 +658,7 @@ impl<'a> InternalSstIterator<'a> {
                 )
                 .await?;
             let block_idx_range = partitioned_keyspace::partitions_covering_range(
-                &index.borrow(),
+                &*index,
                 self.view.start_key(),
                 self.view.end_key(),
             );
@@ -830,13 +830,10 @@ impl RowEntryIterator for InternalSstIterator<'_> {
             // For ascending order, find the first block with or after the key
             let block_idx = match self.options.order {
                 IterationOrder::Ascending => {
-                    partitioned_keyspace::first_partition_including_or_after_key(
-                        &index.borrow(),
-                        next_key,
-                    )
+                    partitioned_keyspace::first_partition_including_or_after_key(&*index, next_key)
                 }
                 IterationOrder::Descending => {
-                    partitioned_keyspace::last_partition_including_key(&index.borrow(), next_key)
+                    partitioned_keyspace::last_partition_including_key(&*index, next_key)
                         .unwrap_or(self.block_idx_range.start)
                 }
             };

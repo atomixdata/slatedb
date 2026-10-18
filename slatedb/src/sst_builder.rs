@@ -1670,7 +1670,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(88, index.size());
+        // 88 encoded bytes plus the 8-byte first-key directory entry of each of the 2 blocks.
+        assert_eq!(88 + 2 * 8, index.size());
     }
 
     #[tokio::test]

@@ -1047,7 +1047,7 @@ impl TableStore {
         let meta = index_borrow.block_meta();
         for range in ranges {
             let blocks = partitions_covering_range(
-                &index_borrow,
+                &*index,
                 range.start_bound().map(|b| b.as_ref()),
                 range.end_bound().map(|b| b.as_ref()),
             );
