@@ -1,4 +1,5 @@
 use crate::bytes_range::BytesRange;
+use crate::comparable_range::ComparableRange;
 use crate::config::CompressionCodec;
 use crate::error::SlateDBError;
 use crate::manifest::{Manifest, ManifestCore};
@@ -216,11 +217,18 @@ impl SsTableView {
         }
     }
 
-    pub(crate) fn intersects_range(&self, end_bound: Bound<Bytes>, range: &BytesRange) -> bool {
-        let sst_range =
-            BytesRange::new(Unbounded, end_bound.clone()).intersect(&self.effective_range);
+    /// Whether this SST's slot in its sorted run (its effective range, cut
+    /// off at `end_bound`) intersects `range`. Works on borrowed bounds, so a
+    /// lookup clones no keys.
+    pub(crate) fn intersects_range(
+        &self,
+        end_bound: Bound<&[u8]>,
+        range: &ComparableRange<&[u8]>,
+    ) -> bool {
+        let effective = borrowed_range(&self.effective_range);
+        let sst_range = ComparableRange::new(Unbounded, end_bound).intersect(&effective);
         match sst_range {
-            Some(sst_range) => BytesRange::new(sst_range.start_bound().cloned(), end_bound)
+            Some(sst_range) => ComparableRange::new(sst_range.start_bound().cloned(), end_bound)
                 .intersect(range)
                 .is_some(),
             None => false,
@@ -626,7 +634,7 @@ impl SortedRun {
     ///
     /// The bound is normally the next view's start key, but becomes inclusive
     /// when adjacent views overlap on that boundary key.
-    fn table_end_bound(&self, idx: usize) -> Bound<Bytes> {
+    fn table_end_bound(&self, idx: usize) -> Bound<&[u8]> {
         let current_sst = &self.sst_views[idx];
         if idx + 1 < self.sst_views.len() {
             let next_sst = &self.sst_views[idx + 1];
@@ -634,9 +642,9 @@ impl SortedRun {
                 .compacted_effective_range()
                 .contains(next_sst.compacted_effective_start_key())
             {
-                Included(next_sst.compacted_effective_start_key().clone())
+                Included(next_sst.compacted_effective_start_key().as_ref())
             } else {
-                Excluded(next_sst.compacted_effective_start_key().clone())
+                Excluded(next_sst.compacted_effective_start_key().as_ref())
             }
         } else {
             Unbounded
@@ -652,7 +660,7 @@ impl SortedRun {
         let Some(max_idx) = self.find_last_sst_with_range_covering_key(key) else {
             return 0..0;
         };
-        let point_range = BytesRange::from_slice(key..=key);
+        let point_range = ComparableRange::new(Included(key), Included(key));
         if !self.sst_views[max_idx].intersects_range(self.table_end_bound(max_idx), &point_range) {
             return 0..0;
         }
@@ -673,20 +681,21 @@ impl SortedRun {
         if views.is_empty() {
             return 0..0;
         }
+        let range = &borrowed_range(range);
 
         // Upper bound: last SST whose start key falls within the range's upper
         // bound. SST[i]'s slot begins at start_key[i]; if start_key[i] is past
         // the range's upper bound the slot cannot overlap.
         let max_idx = match range.end_bound() {
             Included(hi) => {
-                let p = views.partition_point(|sst| sst.compacted_effective_start_key() <= hi);
+                let p = views.partition_point(|sst| sst.compacted_effective_start_key() <= *hi);
                 if p == 0 {
                     return 0..0;
                 }
                 p - 1
             }
             Excluded(hi) => {
-                let p = views.partition_point(|sst| sst.compacted_effective_start_key() < hi);
+                let p = views.partition_point(|sst| sst.compacted_effective_start_key() < *hi);
                 if p == 0 {
                     return 0..0;
                 }
@@ -704,7 +713,7 @@ impl SortedRun {
         // by the backward walk below.
         let start_candidate = match range.start_bound() {
             Included(lo) | Excluded(lo) => views
-                .partition_point(|sst| sst.compacted_effective_start_key() <= lo)
+                .partition_point(|sst| sst.compacted_effective_start_key() <= *lo)
                 .checked_sub(1),
             Unbounded => None,
         };
@@ -919,6 +928,15 @@ impl<'a> StateModifier<'a> {
     fn finish(self) {
         self.db_state.state = Arc::new(self.state);
     }
+}
+
+/// `range` with borrowed bounds, for comparisons that need no copies.
+fn borrowed_range(range: &BytesRange) -> ComparableRange<&[u8]> {
+    use crate::bytes_range::ByteRangeBounds;
+    ComparableRange::new(
+        ByteRangeBounds::start_bound(range),
+        ByteRangeBounds::end_bound(range),
+    )
 }
 
 #[cfg(test)]
