@@ -17,7 +17,7 @@ use parking_lot::Mutex;
 use crate::db_common::extract_segment_prefix;
 use crate::error::SlateDBError;
 use crate::iter::{IterationOrder, RowEntryIterator};
-use crate::prefix_extractor::PrefixExtractor;
+use crate::prefix_extractor::{PrefixExtractor, PrefixTarget};
 use crate::reader::ReadTrace;
 use crate::seq_tracker::{SequenceTracker, TrackedSeq};
 use crate::types::RowEntry;
@@ -110,6 +110,71 @@ pub(crate) struct KVTable {
     /// paths after the antichain check. Empty when no extractor is
     /// configured.
     touched_segments: Mutex<std::collections::BTreeSet<Bytes>>,
+    /// Bloom filter of the key prefixes in this table, if configured.
+    prefix_bloom: Option<PrefixBloom>,
+}
+
+/// Configures a [`PrefixBloom`] for each new memtable, as RocksDB's
+/// memtable prefix bloom: a prefix lookup in a table that holds no key with
+/// that prefix is answered without descending the skiplist.
+#[derive(Clone)]
+pub(crate) struct MemtablePrefixBloom {
+    pub(crate) extractor: Arc<dyn PrefixExtractor>,
+    /// Filter size in bits, rounded up to a power of two.
+    pub(crate) bits: usize,
+}
+
+const PREFIX_BLOOM_PROBES: u32 = 6;
+
+/// A bloom filter over the prefixes (as `extractor` defines them) of every
+/// key put into a memtable. Bits are set before the key is inserted, so a
+/// reader that finds a key's bits clear also cannot find the key.
+pub(crate) struct PrefixBloom {
+    extractor: Arc<dyn PrefixExtractor>,
+    words: Box<[AtomicU64]>,
+    mask: u64,
+}
+
+impl PrefixBloom {
+    fn new(config: &MemtablePrefixBloom) -> Self {
+        let bits = config.bits.next_power_of_two().max(64);
+        Self {
+            extractor: Arc::clone(&config.extractor),
+            words: (0..bits / 64).map(|_| AtomicU64::new(0)).collect(),
+            mask: (bits - 1) as u64,
+        }
+    }
+
+    fn bits(&self, prefix: &[u8]) -> impl Iterator<Item = u64> + '_ {
+        let hash = siphasher::sip::SipHasher13::new().hash(prefix);
+        let h1 = hash & 0xffff_ffff;
+        let h2 = (hash >> 32) | 1;
+        (0..u64::from(PREFIX_BLOOM_PROBES))
+            .map(move |i| (h1.wrapping_add(i.wrapping_mul(h2))) & self.mask)
+    }
+
+    fn add(&self, key: &Bytes) {
+        let Some(len) = self.extractor.prefix_len(&PrefixTarget::Point(key.clone())) else {
+            return;
+        };
+        for bit in self.bits(&key[..len]) {
+            self.words[(bit / 64) as usize].fetch_or(1 << (bit % 64), Ordering::Release);
+        }
+    }
+
+    /// Whether the table may hold a key starting with `prefix`. Answers
+    /// `true` unless `prefix` is exactly an extracted prefix.
+    fn may_contain_prefix(&self, prefix: &Bytes) -> bool {
+        match self
+            .extractor
+            .prefix_len(&PrefixTarget::Prefix(prefix.clone()))
+        {
+            Some(len) if len == prefix.len() => self.bits(prefix).all(|bit| {
+                self.words[(bit / 64) as usize].load(Ordering::Acquire) & (1 << (bit % 64)) != 0
+            }),
+            _ => true,
+        }
+    }
 }
 
 pub(crate) struct KVTableMetadata {
@@ -133,6 +198,15 @@ impl WritableKVTable {
     pub(crate) fn new() -> Self {
         Self {
             table: Arc::new(KVTable::new()),
+        }
+    }
+
+    /// A table with a prefix bloom filter if `bloom` is configured.
+    pub(crate) fn with_prefix_bloom(bloom: Option<&MemtablePrefixBloom>) -> Self {
+        let mut table = KVTable::new();
+        table.prefix_bloom = bloom.map(PrefixBloom::new);
+        Self {
+            table: Arc::new(table),
         }
     }
 
@@ -376,6 +450,7 @@ impl KVTable {
             first_seq: AtomicU64::new(u64::MAX),
             sequence_tracker: Mutex::new(SequenceTracker::new()),
             touched_segments: Mutex::new(std::collections::BTreeSet::new()),
+            prefix_bloom: None,
         }
     }
 
@@ -511,6 +586,11 @@ impl KVTable {
     /// descent, so a reader can skip the table without building a range
     /// iterator.
     pub(crate) fn contains_prefix(&self, prefix: &Bytes) -> bool {
+        if let Some(bloom) = &self.prefix_bloom {
+            if !bloom.may_contain_prefix(prefix) {
+                return false;
+            }
+        }
         let start = SequencedKey::new(prefix.clone(), u64::MAX);
         self.map
             .lower_bound(Bound::Included(&start))
@@ -538,6 +618,10 @@ impl KVTable {
     }
 
     pub(crate) fn put(&self, row: RowEntry) {
+        // Before the insert, so readers never see the key without its bits.
+        if let Some(bloom) = &self.prefix_bloom {
+            bloom.add(&row.key);
+        }
         let internal_key = SequencedKey::new(row.key.clone(), row.seq);
         let previous_size = Cell::new(None);
 
@@ -603,6 +687,50 @@ mod tests {
     use crate::{proptest_util, test_utils};
     use rstest::rstest;
     use tokio::runtime::Runtime;
+
+    #[test]
+    fn test_contains_prefix_with_prefix_bloom() {
+        struct Fixed3;
+        impl PrefixExtractor for Fixed3 {
+            fn name(&self) -> &str {
+                "fixed3"
+            }
+
+            fn prefix_len(&self, target: &PrefixTarget) -> Option<usize> {
+                let len = match target {
+                    PrefixTarget::Point(key) => key.len(),
+                    PrefixTarget::Prefix(prefix) => prefix.len(),
+                };
+                (len >= 3).then_some(3)
+            }
+        }
+        let bloom = MemtablePrefixBloom {
+            extractor: Arc::new(Fixed3),
+            bits: 1 << 16,
+        };
+        let writable = WritableKVTable::with_prefix_bloom(Some(&bloom));
+        writable.put(RowEntry::new_value(b"abc1", b"v", 1));
+        writable.put(RowEntry::new_value(b"xyz2", b"v", 2));
+        let table = writable.table();
+
+        assert!(table.contains_prefix(&Bytes::from_static(b"abc")));
+        assert!(table.contains_prefix(&Bytes::from_static(b"xyz")));
+        assert!(!table.contains_prefix(&Bytes::from_static(b"abd")));
+        // A probe that is not a whole extracted prefix is answered by the
+        // skiplist.
+        assert!(table.contains_prefix(&Bytes::from_static(b"ab")));
+        // The bloom alone rules out a prefix no key has.
+        let prefix_bloom = table.prefix_bloom.as_ref().unwrap();
+        assert!(prefix_bloom.may_contain_prefix(&Bytes::from_static(b"abc")));
+        assert!(!prefix_bloom.may_contain_prefix(&Bytes::from_static(b"qqq")));
+        assert!(prefix_bloom.may_contain_prefix(&Bytes::from_static(b"ab")));
+
+        // A table without the bloom answers the same.
+        let plain = WritableKVTable::new();
+        plain.put(RowEntry::new_value(b"abc1", b"v", 1));
+        assert!(plain.table().contains_prefix(&Bytes::from_static(b"abc")));
+        assert!(!plain.table().contains_prefix(&Bytes::from_static(b"abd")));
+    }
 
     #[tokio::test]
     async fn test_memtable_iter() {

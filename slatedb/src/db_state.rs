@@ -3,7 +3,7 @@ use crate::comparable_range::ComparableRange;
 use crate::config::CompressionCodec;
 use crate::error::SlateDBError;
 use crate::manifest::{Manifest, ManifestCore};
-use crate::mem_table::{ImmutableMemtable, KVTable, WritableKVTable};
+use crate::mem_table::{ImmutableMemtable, KVTable, MemtablePrefixBloom, WritableKVTable};
 use crate::reader::DbStateReader;
 use bytes::Bytes;
 use serde::Serialize;
@@ -757,6 +757,8 @@ impl SortedRun {
 
 pub(crate) struct DbState {
     memtable: WritableKVTable,
+    /// The prefix bloom each new memtable gets, if configured.
+    memtable_prefix_bloom: Option<MemtablePrefixBloom>,
     state: Arc<COWDbState>,
 }
 
@@ -826,6 +828,7 @@ impl DbState {
     pub(crate) fn new(manifest: DirtyObject<Manifest>) -> Self {
         Self {
             memtable: WritableKVTable::new(),
+            memtable_prefix_bloom: None,
             state: Arc::new(COWDbState {
                 imm_memtable: VecDeque::new(),
                 manifest,
@@ -848,8 +851,22 @@ impl DbState {
         &self.memtable
     }
 
+    /// Gives the current (still empty) memtable and every later one a prefix
+    /// bloom filter.
+    pub(crate) fn set_memtable_prefix_bloom(&mut self, bloom: MemtablePrefixBloom) {
+        assert!(
+            self.memtable.is_empty(),
+            "the prefix bloom must be set before any write"
+        );
+        self.memtable = WritableKVTable::with_prefix_bloom(Some(&bloom));
+        self.memtable_prefix_bloom = Some(bloom);
+    }
+
     pub(crate) fn freeze_memtable(&mut self, replay_after_wal_id: u64) {
-        let old_memtable = std::mem::replace(&mut self.memtable, WritableKVTable::new());
+        let old_memtable = std::mem::replace(
+            &mut self.memtable,
+            WritableKVTable::with_prefix_bloom(self.memtable_prefix_bloom.as_ref()),
+        );
         self.modify(|modifier| {
             modifier
                 .state

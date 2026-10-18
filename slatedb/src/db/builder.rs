@@ -198,6 +198,7 @@ pub struct DbBuilder<P: Into<Path>> {
     filter_policies: Vec<Arc<dyn FilterPolicy>>,
     metrics_recorder: Arc<dyn MetricsRecorder>,
     segment_extractor: Option<Arc<dyn crate::prefix_extractor::PrefixExtractor>>,
+    memtable_prefix_bloom: Option<crate::mem_table::MemtablePrefixBloom>,
     wal_writer_init: Option<Box<dyn wal::WriterInit>>,
 }
 
@@ -230,6 +231,7 @@ impl<P: Into<Path>> DbBuilder<P> {
             filter_policies: default_filter_policies(),
             metrics_recorder: Arc::new(NoopMetricsRecorder::new()),
             segment_extractor: None,
+            memtable_prefix_bloom: None,
             wal_writer_init: None,
         }
     }
@@ -247,6 +249,22 @@ impl<P: Into<Path>> DbBuilder<P> {
         extractor: Arc<dyn crate::prefix_extractor::PrefixExtractor>,
     ) -> Self {
         self.segment_extractor = Some(extractor);
+        self
+    }
+
+    /// Gives each memtable a bloom filter of `bits` bits over its keys'
+    /// prefixes as `extractor` defines them. A prefix lookup, such as
+    /// [`Db::scan_prefix_by_recency`], then skips a memtable that holds no
+    /// key with the prefix without searching it. The prefix a lookup passes
+    /// must be the full prefix `extractor` extracts from the keys it should
+    /// find. Off by default.
+    pub fn with_memtable_prefix_bloom(
+        mut self,
+        extractor: Arc<dyn crate::prefix_extractor::PrefixExtractor>,
+        bits: usize,
+    ) -> Self {
+        self.memtable_prefix_bloom =
+            Some(crate::mem_table::MemtablePrefixBloom { extractor, bits });
         self
     }
 
@@ -741,6 +759,10 @@ impl<P: Into<Path>> DbBuilder<P> {
             )
             .await?,
         );
+        // Before WAL replay, so replayed keys are in the filter too.
+        if let Some(bloom) = &self.memtable_prefix_bloom {
+            inner.state.write().set_memtable_prefix_bloom(bloom.clone());
+        }
 
         // Setup background tasks
         let tokio_handle = Handle::current();
