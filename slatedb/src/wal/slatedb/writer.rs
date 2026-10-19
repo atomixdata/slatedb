@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 use std::fmt::{Debug, Formatter};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
@@ -92,6 +92,62 @@ struct SlateDbWalWriterInner {
     flush_task_exited_reason: Option<WalError>,
     /// The channel to send the flush work to the background worker.
     flush_tx: SafeSender<WalFlushWork>,
+    /// The status as of its last computation, for observers that find the
+    /// lock taken.
+    published: Arc<PublishedWalStatus>,
+}
+
+/// A [`WalStatus`] as of its last computation, readable without the WAL lock.
+///
+/// The writer holds the WAL lock exclusively while it appends a write group,
+/// and every write checks the WAL status for backpressure. Reading the status
+/// through the lock would stall each write that arrives during an append.
+#[derive(Default)]
+struct PublishedWalStatus {
+    estimated_bytes: AtomicUsize,
+    last_flushed_wal_id: AtomicU64,
+    /// The last flushed sequence number plus one, or zero before the first
+    /// flush.
+    last_flushed_seq_plus_one: AtomicU64,
+    buffered_wal_entries_count: AtomicUsize,
+    closed: AtomicBool,
+}
+
+impl PublishedWalStatus {
+    fn store(&self, status: &WalStatus) {
+        self.estimated_bytes
+            .store(status.estimated_bytes, Ordering::Relaxed);
+        self.last_flushed_wal_id
+            .store(status.last_flushed_wal_id, Ordering::Relaxed);
+        let seq_plus_one = status.last_flushed_seq.map_or(0, |seq| {
+            seq.checked_add(1)
+                .expect("sequence numbers stay below u64::MAX")
+        });
+        self.last_flushed_seq_plus_one
+            .store(seq_plus_one, Ordering::Relaxed);
+        self.buffered_wal_entries_count
+            .store(status.buffered_wal_entries_count, Ordering::Relaxed);
+        self.closed
+            .store(status.closed_reason.is_some(), Ordering::Relaxed);
+    }
+
+    /// Returns the published status, or `None` once the WAL has closed: the
+    /// reason it closed is only available under the lock.
+    fn load(&self) -> Option<WalStatus> {
+        if self.closed.load(Ordering::Relaxed) {
+            return None;
+        }
+        Some(WalStatus {
+            closed_reason: None,
+            estimated_bytes: self.estimated_bytes.load(Ordering::Relaxed),
+            last_flushed_wal_id: self.last_flushed_wal_id.load(Ordering::Relaxed),
+            last_flushed_seq: self
+                .last_flushed_seq_plus_one
+                .load(Ordering::Relaxed)
+                .checked_sub(1),
+            buffered_wal_entries_count: self.buffered_wal_entries_count.load(Ordering::Relaxed),
+        })
+    }
 }
 
 /// Stores entries to the write-ahead log (WAL) in memory.
@@ -151,7 +207,10 @@ impl SlateDbWalWriter {
             last_flushed_seq: None,
             flush_task_exited_reason: None,
             flush_tx,
+            published: Arc::default(),
         };
+        // Publishes the initial status.
+        inner.compute_status(&table_store);
         let inner = Arc::new(parking_lot::RwLock::new(inner));
         let stats = Arc::new(WalBufferStats::new(recorder));
         let wal_flush_handler = WalFlushHandler {
@@ -253,6 +312,7 @@ impl WalWriter for SlateDbWalWriter {
 
     fn observer(&self) -> Box<dyn wal::WalObserver> {
         Box::new(SlateDbWalObserver {
+            published: self.inner.read().published.clone(),
             inner: self.inner.clone(),
             table_store: self.table_store.clone(),
         })
@@ -374,13 +434,15 @@ impl SlateDbWalWriterInner {
             .map(|(_, wal)| wal.len())
             .sum::<usize>();
         let buffered_wal_entries_count = self.current_wal.len() + flushing_wal_entries_count;
-        WalStatus {
+        let status = WalStatus {
             closed_reason: self.flush_task_exited_reason.clone(),
             estimated_bytes: self.estimated_bytes(table_store),
             last_flushed_wal_id: self.last_flushed_wal_id,
             last_flushed_seq: self.last_flushed_seq,
             buffered_wal_entries_count,
-        }
+        };
+        self.published.store(&status);
+        status
     }
 
     fn mark_closed(&mut self, reason: WalError, table_store: &WalTableStore) -> WalStatus {
@@ -920,12 +982,20 @@ impl MessageHandler<WalFlushWork> for WalFlushHandler {
 struct SlateDbWalObserver {
     inner: Arc<parking_lot::RwLock<SlateDbWalWriterInner>>,
     table_store: Arc<WalTableStore>,
+    published: Arc<PublishedWalStatus>,
 }
 
 impl wal::WalObserver for SlateDbWalObserver {
-    /// Gets information about the Wal buffer's current state
+    /// Gets information about the Wal buffer's current state, as of its last
+    /// computation if the writer holds the lock.
     fn status(&self) -> Result<WalStatus, WalStatus> {
-        self.inner.read().status(self.table_store.as_ref())
+        if let Some(inner) = self.inner.try_read() {
+            return inner.status(self.table_store.as_ref());
+        }
+        match self.published.load() {
+            Some(status) => Ok(status),
+            None => self.inner.read().status(self.table_store.as_ref()),
+        }
     }
 
     fn subscribe(&self, listener: wal::WalStatusListener) -> Result<(), WalError> {
@@ -1268,6 +1338,36 @@ mod tests {
             .monitor_on(&Handle::current())
             .expect("failed to monitor executor");
         (wal_buffer, table_store, status_manager, recorder)
+    }
+
+    #[tokio::test]
+    async fn test_observer_status_while_writer_holds_lock() {
+        let (mut wal_buffer, _, _, _) = setup_wal_buffer().await;
+        wal_buffer
+            .append(&[make_entry("key1", "value1", 1, None)])
+            .await
+            .unwrap();
+        let observer = wal_buffer.observer();
+        let expected = observer.status().unwrap();
+
+        // Hold the lock as an append does; the observer must not wait for it.
+        let guard = wal_buffer.inner.write();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || tx.send(observer.status()).unwrap());
+        let status = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("status waited for the WAL lock")
+            .unwrap();
+        drop(guard);
+
+        assert_eq!(status.estimated_bytes, expected.estimated_bytes);
+        assert_eq!(status.last_flushed_wal_id, expected.last_flushed_wal_id);
+        assert_eq!(status.last_flushed_seq, expected.last_flushed_seq);
+        assert_eq!(
+            status.buffered_wal_entries_count,
+            expected.buffered_wal_entries_count
+        );
+        assert!(expected.buffered_wal_entries_count > 0);
     }
 
     #[tokio::test]
