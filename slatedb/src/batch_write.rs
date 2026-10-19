@@ -37,6 +37,7 @@ use crate::db_state::DbState;
 use crate::db_transaction::DbTransaction;
 use crate::dispatcher::MessageHandler;
 use crate::mem_table::KVTable;
+use crate::memtable_insert::MemtableInsertPool;
 use crate::types::RowEntry;
 use crate::utils::WatchableOnceCellReader;
 use crate::wal::{FlushResultFuture, WalWriter};
@@ -51,17 +52,14 @@ pub(crate) const WRITE_BATCH_TASK_NAME: &str = "writer";
 
 pub(crate) type WriteBatchResult = Result<WriteHandle, SlateDBError>;
 
-/// Environment variable with the number of tasks that insert a group of
-/// queued writes into the memtable. 1 (the default) applies each write on its
-/// own; above 1 the writer takes every queued write as one group.
+/// Environment variable with the number of threads that insert a group of
+/// queued writes into the memtable: the writer and helper threads. 1 (the
+/// default) applies each write on its own; above 1 the writer takes every
+/// queued write as one group.
 const MEMTABLE_INSERT_TASKS_ENV: &str = "SLATEDB_MEMTABLE_INSERT_TASKS";
 
 /// The most queued writes the writer takes as one group.
 const MAX_GROUP_WRITES: usize = 4096;
-
-/// A group inserts with one task per this many entries, up to the configured
-/// number of tasks, so small groups skip the task handoff.
-const MIN_ENTRIES_PER_INSERT_TASK: usize = 64;
 
 /// A batch with a sequence number and a place in the WAL, not yet in the
 /// memtable or visible to readers.
@@ -133,9 +131,11 @@ impl std::fmt::Debug for BatchWriterMessage {
 pub(crate) struct WriteBatchEventHandler {
     db_inner: Arc<DbInner>,
     wal_writer: Option<Box<dyn WalWriter>>,
-    /// Tasks that insert a group of writes into the memtable. See
+    /// Threads that insert a group of writes into the memtable. See
     /// [`MEMTABLE_INSERT_TASKS_ENV`].
     memtable_insert_tasks: usize,
+    /// The helper threads for group inserts, started on the first group.
+    insert_pool: Option<MemtableInsertPool>,
 }
 
 impl WriteBatchEventHandler {
@@ -149,6 +149,7 @@ impl WriteBatchEventHandler {
             db_inner,
             wal_writer,
             memtable_insert_tasks,
+            insert_pool: None,
         }
     }
 
@@ -200,9 +201,11 @@ impl WriteBatchEventHandler {
             return Ok(());
         }
         let started = monotonic_now();
-        self.db_inner
-            .insert_staged_writes(group, self.memtable_insert_tasks)
-            .await?;
+        let helpers = self.memtable_insert_tasks - 1;
+        let pool = self
+            .insert_pool
+            .get_or_insert_with(|| MemtableInsertPool::new(helpers));
+        self.db_inner.insert_staged_writes(group, pool)?;
         self.db_inner
             .publish_staged_writes(group, self.wal_writer.as_deref())?;
         for staged in group.drain(..) {
@@ -474,16 +477,16 @@ impl DbInner {
         Ok(Ok((prepared, batch.keys())))
     }
 
-    /// Inserts a group of staged writes into the active memtable, spreading
-    /// the entries over up to `tasks` tasks. Readers do not see them until
+    /// Inserts a group of staged writes into the active memtable, with the
+    /// pool's helper threads. Readers do not see them until
     /// [`Self::publish_staged_writes`].
     ///
     /// Only the writer task freezes the memtable, so the table captured here
     /// stays active until the inserts finish.
-    async fn insert_staged_writes(
+    fn insert_staged_writes(
         &self,
         group: &mut [StagedWrite],
-        tasks: usize,
+        pool: &MemtableInsertPool,
     ) -> Result<(), SlateDBError> {
         let step_start = monotonic_now();
         let table = {
@@ -496,31 +499,14 @@ impl DbInner {
             }
             Arc::clone(memtable.table())
         };
-        let mut entries: Vec<RowEntry> = group
+        let entries: Vec<RowEntry> = group
             .iter_mut()
             .flat_map(|staged| std::mem::take(&mut staged.write.entries))
             .collect();
-        let tasks = tasks
-            .min(entries.len() / MIN_ENTRIES_PER_INSERT_TASK)
-            .max(1);
-        let per_task = entries.len().div_ceil(tasks);
-        let mut inserts = Vec::with_capacity(tasks - 1);
-        while entries.len() > per_task {
-            let chunk = entries.split_off(entries.len() - per_task);
-            let table = Arc::clone(&table);
-            inserts.push(tokio::spawn(async move {
-                for entry in chunk {
-                    table.put(entry);
-                }
-            }));
-        }
-        for entry in entries {
-            table.put(entry);
-        }
-        for insert in inserts {
-            insert.await.map_err(|error| {
-                SlateDBError::BackgroundTaskPanic(format!("memtable insert task failed: {error}"))
-            })?;
+        if !pool.insert(&table, entries) {
+            return Err(SlateDBError::BackgroundTaskPanic(
+                "memtable insert thread panicked".to_string(),
+            ));
         }
         self.db_stats
             .write_diag
