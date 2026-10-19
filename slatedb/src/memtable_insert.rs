@@ -58,9 +58,7 @@ impl Job {
             };
             let entries = chunk.lock().take().expect("each chunk is taken once");
             let _done = ChunkDone(self);
-            for entry in entries {
-                self.table.put(entry);
-            }
+            self.table.put_all(entries);
         }
     }
 }
@@ -104,9 +102,7 @@ impl MemtableInsertPool {
     /// helper thread panicked.
     pub(crate) fn insert(&self, table: &Arc<KVTable>, mut entries: Vec<RowEntry>) -> bool {
         if self.helpers.is_empty() || entries.len() <= CHUNK_ENTRIES {
-            for entry in entries {
-                table.put(entry);
-            }
+            table.put_all(entries);
             return true;
         }
         let mut chunks = Vec::with_capacity(entries.len().div_ceil(CHUNK_ENTRIES));

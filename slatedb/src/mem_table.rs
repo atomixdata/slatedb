@@ -656,6 +656,54 @@ impl KVTable {
         }
     }
 
+    /// Inserts `rows` like [`Self::put`], but updates the table's tick,
+    /// sequence and size statistics once for all of them. Threads inserting
+    /// chunks of one group concurrently would otherwise contend on those
+    /// shared counters for every row.
+    pub(crate) fn put_all(&self, rows: Vec<RowEntry>) {
+        let mut last_tick = None;
+        let mut last_seq = 0;
+        let mut first_seq = u64::MAX;
+        for row in &rows {
+            if let Some(create_ts) = row.create_ts {
+                last_tick = Some(last_tick.map_or(create_ts, |tick: i64| tick.max(create_ts)));
+            }
+            last_seq = last_seq.max(row.seq);
+            first_seq = first_seq.min(row.seq);
+        }
+        // As in `put`, the bounds cover the rows before they are inserted.
+        if let Some(tick) = last_tick {
+            self.last_tick.fetch_max(tick, SeqCst);
+        }
+        if !rows.is_empty() {
+            self.last_seq.fetch_max(last_seq, SeqCst);
+            self.first_seq.fetch_min(first_seq, SeqCst);
+        }
+
+        let mut added = 0;
+        let mut removed = 0;
+        for row in rows {
+            // Before the insert, so readers never see the key without its bits.
+            if let Some(bloom) = &self.prefix_bloom {
+                bloom.add(&row.key);
+            }
+            let internal_key = SequencedKey::new(row.key.clone(), row.seq);
+            let previous_size = Cell::new(None);
+            added += row.estimated_size();
+            self.map.compare_insert(internal_key, row, |previous_row| {
+                // See `put`: the last call sets the size of the replaced row.
+                previous_size.set(Some(previous_row.estimated_size()));
+                true
+            });
+            removed += previous_size.take().unwrap_or(0);
+        }
+        // Add first so the count never wraps below zero in between.
+        self.entries_size_in_bytes
+            .fetch_add(added, Ordering::Relaxed);
+        self.entries_size_in_bytes
+            .fetch_sub(removed, Ordering::Relaxed);
+    }
+
     pub(crate) fn durable_watcher(&self) -> WatchableOnceCellReader<Result<(), SlateDBError>> {
         self.durable.reader()
     }
@@ -687,6 +735,37 @@ mod tests {
     use crate::{proptest_util, test_utils};
     use rstest::rstest;
     use tokio::runtime::Runtime;
+
+    #[test]
+    fn test_put_all_matches_put() {
+        let rows = vec![
+            RowEntry::new_value(b"b", b"value", 7).with_create_ts(30),
+            RowEntry::new_value(b"a", b"value", 5).with_create_ts(10),
+            RowEntry::new_value(b"c", b"longer value", 9).with_create_ts(20),
+            // Replaces the row with the same key and sequence number.
+            RowEntry::new_value(b"a", b"other value", 5).with_create_ts(10),
+            RowEntry::new_value(b"d", b"value", 3),
+        ];
+        let one_by_one = KVTable::new();
+        for row in rows.clone() {
+            one_by_one.put(row);
+        }
+        let together = KVTable::new();
+        together.put_all(rows);
+        together.put_all(Vec::new());
+
+        let (expected, actual) = (one_by_one.metadata(), together.metadata());
+        assert_eq!(actual.entry_num, 4);
+        assert_eq!(actual.entry_num, expected.entry_num);
+        assert_eq!(actual.entries_size_in_bytes, expected.entries_size_in_bytes);
+        assert_eq!(actual.last_tick, expected.last_tick);
+        assert_eq!(actual.last_seq, expected.last_seq);
+        assert_eq!(actual.first_seq, expected.first_seq);
+        assert_eq!(
+            (actual.first_seq, actual.last_seq, actual.last_tick),
+            (3, 9, 30)
+        );
+    }
 
     #[test]
     fn test_contains_prefix_with_prefix_bloom() {
