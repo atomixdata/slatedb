@@ -7,13 +7,16 @@
 //! long as they took to run. Here the writer and dedicated helper threads take
 //! small chunks of the group from a shared cursor until none are left: the
 //! writer does whatever the helpers have not started, so its wait at the end is
-//! at most one chunk.
+//! at most one chunk. The writer unparks each helper itself, so they wake
+//! together: a condition variable's `notify_all` hands its mutex from one
+//! woken thread to the next, and the last helper would start only after a
+//! chain of wakeups.
 
 use crate::mem_table::KVTable;
 use crate::types::RowEntry;
-use parking_lot::{Condvar, Mutex};
+use parking_lot::Mutex;
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 
@@ -29,17 +32,12 @@ pub(crate) struct MemtableInsertPool {
     helpers: Vec<thread::JoinHandle<()>>,
 }
 
-struct Shared {
-    state: Mutex<PoolState>,
-    wake: Condvar,
-}
-
 #[derive(Default)]
-struct PoolState {
-    job: Option<Arc<Job>>,
+struct Shared {
+    job: Mutex<Option<Arc<Job>>>,
     /// Incremented for each job, so a helper joins each job at most once.
-    generation: u64,
-    shutdown: bool,
+    generation: AtomicU64,
+    shutdown: AtomicBool,
 }
 
 /// The chunks of one group, taken in turn by the writer and the helpers.
@@ -89,10 +87,7 @@ impl MemtableInsertPool {
     /// none.
     #[allow(clippy::disallowed_types, clippy::disallowed_methods)]
     pub(crate) fn new(helpers: usize) -> Self {
-        let shared = Arc::new(Shared {
-            state: Mutex::default(),
-            wake: Condvar::new(),
-        });
+        let shared = Arc::new(Shared::default());
         let helpers = (0..helpers)
             .map(|index| {
                 let shared = Arc::clone(&shared);
@@ -126,12 +121,11 @@ impl MemtableInsertPool {
             finished: AtomicUsize::new(0),
             panicked: AtomicBool::new(false),
         });
-        {
-            let mut state = self.shared.state.lock();
-            state.job = Some(Arc::clone(&job));
-            state.generation += 1;
+        *self.shared.job.lock() = Some(Arc::clone(&job));
+        self.shared.generation.fetch_add(1, Ordering::Release);
+        for helper in &self.helpers {
+            helper.thread().unpark();
         }
-        self.shared.wake.notify_all();
         job.work();
         let mut spins = 0u32;
         while job.finished.load(Ordering::Acquire) < job.chunks.len() {
@@ -142,16 +136,16 @@ impl MemtableInsertPool {
                 thread::yield_now();
             }
         }
-        self.shared.state.lock().job = None;
+        *self.shared.job.lock() = None;
         !job.panicked.load(Ordering::Relaxed)
     }
 }
 
 impl Drop for MemtableInsertPool {
     fn drop(&mut self) {
-        self.shared.state.lock().shutdown = true;
-        self.shared.wake.notify_all();
+        self.shared.shutdown.store(true, Ordering::Release);
         for helper in self.helpers.drain(..) {
+            helper.thread().unpark();
             let _ = helper.join();
         }
     }
@@ -161,17 +155,17 @@ impl Drop for MemtableInsertPool {
 fn help(shared: &Shared) {
     let mut seen = 0;
     loop {
-        let job = {
-            let mut state = shared.state.lock();
-            while state.generation == seen && !state.shutdown {
-                shared.wake.wait(&mut state);
-            }
-            if state.shutdown {
-                return;
-            }
-            seen = state.generation;
-            state.job.clone()
-        };
+        if shared.shutdown.load(Ordering::Acquire) {
+            return;
+        }
+        let generation = shared.generation.load(Ordering::Acquire);
+        if generation == seen {
+            // An unpark that came before this park is not lost.
+            thread::park();
+            continue;
+        }
+        seen = generation;
+        let job = shared.job.lock().clone();
         if let Some(job) = job {
             // A panic is recorded by the chunk's guard, and the thread keeps
             // serving later jobs.
