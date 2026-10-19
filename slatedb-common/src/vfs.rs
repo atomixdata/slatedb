@@ -6,14 +6,14 @@
 
 use std::fmt::Debug;
 use std::fs::TryLockError;
-use std::io;
+use std::io::{self, Write};
+use std::mem;
 use std::ops::Range;
 use std::path::Path;
 
 use crate::file_handle_cache::{read_exact_at_offset, FileHandleCache};
 use async_trait::async_trait;
 use bytes::Bytes;
-use tokio::io::AsyncWriteExt;
 
 /// A regular file in a [`Vfs::list`] result.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,7 +83,9 @@ pub trait VfsLock: Debug + Send + Sync {}
 /// Range reads reuse open files and run in one blocking task per read.
 /// Clones share the cache of open files.
 /// The cache retains at most 1,000 open files by default.
-/// Writes are flushed before publication, without syncing them to disk.
+/// Writes are buffered and written in batches of about 1 MiB, each in one
+/// blocking task, and flushed before publication, without syncing them to
+/// disk.
 #[derive(Debug, Clone)]
 pub struct StdVfs {
     file_handle_cache: FileHandleCache,
@@ -203,8 +205,14 @@ impl Vfs for StdVfs {
             .write(true)
             .create_new(true)
             .open(path)
-            .await?;
-        Ok(Box::new(StdVfsWriter { file }))
+            .await?
+            .into_std()
+            .await;
+        Ok(Box::new(StdVfsWriter {
+            file: Some(file),
+            pending: Vec::new(),
+            pending_len: 0,
+        }))
     }
 
     async fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
@@ -243,19 +251,57 @@ struct StdVfsLock {
 
 impl VfsLock for StdVfsLock {}
 
+/// Bytes a [`StdVfsWriter`] collects before writing them out.
+const WRITE_BATCH_BYTES: usize = 1 << 20;
+
+/// Collects writes and writes them out in batches, each in one blocking task.
+///
+/// A `tokio::fs::File` hands every write to a blocking-pool thread, so writing
+/// a file in many small chunks wakes a blocking thread per chunk.
 #[derive(Debug)]
 struct StdVfsWriter {
-    file: tokio::fs::File,
+    /// `None` after a batch write was cancelled, which leaves the file
+    /// incomplete.
+    file: Option<std::fs::File>,
+    pending: Vec<Bytes>,
+    pending_len: usize,
+}
+
+impl StdVfsWriter {
+    async fn write_pending(&mut self) -> io::Result<()> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let mut file = self
+            .file
+            .take()
+            .ok_or_else(|| io::Error::other("an earlier write to this file was cancelled"))?;
+        let chunks = mem::take(&mut self.pending);
+        self.pending_len = 0;
+        #[allow(clippy::disallowed_methods)]
+        let (file, result) = tokio::task::spawn_blocking(move || {
+            let result = chunks.iter().try_for_each(|chunk| file.write_all(chunk));
+            (file, result)
+        })
+        .await?;
+        self.file = Some(file);
+        result
+    }
 }
 
 #[async_trait]
 impl VfsWriter for StdVfsWriter {
     async fn write(&mut self, bytes: Bytes) -> io::Result<()> {
-        self.file.write_all(&bytes).await
+        self.pending_len += bytes.len();
+        self.pending.push(bytes);
+        if self.pending_len >= WRITE_BATCH_BYTES {
+            self.write_pending().await?;
+        }
+        Ok(())
     }
 
     async fn finish(&mut self) -> io::Result<()> {
-        self.file.flush().await
+        self.write_pending().await
     }
 }
 
@@ -287,6 +333,36 @@ mod tests {
                 size: 11
             }]
         );
+    }
+
+    #[tokio::test]
+    async fn should_write_small_chunks_in_batches() {
+        let dir = tempfile::tempdir().unwrap();
+        let vfs = StdVfs::new();
+        let path = dir.path().join("a");
+        let mut writer = vfs.create(&path).await.unwrap();
+
+        // Writes below one batch stay buffered until `finish`.
+        writer.write(Bytes::from_static(b"head")).await.unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+
+        let chunks: Vec<Bytes> = (0..1000u32)
+            .map(|i| Bytes::from(vec![(i % 251) as u8; 4096]))
+            .collect();
+        for chunk in &chunks {
+            writer.write(chunk.clone()).await.unwrap();
+        }
+        // Full batches are written before `finish`.
+        assert!(std::fs::metadata(&path).unwrap().len() >= WRITE_BATCH_BYTES as u64);
+        writer.write(Bytes::from_static(b"tail")).await.unwrap();
+        writer.finish().await.unwrap();
+
+        let mut expected = b"head".to_vec();
+        for chunk in &chunks {
+            expected.extend_from_slice(chunk);
+        }
+        expected.extend_from_slice(b"tail");
+        assert_eq!(vfs.read(&path).await.unwrap(), expected);
     }
 
     #[tokio::test]
