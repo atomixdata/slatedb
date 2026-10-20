@@ -542,8 +542,6 @@ pub(crate) struct CompactorEventHandler {
     /// The value lives only in memory, so a restarted coordinator can make an
     /// incremental commit on its first poll.
     last_incremental_commit: Option<chrono::DateTime<chrono::Utc>>,
-    /// Turns on incremental commits. Only tests set it for now.
-    enable_incremental_compaction: bool,
 }
 
 #[async_trait]
@@ -627,7 +625,6 @@ impl CompactorEventHandler {
             prev_claimed: HashSet::new(),
             worker_heartbeat_gauges: HashMap::new(),
             last_incremental_commit: None,
-            enable_incremental_compaction: false,
         })
     }
 
@@ -974,10 +971,11 @@ impl CompactorEventHandler {
     ///   goes into that run.
     /// - It has a context, which holds the range plan and stored output.
     ///
-    /// The list is empty when incremental compaction is off or when less than
-    /// `INCREMENTAL_COMMIT_INTERVAL` passed since the last incremental commit.
+    /// The list is empty when [`CompactorOptions::enable_incremental_compaction`] is
+    /// false or when less than `INCREMENTAL_COMMIT_INTERVAL` passed since the last
+    /// incremental commit.
     fn jobs_due_for_incremental_commit(&self) -> Vec<Compaction> {
-        let due = self.enable_incremental_compaction
+        let due = self.options.enable_incremental_compaction
             && self.last_incremental_commit.is_none_or(|last| {
                 (self.system_clock.now() - last)
                     .to_std()
@@ -6938,7 +6936,7 @@ mod tests {
     #[tokio::test]
     async fn incremental_commit_writes_checkpoint_and_final_commit_does_not_wait() {
         let mut fixture = CompactorEventHandlerTestFixture::new().await;
-        fixture.handler.enable_incremental_compaction = true;
+        Arc::make_mut(&mut fixture.handler.options).enable_incremental_compaction = true;
         let job = seed_incremental_job(&mut fixture).await;
         let before = fixture.manifest_store.read_latest_manifest().await.unwrap();
         fixture.handler.commit_compacted_entries().await.unwrap();
@@ -6995,12 +6993,12 @@ mod tests {
     async fn incremental_interval_tracks_successful_commits() {
         let clock = Arc::new(MockSystemClock::new());
         clock.set(1_000);
-        let mut fixture = CompactorEventHandlerTestFixture::new_with_clock(
-            clock.clone(),
-            Arc::new(CompactorOptions::default()),
-        )
-        .await;
-        fixture.handler.enable_incremental_compaction = true;
+        let options = Arc::new(CompactorOptions {
+            enable_incremental_compaction: true,
+            ..CompactorOptions::default()
+        });
+        let mut fixture =
+            CompactorEventHandlerTestFixture::new_with_clock(clock.clone(), options).await;
         let job = seed_incremental_job(&mut fixture).await;
         let without_progress =
             Compaction::new(job.id(), job.spec().clone()).with_status(CompactionStatus::Running);
@@ -7070,7 +7068,7 @@ mod tests {
     async fn revalidation_preserves_incremental_context() {
         let mut fixture = CompactorEventHandlerTestFixture::new().await;
         let job = seed_incremental_job(&mut fixture).await;
-        fixture.handler.enable_incremental_compaction = true;
+        Arc::make_mut(&mut fixture.handler.options).enable_incremental_compaction = true;
         fixture.handler.commit_compacted_entries().await.unwrap();
         fixture
             .handler
@@ -7095,7 +7093,7 @@ mod tests {
     #[tokio::test]
     async fn incremental_commit_keeps_progress_when_no_physical_file_is_released() {
         let mut fixture = CompactorEventHandlerTestFixture::new().await;
-        fixture.handler.enable_incremental_compaction = true;
+        Arc::make_mut(&mut fixture.handler.options).enable_incremental_compaction = true;
         let job = seed_incremental_job(&mut fixture).await;
         let duplicate = fixture.handler.state().db_state().tree.compacted[0].sst_views()[0].clone();
         Arc::make_mut(
@@ -7296,7 +7294,7 @@ mod tests {
             .handler
             .state_mut()
             .insert_compaction_for_test(job.clone());
-        fixture.handler.enable_incremental_compaction = true;
+        Arc::make_mut(&mut fixture.handler.options).enable_incremental_compaction = true;
         let before = fixture
             .manifest_store
             .read_latest_manifest()
@@ -7366,7 +7364,7 @@ mod tests {
             .write_state_safely()
             .await
             .unwrap();
-        fixture.handler.enable_incremental_compaction = true;
+        Arc::make_mut(&mut fixture.handler.options).enable_incremental_compaction = true;
         let before = fixture.manifest_store.read_latest_manifest().await.unwrap();
         fixture.handler.commit_compacted_entries().await.unwrap();
         let after = fixture.manifest_store.read_latest_manifest().await.unwrap();
