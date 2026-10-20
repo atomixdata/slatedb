@@ -76,5 +76,9 @@ manifest available. Garbage collection deletes an input SST only after no view u
 checkpoint expires, so reads that started before the commit can still finish.
 `CompactorOptions::checkpoint_lifetime` sets how long the checkpoint lasts.
 
+The counter `slatedb.compactor.incremental_released_bytes` estimates the bytes of the input SSTs
+that incremental commits release. It counts an SST once, after a successful commit removes its last
+view from all trees.
+
 If a worker stops, the next worker resumes the compaction from its progress. Key ranges that are
 already complete do not run again.

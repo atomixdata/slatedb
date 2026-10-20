@@ -76,7 +76,7 @@ use crate::compactions_store::{CompactionsStore, StoredCompactions};
 use crate::compactor::stats::CompactionStats;
 use crate::compactor_state_protocols::CompactorStateWriter;
 use crate::config::CompactorOptions;
-use crate::db_state::{SortedRun, SsTableView};
+use crate::db_state::{SortedRun, SsTableId, SsTableView};
 use crate::db_status::ClosedResultWriter;
 use crate::dispatcher::{MessageHandler, MessageHandlerExecutor, MessageTickerDef};
 use crate::error::{Error, SlateDBError};
@@ -895,12 +895,18 @@ impl CompactorEventHandler {
             return Ok(());
         }
 
+        // Collect the inputs before the commits change the views of the input runs
+        // to count the released bytes.
+        let incremental_inputs = self.incremental_input_ssts(&incremental_jobs);
         let final_changed = self.apply_final_commits(&finished_jobs);
         let incremental_changed = self.apply_incremental_commits(&incremental_jobs)?;
         self.log_compaction_state();
 
         if final_changed || incremental_changed {
             self.state_writer.write_manifest_safely().await?;
+            self.stats
+                .incremental_released_bytes
+                .increment(self.released_bytes(&incremental_inputs));
             if incremental_changed {
                 self.last_incremental_commit = Some(self.system_clock.now());
             }
@@ -995,6 +1001,52 @@ impl CompactorEventHandler {
             })
             .cloned()
             .collect()
+    }
+
+    /// Returns the estimated size of each SST in the input runs of `jobs`, by SST ID.
+    /// The recorded output SSTs of `jobs` are not included.
+    fn incremental_input_ssts(&self, jobs: &[Compaction]) -> HashMap<SsTableId, u64> {
+        let mut inputs = HashMap::new();
+        for job in jobs {
+            let output_ids: HashSet<SsTableId> = job
+                .subcompactions()
+                .iter()
+                .flat_map(|sub| sub.output_ssts().iter().map(|sst| sst.id))
+                .collect();
+            for run in job.get_sorted_runs(self.state().db_state()) {
+                inputs.extend(
+                    run.sst_views()
+                        .iter()
+                        .filter(|view| !output_ids.contains(&view.sst.id))
+                        .map(|view| (view.sst.id, view.sst.estimate_size())),
+                );
+            }
+        }
+        inputs
+    }
+
+    /// Returns the total estimated size of the SSTs in `ssts` that no view in the
+    /// in-memory manifest uses anymore.
+    ///
+    /// `ssts` maps the ID of each SST to its estimated size in bytes. The caller
+    /// gets it before the input runs are changed by the incremental commit.
+    ///
+    /// This method is called after a successful manifest write. The in-memory
+    /// manifest is then the written manifest.
+    fn released_bytes(&self, ssts: &HashMap<SsTableId, u64>) -> u64 {
+        if ssts.is_empty() {
+            return 0;
+        }
+        let retained: HashSet<SsTableId> = self
+            .state()
+            .db_state()
+            .all_sst_views()
+            .map(|view| view.sst.id)
+            .collect();
+        ssts.iter()
+            .filter(|(id, _)| !retained.contains(id))
+            .map(|(_, size)| size)
+            .sum()
     }
 
     /// Applies the stored progress of `jobs` to the in-memory manifest.
@@ -1497,6 +1549,7 @@ pub mod stats {
     pub const SSTS_WRITTEN: &str = compactor_stat_name!("ssts_written");
     pub const JOBS_CLAIMED: &str = compactor_stat_name!("jobs_claimed");
     pub const JOBS_RECLAIMED: &str = compactor_stat_name!("jobs_reclaimed");
+    pub const INCREMENTAL_RELEASED_BYTES: &str = compactor_stat_name!("incremental_released_bytes");
     pub const WORKER_LAST_HEARTBEAT_MS: &str = compactor_stat_name!("worker_last_heartbeat_ms");
     /// Label key carrying a worker's id on per-worker metrics.
     pub const WORKER_ID_LABEL: &str = "worker_id";
@@ -1532,6 +1585,8 @@ pub mod stats {
         pub(crate) jobs_claimed: Arc<dyn CounterFn>,
         /// Stale jobs the coordinator reset `Running → Submitted`.
         pub(crate) jobs_reclaimed: Arc<dyn CounterFn>,
+        /// Estimated bytes of the input SSTs that incremental commits released.
+        pub(crate) incremental_released_bytes: Arc<dyn CounterFn>,
     }
 
     impl CompactionStats {
@@ -1541,6 +1596,12 @@ pub mod stats {
                 last_compaction_ts: recorder.gauge(LAST_COMPACTION_TS_SEC).register(),
                 jobs_claimed: recorder.counter(JOBS_CLAIMED).register(),
                 jobs_reclaimed: recorder.counter(JOBS_RECLAIMED).register(),
+                incremental_released_bytes: recorder
+                    .counter(INCREMENTAL_RELEASED_BYTES)
+                    .description(
+                        "Estimated bytes of the input SSTs that incremental compaction commits released",
+                    )
+                    .register(),
                 total_bytes_being_compacted: recorder.gauge(TOTAL_BYTES_BEING_COMPACTED).register(),
                 total_throughput: recorder.gauge(TOTAL_THROUGHPUT_BYTES_PER_SEC).register(),
                 merge_operator_compact_operands: recorder
@@ -6933,6 +6994,14 @@ mod tests {
         job
     }
 
+    fn incremental_released_bytes(fixture: &CompactorEventHandlerTestFixture) -> i64 {
+        slatedb_common::metrics::lookup_metric(
+            &fixture.test_recorder,
+            stats::INCREMENTAL_RELEASED_BYTES,
+        )
+        .expect("incremental released bytes metric")
+    }
+
     #[tokio::test]
     async fn incremental_commit_writes_checkpoint_and_final_commit_does_not_wait() {
         let mut fixture = CompactorEventHandlerTestFixture::new().await;
@@ -6942,6 +7011,7 @@ mod tests {
         fixture.handler.commit_compacted_entries().await.unwrap();
         let incremental_manifest = fixture.manifest_store.read_latest_manifest().await.unwrap();
         assert_eq!(incremental_manifest.id(), before.id() + 2);
+        assert_eq!(incremental_released_bytes(&fixture), 120);
         assert_eq!(
             incremental_manifest
                 .core()
@@ -6987,6 +7057,7 @@ mod tests {
         let final_manifest = fixture.manifest_store.read_latest_manifest().await.unwrap();
         assert_eq!(final_manifest.id(), incremental_manifest.id() + 2);
         assert_eq!(final_manifest.core().tree.compacted.len(), 1);
+        assert_eq!(incremental_released_bytes(&fixture), 120);
     }
 
     #[tokio::test]
@@ -7126,6 +7197,7 @@ mod tests {
         );
         assert_ne!(fixture.handler.state().db_state(), before.core());
         assert!(fixture.handler.last_incremental_commit.is_some());
+        assert_eq!(incremental_released_bytes(&fixture), 0);
         assert_eq!(
             fixture
                 .handler
@@ -7392,6 +7464,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![2, 1, 0]
         );
+        assert_eq!(incremental_released_bytes(&fixture), 0);
         assert_eq!(
             fixture
                 .handler
@@ -7403,6 +7476,99 @@ mod tests {
                 .status(),
             CompactionStatus::Running
         );
+    }
+
+    #[tokio::test]
+    async fn mixed_batch_counts_released_bytes_only_for_incremental_inputs() {
+        // given: an incremental job that releases a 120-byte input, and a finished job
+        // whose final commit releases a 999-byte input
+        let mut fixture = CompactorEventHandlerTestFixture::new().await;
+        Arc::make_mut(&mut fixture.handler.options).enable_incremental_compaction = true;
+        seed_incremental_job(&mut fixture).await;
+        let mut final_input = fake_output_sst();
+        final_input.info.index_offset = 999;
+        Arc::make_mut(
+            &mut fixture
+                .handler
+                .state_mut()
+                .manifest_mut_for_test()
+                .value
+                .core
+                .tree,
+        )
+        .compacted
+        .push(SortedRun::new(0, [SsTableView::identity(final_input)]));
+        let finished = Compaction::new(
+            Ulid::from_parts(2, 0),
+            CompactionSpec::new(vec![SourceId::SortedRun(0)], 0),
+        )
+        .with_status(CompactionStatus::Compacted);
+        fixture
+            .handler
+            .state_mut()
+            .insert_compaction_for_test(finished);
+        fixture
+            .handler
+            .state_writer
+            .write_state_safely()
+            .await
+            .unwrap();
+        let before = fixture
+            .manifest_store
+            .read_latest_manifest()
+            .await
+            .unwrap()
+            .id();
+
+        // when: both commits go into one manifest write
+        fixture.handler.commit_compacted_entries().await.unwrap();
+
+        // then: the metric counts only the input of the incremental job
+        assert_eq!(
+            fixture
+                .manifest_store
+                .read_latest_manifest()
+                .await
+                .unwrap()
+                .id(),
+            before + 2
+        );
+        assert_eq!(incremental_released_bytes(&fixture), 120);
+    }
+
+    #[tokio::test]
+    async fn incremental_commit_does_not_count_an_input_that_the_writer_still_uses() {
+        // given: an incremental job that releases its input, and a writer that adds an
+        // L0 view of the same SST to the remote manifest
+        let mut fixture = CompactorEventHandlerTestFixture::new().await;
+        Arc::make_mut(&mut fixture.handler.options).enable_incremental_compaction = true;
+        seed_incremental_job(&mut fixture).await;
+        let input = fixture.handler.state().db_state().tree.compacted[0].sst_views()[0].clone();
+        let mut writer = StoredManifest::load(
+            fixture.manifest_store.clone(),
+            Arc::new(DefaultSystemClock::new()),
+        )
+        .await
+        .unwrap();
+        let mut dirty = writer.prepare_dirty().unwrap();
+        Arc::make_mut(&mut dirty.value.core.tree)
+            .l0
+            .push_front(input.clone());
+        writer.update(dirty).await.unwrap();
+
+        // when: the coordinator commits the incremental progress
+        fixture.handler.commit_compacted_entries().await.unwrap();
+
+        // then: the written manifest keeps the L0 view, so the SST is not released
+        let after = fixture.manifest_store.read_latest_manifest().await.unwrap();
+        assert!(after.core().tree.compacted[0].sst_views().is_empty());
+        assert!(after
+            .core()
+            .tree
+            .l0
+            .iter()
+            .any(|view| view.sst.id == input.sst.id));
+        assert_eq!(incremental_released_bytes(&fixture), 0);
     }
 
     #[tokio::test]
