@@ -25,6 +25,12 @@ pub(crate) struct SlateDbWalWriterInitOptions {
     max_flush_interval: Option<Duration>,
 }
 
+impl SlateDbWalWriterInitOptions {
+    pub(crate) fn max_inflight_wal_uploads(&self) -> usize {
+        self.max_inflight_wal_uploads
+    }
+}
+
 impl From<&Settings> for SlateDbWalWriterInitOptions {
     fn from(settings: &Settings) -> Self {
         Self {
