@@ -1726,6 +1726,8 @@ mod tests {
             segment_extractor_name: None,
             next_wal_sst_id: 0,
             replay_after_wal_id: 0,
+            wal_excluded_range_max_size: 1,
+            wal_excluded_ranges: vec![],
             last_l0_seq: 0,
             last_l0_clock_tick: 0,
             checkpoints: vec![],

@@ -110,6 +110,7 @@ impl WriterFencer {
             self.manifest_update_timeout,
             self.system_clock.clone(),
             expected_epoch,
+            self.wal_writer_init_options.max_inflight_wal_uploads() as u64,
         )
         .await?;
         self.fail_point_send("FenceManifest");

@@ -148,6 +148,21 @@ table ManifestV2 {
     // (RFC-0024). Persisted so the writer can detect accidental reconfiguration
     // on startup. Absent when no extractor is configured.
     segment_extractor_name: string;
+
+    // Size of the WAL ID range that the next writer takeover must exclude. It
+    // must be at least the upload limit of every writer whose uploads are not
+    // excluded yet. Manifests written before this field existed read as 1.
+    wal_excluded_range_max_size: ulong = 1;
+
+    // WAL ID ranges that writer takeovers excluded from accepted history. A
+    // range applies only if the WAL object at its start is a zero-byte fence.
+    wal_excluded_ranges: [WalExcludedRange];
+}
+
+// An inclusive range of WAL IDs that a writer takeover excluded.
+struct WalExcludedRange {
+    start: ulong;
+    end: ulong;
 }
 
 // Per-segment LSM state. Structurally mirrors the top-level `l0` / `compacted` /
