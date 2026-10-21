@@ -199,6 +199,7 @@ mod tests {
     use crate::proptest_util::{rng, sample};
     use crate::tablestore::{TableStore, TableStoreKind};
     use crate::types::RowEntry;
+    use crate::wal::slatedb::iterator::WalExcludedRanges;
     use crate::wal::slatedb::store::WalTableStore;
     use crate::wal::{WalError, WalIterator as WalIteratorTrait, WalRows};
     use crate::{error::SlateDBError, test_utils};
@@ -233,15 +234,19 @@ mod tests {
             wal_store: Arc<WalTableStore>,
         ) -> Result<Self, SlateDBError> {
             let wal_id_start = db_state.replay_after_wal_id + 1;
+            let iterator_options = SlateDbWalIteratorOptions::default();
             let wal_id_end = wal_store
-                .last_seen_wal_id(db_state.replay_after_wal_id.into())
+                .walk_to_frontier(
+                    wal_id_start.into(),
+                    &WalExcludedRanges::known(&db_state.wal_excluded_ranges),
+                )
                 .await?
                 .value();
-            let wal_id_range = wal_id_start..(wal_id_end + 1);
+            let wal_id_range = wal_id_start..wal_id_end;
             Self::range(
                 wal_id_range,
                 db_state,
-                SlateDbWalIteratorOptions::default(),
+                iterator_options,
                 options,
                 table_store,
                 wal_store,

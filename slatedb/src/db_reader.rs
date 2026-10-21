@@ -205,6 +205,7 @@ impl DbReaderInner {
                 crate::wal::slatedb::reader::SlateDbWalReader::new_with_status_manager(
                     wal_store,
                     &status_manager,
+                    Arc::clone(&manifest_store),
                     Arc::clone(&system_clock),
                     SlateDbWalReaderOptions::default(),
                 ),
@@ -3146,12 +3147,15 @@ mod tests {
         wal_store: &Arc<WalTableStore>,
         status_manager: &DbStatusManager,
     ) -> crate::wal::slatedb::reader::SlateDbWalReader {
-        crate::wal::slatedb::reader::SlateDbWalReader::new_with_status_manager(
-            Arc::clone(wal_store),
-            status_manager,
-            Arc::new(DefaultSystemClock::new()),
-            SlateDbWalReaderOptions::default(),
-        )
+        // These tests write no excluded ranges, so the status manifest also
+        // serves range lookups.
+        crate::wal::slatedb::reader::SlateDbWalReaderBuilder::new()
+            .with_wal_store(Arc::clone(wal_store))
+            .with_manifest_reader(Arc::new(status_manager.subscribe()))
+            .with_system_clock(Arc::new(DefaultSystemClock::new()))
+            .with_options(SlateDbWalReaderOptions::default())
+            .build()
+            .unwrap()
     }
 
     fn immutable_memtable(

@@ -51,6 +51,10 @@ pub(crate) enum WalExcludedRanges {
     /// Ranges that the caller already holds, from a manifest that is new
     /// enough for every fence it can reach.
     Known(Arc<[WalExcludedRange]>),
+    /// Ranges read from the latest manifest each time they are needed. The
+    /// reader must return a fresh manifest, not a cached one. A read after the
+    /// fence was seen then includes the fence's range.
+    Latest(Arc<dyn ManifestReader>),
 }
 
 impl WalExcludedRanges {
@@ -66,6 +70,12 @@ impl WalExcludedRanges {
     pub(crate) async fn load(&self) -> Result<Arc<[WalExcludedRange]>, SlateDBError> {
         match self {
             Self::Known(ranges) => Ok(Arc::clone(ranges)),
+            Self::Latest(manifest_reader) => match manifest_reader.manifest().await {
+                Ok(manifest) => Ok(Arc::from(manifest.core().wal_excluded_ranges.as_slice())),
+                // Without a manifest, no takeover can have recorded a range.
+                Err(SlateDBError::LatestTransactionalObjectVersionMissing) => Ok(Arc::from([])),
+                Err(err) => Err(err),
+            },
         }
     }
 }
@@ -626,13 +636,13 @@ mod tests {
     use slatedb_common::clock::DefaultSystemClock;
 
     use super::{
-        SlateDbWalIterator, SlateDbWalIteratorOptions, WalFileIterator, WalIteratorEndBound,
-        WalRowsCollector,
+        SlateDbWalIterator, SlateDbWalIteratorOptions, WalExcludedRanges, WalFileIterator,
+        WalIteratorEndBound, WalRowsCollector,
     };
     use crate::db_status::DbStatusManager;
     use crate::format::sst::SsTableFormat;
     use crate::iter::EmptyIterator;
-    use crate::manifest::{Manifest, ManifestCore, VersionedManifest};
+    use crate::manifest::{Manifest, ManifestCore, VersionedManifest, WalExcludedRange};
     use crate::object_store_tag::TableStoreKind;
     use crate::types::RowEntry;
     use crate::wal::slatedb::sst_iterator::WalSstIterator;
@@ -1054,6 +1064,79 @@ mod tests {
         let first = iter.next().await.unwrap().unwrap();
 
         assert_eq!(first.last_consumed_wal_file_id, 1);
+    }
+
+    async fn write_data(table_store: &WalTableStore, wal_id: u64, seq: u64) {
+        let mut builder = table_store.table_builder();
+        builder
+            .add(RowEntry::new_value(b"key", b"value", seq))
+            .await
+            .unwrap();
+        let encoded = builder.build().await.unwrap();
+        table_store
+            .write_sst(wal_id.into(), &encoded)
+            .await
+            .unwrap();
+    }
+
+    fn batch_summary(batch: crate::wal::WalRows) -> (u64, Vec<u64>) {
+        let seqs = batch.rows.iter().map(|row| row.seq).collect();
+        (batch.last_consumed_wal_file_id, seqs)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn should_wait_at_a_gap_and_skip_the_excluded_range_after_its_fence() {
+        // given: data at 1, a gap at 2, and an orphan at 3. A tailing reader
+        // reads excluded ranges from the latest manifest.
+        let table_store = test_table_store();
+        write_data(&table_store, 1, 1).await;
+        write_data(&table_store, 3, 100).await;
+        let status_manager = status_manager(2);
+        let mut wal_iter = SlateDbWalIterator::range(
+            1,
+            WalIteratorEndBound::Unbounded {
+                manifest_reader: Arc::new(status_manager.subscribe()),
+                poll_interval: Duration::from_millis(10),
+                system_clock: Arc::new(DefaultSystemClock::new()),
+            },
+            SlateDbWalIteratorOptions::default(),
+            Arc::clone(&table_store),
+        )
+        .unwrap()
+        .with_excluded_ranges(WalExcludedRanges::Latest(Arc::new(
+            status_manager.subscribe(),
+        )));
+        let first = wal_iter.next().await.unwrap().unwrap();
+        assert_eq!(batch_summary(first), (1, vec![1]));
+
+        // when/then: the reader waits at the gap, although WAL 3 exists.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), wal_iter.next())
+                .await
+                .is_err(),
+            "the iterator read past a missing WAL"
+        );
+
+        // when: a takeover records the range 2 to 4, fences 2, and the new
+        // writer writes 5. WAL 4 never appears.
+        let mut core = ManifestCore::new();
+        core.next_wal_sst_id = 2;
+        core.wal_excluded_ranges = vec![WalExcludedRange { start: 2, end: 4 }];
+        status_manager
+            .report_manifest(VersionedManifest::from_manifest(2, Manifest::initial(core)));
+        table_store.write_wal_fence(2.into()).await.unwrap();
+        write_data(&table_store, 5, 2).await;
+
+        // then: the reader skips the range without waiting for WAL 4, and the
+        // orphan is not returned.
+        for expected in [(4, vec![]), (5, vec![2])] {
+            let batch = tokio::time::timeout(Duration::from_millis(100), wal_iter.next())
+                .await
+                .expect("iterator did not skip the excluded range")
+                .unwrap()
+                .unwrap();
+            assert_eq!(batch_summary(batch), expected);
+        }
     }
 
     fn test_table_store() -> Arc<WalTableStore> {

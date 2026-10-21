@@ -13,7 +13,8 @@ use crate::format::sst::SsTableFormat;
 use crate::manifest::store::ManifestStore;
 use crate::object_store_tag::TableStoreKind;
 use crate::wal::slatedb::iterator::{
-    ManifestReader, SlateDbWalIterator, SlateDbWalIteratorOptions, WalIteratorEndBound,
+    ManifestReader, SlateDbWalIterator, SlateDbWalIteratorOptions, WalExcludedRanges,
+    WalIteratorEndBound,
 };
 use crate::wal::slatedb::store::WalTableStore;
 use crate::wal::{WalError, WalFileRange, WalIterator, WalReader};
@@ -69,6 +70,7 @@ pub struct SlateDbWalReaderBuilder {
     object_store: Option<Arc<dyn ObjectStore>>,
     wal_object_store: Option<Arc<dyn ObjectStore>>,
     manifest_reader: Option<Arc<dyn ManifestReader>>,
+    excluded_range_reader: Option<Arc<dyn ManifestReader>>,
     system_clock: Arc<dyn SystemClock>,
     options: SlateDbWalReaderOptions,
 }
@@ -81,6 +83,7 @@ impl Default for SlateDbWalReaderBuilder {
             object_store: None,
             wal_object_store: None,
             manifest_reader: None,
+            excluded_range_reader: None,
             system_clock: Arc::new(DefaultSystemClock::new()),
             options: SlateDbWalReaderOptions::default(),
         }
@@ -139,6 +142,18 @@ impl SlateDbWalReaderBuilder {
         self
     }
 
+    /// Sets the manifest reader used to look up excluded WAL ranges.
+    ///
+    /// It must return a fresh manifest, not a cached one. If unset, the
+    /// manifest reader is used.
+    pub(crate) fn with_excluded_range_reader(
+        mut self,
+        excluded_range_reader: Arc<dyn ManifestReader>,
+    ) -> Self {
+        self.excluded_range_reader = Some(excluded_range_reader);
+        self
+    }
+
     /// Builds a WAL reader from the configured state.
     ///
     /// # Errors
@@ -181,8 +196,12 @@ impl SlateDbWalReaderBuilder {
                 ))
             }
         };
+        let excluded_range_reader = self
+            .excluded_range_reader
+            .unwrap_or_else(|| Arc::clone(&manifest_reader));
         Ok(SlateDbWalReader {
             wal_store,
+            excluded_ranges: WalExcludedRanges::Latest(excluded_range_reader),
             manifest_reader,
             system_clock: self.system_clock,
             options: self.options,
@@ -193,6 +212,7 @@ impl SlateDbWalReaderBuilder {
 pub struct SlateDbWalReader {
     wal_store: Arc<WalTableStore>,
     manifest_reader: Arc<dyn ManifestReader>,
+    excluded_ranges: WalExcludedRanges,
     system_clock: Arc<dyn SystemClock>,
     options: SlateDbWalReaderOptions,
 }
@@ -201,6 +221,7 @@ impl SlateDbWalReader {
     pub(crate) fn new_with_status_manager(
         wal_store: Arc<WalTableStore>,
         db_status: &DbStatusManager,
+        manifest_store: Arc<ManifestStore>,
         system_clock: Arc<dyn SystemClock>,
         options: SlateDbWalReaderOptions,
     ) -> Self {
@@ -208,6 +229,7 @@ impl SlateDbWalReader {
         SlateDbWalReaderBuilder::new()
             .with_wal_store(wal_store)
             .with_manifest_reader(manifest_reader)
+            .with_excluded_range_reader(manifest_store)
             .with_system_clock(system_clock)
             .with_options(options)
             .build()
@@ -260,16 +282,18 @@ impl WalReader for SlateDbWalReader {
             end_bound,
             self.options.clone().into(),
             Arc::clone(&self.wal_store),
-        )?;
+        )?
+        .with_excluded_ranges(self.excluded_ranges.clone());
         Ok(Box::new(iterator))
     }
 
     async fn last_wal_file_id(&self, replay_after_wal_id: u64) -> Result<u64, WalError> {
-        let last = self
+        let frontier = self
             .wal_store
-            .last_seen_wal_id(replay_after_wal_id.into())
+            .walk_to_frontier((replay_after_wal_id + 1).into(), &self.excluded_ranges)
             .await?
             .value();
+        let last = frontier - 1;
         let manifest = self.manifest_reader.manifest().await?;
         if last < manifest.core().replay_after_wal_id {
             return Err(WalError::WalTruncated(last));
