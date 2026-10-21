@@ -7475,6 +7475,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_l0_flush_and_wal_gc_after_takeover_keep_the_orphan_hidden() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("/tmp/test_l0_flush_and_wal_gc_after_takeover");
+        let settings = test_db_options(0, 1024 * 1024, None);
+        let wal_store = WalTableStore::new(
+            object_store.clone(),
+            SsTableFormat::default(),
+            path.clone(),
+            TableStoreKind::Main,
+        );
+
+        // given: a takeover excluded 3 to 5 with an orphan at 4. The new
+        // writer writes key 2 at WAL 6, and an L0 flush moves the replay
+        // boundary past the range.
+        let db2 = test_utils::open_after_takeover_with_an_orphan(
+            &path,
+            object_store.clone(),
+            settings.clone(),
+        )
+        .await;
+        db2.put(b"2", b"2").await.unwrap();
+        db2.flush_with_options(FlushOptions {
+            flush_type: FlushType::MemTable,
+        })
+        .await
+        .unwrap();
+        db2.close().await.unwrap();
+        let manifest = ManifestStore::new(&path, object_store.clone())
+            .read_latest_manifest()
+            .await
+            .unwrap();
+        assert!(manifest.manifest.core.replay_after_wal_id >= 5);
+
+        // when: WAL GC runs with no minimum age.
+        let gc_options = GarbageCollectorOptions {
+            wal_options: Some(GarbageCollectorDirectoryOptions {
+                interval: None,
+                min_age: Duration::from_millis(0),
+                dry_run: false,
+            }),
+            wal_fence_options: None,
+            manifest_options: None,
+            compacted_options: None,
+            compactions_options: None,
+            detach_options: None,
+            metric_level: None,
+            boundary_files_enabled: true,
+            object_store_max_retries: None,
+        };
+        GarbageCollectorBuilder::new(path.clone(), object_store.clone())
+            .with_options(gc_options)
+            .build()
+            .run_gc_once()
+            .await;
+
+        // then: GC deleted the data file and the orphan below the boundary,
+        // and kept the fences.
+        let remaining: Vec<(u64, u64)> = wal_store
+            .list_wal_ssts(..WalFileId::from(6))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|wal| (wal.id.value(), wal.metadata.size))
+            .collect();
+        assert_eq!(remaining, vec![(1, 0), (3, 0), (5, 0)]);
+
+        // then: later writers recover every acknowledged write and never the
+        // orphan.
+        let db3 = Db::builder(path.clone(), object_store.clone())
+            .with_settings(settings.clone())
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(db3.get(b"1").await.unwrap(), Some(Bytes::from_static(b"1")));
+        assert_eq!(db3.get(b"2").await.unwrap(), Some(Bytes::from_static(b"2")));
+        assert_eq!(db3.get(b"orphan").await.unwrap(), None);
+        db3.put(b"3", b"3").await.unwrap();
+        db3.flush_with_options(FlushOptions {
+            flush_type: FlushType::Wal,
+        })
+        .await
+        .unwrap();
+        let db4 = Db::builder(path.clone(), object_store.clone())
+            .with_settings(settings)
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(db4.get(b"2").await.unwrap(), Some(Bytes::from_static(b"2")));
+        assert_eq!(db4.get(b"3").await.unwrap(), Some(Bytes::from_static(b"3")));
+        assert_eq!(db4.get(b"orphan").await.unwrap(), None);
+    }
+
+    #[tokio::test]
     async fn test_empty_wal_should_fence_old_writer() {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let path = "/tmp/test_kv_store";

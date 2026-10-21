@@ -300,12 +300,7 @@ impl WalAdmin for BTreeMapWalAdmin {
             .collect())
     }
 
-    async fn is_empty(
-        &self,
-        path: &Path,
-        _replay_after_wal_id: u64,
-        _wal_id_last_seen: u64,
-    ) -> Result<bool, WalError> {
+    async fn is_empty(&self, path: &Path, _manifest: &VersionedManifest) -> Result<bool, WalError> {
         Ok(self.wal(path).files.lock().values().all(Vec::is_empty))
     }
 
