@@ -2245,7 +2245,7 @@ mod tests {
     };
     use crate::iter::{IterationOrder, RowEntryIterator};
     use crate::manifest::store::{ManifestStore, StoredManifest};
-    use crate::manifest::{ManifestCore, VersionedManifest};
+    use crate::manifest::{ManifestCore, VersionedManifest, WalExcludedRange};
     use crate::merge_operator::{
         MERGE_OPERATOR_COMPACT_PATH, MERGE_OPERATOR_FLUSH_PATH, MERGE_OPERATOR_READ_PATH,
     };
@@ -7202,6 +7202,140 @@ mod tests {
         assert_eq!(
             db.inner.wal_observer.status().unwrap().last_flushed_wal_id,
             3
+        );
+    }
+
+    #[tokio::test]
+    async fn test_db_open_should_fence_the_stored_window() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("/tmp/test_db_open_should_fence_the_stored_window");
+        let wal_store = WalTableStore::new(
+            object_store.clone(),
+            SsTableFormat::default(),
+            path.clone(),
+            TableStoreKind::Main,
+        );
+
+        // given: WAL 1 is the first fence and WAL 2 holds key 1 at seq 1. The
+        // manifest stores a window of 3, and WAL 4 holds an orphan at seq
+        // 2. A replayed orphan would be visible to reads. A large L0 size
+        // avoids L0 flushes, so every open replays from WAL 1.
+        let db1 = Db::builder(path.clone(), object_store.clone())
+            .with_settings(test_db_options(0, 1024 * 1024, None))
+            .build()
+            .await
+            .unwrap();
+        db1.put(b"1", b"1").await.unwrap();
+        db1.flush_with_options(FlushOptions {
+            flush_type: FlushType::Wal,
+        })
+        .await
+        .unwrap();
+        let manifest_store = Arc::new(ManifestStore::new(&path, object_store.clone()));
+        let mut stored_manifest =
+            StoredManifest::load(manifest_store, Arc::new(DefaultSystemClock::new()))
+                .await
+                .unwrap();
+        let mut dirty = stored_manifest.prepare_dirty().unwrap();
+        dirty.value.core.wal_excluded_range_max_size = 3;
+        stored_manifest.update(dirty).await.unwrap();
+        let mut builder = wal_store.table_builder();
+        builder
+            .add(RowEntry::new_value(b"orphan", b"orphan", 2))
+            .await
+            .unwrap();
+        let orphan = builder.build().await.unwrap();
+        wal_store.write_sst(4.into(), &orphan).await.unwrap();
+
+        // when: a new writer takes over.
+        let db2 = Db::builder(path.clone(), object_store.clone())
+            .with_settings(test_db_options(0, 1024 * 1024, None))
+            .build()
+            .await
+            .unwrap();
+
+        // then: the takeover records the range 3 to 5 in the manifest,
+        // fences 3 and 5, leaves the orphan at 4, and starts the writer after
+        // the range. The orphan is not replayed.
+        let manifest = ManifestStore::new(&path, object_store.clone())
+            .read_latest_manifest()
+            .await
+            .unwrap();
+        assert_eq!(
+            manifest.manifest.core.wal_excluded_ranges,
+            vec![WalExcludedRange { start: 3, end: 5 }]
+        );
+        for wal_id in [3, 5] {
+            assert!(matches!(
+                wal_store.open_sst(wal_id.into()).await,
+                Err(SlateDBError::EmptySSTable)
+            ));
+        }
+        assert!(wal_store.open_sst(4.into()).await.is_ok());
+        assert_eq!(
+            db2.inner.wal_observer.status().unwrap().last_flushed_wal_id,
+            5
+        );
+        assert_eq!(db2.get(b"1").await.unwrap(), Some(Bytes::from_static(b"1")));
+        assert_eq!(db2.get(b"orphan").await.unwrap(), None);
+        db2.put(b"2", b"2").await.unwrap();
+        db2.flush_with_options(FlushOptions {
+            flush_type: FlushType::Wal,
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            db2.inner.wal_observer.status().unwrap().last_flushed_wal_id,
+            6
+        );
+
+        // then: a DbReader finds the tail with the walk and skips the excluded
+        // range. It sees both keys and not the orphan.
+        let reader = crate::DbReader::builder(path.clone(), object_store.clone())
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(
+            reader.get(b"1").await.unwrap(),
+            Some(Bytes::from_static(b"1"))
+        );
+        assert_eq!(
+            reader.get(b"2").await.unwrap(),
+            Some(Bytes::from_static(b"2"))
+        );
+        assert_eq!(reader.get(b"orphan").await.unwrap(), None);
+        reader.close().await.unwrap();
+
+        // then: a later replay skips the excluded range, so the orphan stays
+        // hidden.
+        let db3 = Db::builder(path.clone(), object_store.clone())
+            .with_settings(test_db_options(0, 1024 * 1024, None))
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(db3.get(b"1").await.unwrap(), Some(Bytes::from_static(b"1")));
+        assert_eq!(db3.get(b"2").await.unwrap(), Some(Bytes::from_static(b"2")));
+        assert_eq!(db3.get(b"orphan").await.unwrap(), None);
+
+        // then: db3 fenced 7 to 9. Its first L0 flush, with only replayed
+        // data, moves the replay boundary to the end of that window.
+        db3.flush_with_options(FlushOptions {
+            flush_type: FlushType::MemTable,
+        })
+        .await
+        .unwrap();
+        let manifest = ManifestStore::new(&path, object_store.clone())
+            .read_latest_manifest()
+            .await
+            .unwrap();
+        assert_eq!(manifest.manifest.core.replay_after_wal_id, 9);
+        // db3 kept the earlier range and added its own.
+        assert_eq!(
+            manifest.manifest.core.wal_excluded_ranges,
+            vec![
+                WalExcludedRange { start: 3, end: 5 },
+                WalExcludedRange { start: 7, end: 9 },
+            ]
         );
     }
 

@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use fail_parallel::{fail_point, FailPointRegistry};
-use futures::{future::join_all, StreamExt};
+use futures::StreamExt;
 use log::{debug, warn};
 use object_store::path::Path;
 use object_store::{GetOptions, GetRange, ObjectStore, ObjectStoreExt, PutMode, PutOptions};
@@ -481,87 +481,6 @@ impl WalTableStore {
         Ok(blocks.into_iter().map(Arc::new).collect())
     }
 
-    /// Find the highest WAL SST id present in the object store at or above
-    /// `start_after + 1`, returning `start_after` if none exist.
-    ///
-    /// `start_after` should be a known lower bound (e.g. `replay_after_wal_id`
-    /// from the manifest, or the highest already-replayed WAL id). Passing 0
-    /// scans the entire WAL id space.
-    ///
-    /// Two phases:
-    ///   1. Parallel exponential probe at offsets `2^0, 2^1, ..., 2^k` from
-    ///      `start_after`. One RTT per round of 8 exponents. Brackets the
-    ///      frontier between two adjacent powers of two.
-    ///   2. Sequential binary search inside the bracketed range to find the
-    ///      exact frontier.
-    ///
-    /// Relies on the fencing protocol's contiguity invariant: "id exists" is
-    /// monotone-decreasing in id, so binary search is sound. Total HEAD count
-    /// is `O(log N)` for a gap of size N, vs `O(N)` for a windowed scan.
-    pub(crate) async fn last_seen_wal_id(
-        &self,
-        start_after: WalFileId,
-    ) -> Result<WalFileId, SlateDBError> {
-        fail_point!(Arc::clone(&self.fp_registry), "probe-wal-ssts", |_| {
-            Err(SlateDBError::from(std::io::Error::other("oops")))
-        });
-
-        const ROUND_SIZE: u32 = 8;
-        const MAX_EXP: u32 = 48;
-
-        let mut lo_offset = None;
-        let mut hi_offset = None;
-        let mut next_exp = 0;
-
-        while hi_offset.is_none() {
-            if next_exp >= MAX_EXP {
-                return Err(SlateDBError::InvalidDBState);
-            }
-            let end_exp = (next_exp + ROUND_SIZE).min(MAX_EXP);
-            let exps: Vec<u32> = (next_exp..end_exp).collect();
-            let probes = exps.iter().map(|&exp| {
-                let offset = 1u64 << exp;
-                let path = self.path(WalFileId::from(start_after.value() + offset));
-                let object_store = Arc::clone(&self.object_store);
-                async move { wal_object_exists(&object_store, &path).await }
-            });
-            let results = join_all(probes).await;
-
-            for (exp, result) in exps.iter().zip(results) {
-                let offset = 1u64 << exp;
-                if result? {
-                    lo_offset = Some(offset);
-                } else {
-                    hi_offset = Some(offset);
-                    break;
-                }
-            }
-            next_exp = end_exp;
-        }
-
-        let hi = hi_offset.expect("loop exits only after finding an upper bound");
-        let Some(lo) = lo_offset else {
-            return Ok(start_after);
-        };
-
-        let mut left = lo + 1;
-        let mut right = hi;
-        while left < right {
-            let mid = left + (right - left) / 2;
-            if wal_object_exists(
-                &self.object_store,
-                &self.path(WalFileId::from(start_after.value() + mid)),
-            )
-            .await?
-            {
-                left = mid + 1;
-            } else {
-                right = mid;
-            }
-        }
-        Ok(WalFileId::from(start_after.value() + left - 1))
-    }
-
     /// Walks accepted WAL history from `start` and returns the frontier, i.e.
     /// the first missing WAL ID.
     ///
@@ -618,17 +537,6 @@ impl WalTableStore {
     }
 }
 
-async fn wal_object_exists(
-    object_store: &Arc<dyn ObjectStore>,
-    path: &Path,
-) -> Result<bool, SlateDBError> {
-    match object_store.head(path).await {
-        Ok(_) => Ok(true),
-        Err(object_store::Error::NotFound { .. }) => Ok(false),
-        Err(error) => Err(SlateDBError::from(error)),
-    }
-}
-
 #[allow(dead_code)]
 fn slatedb_io_error() -> SlateDBError {
     SlateDBError::from(std::io::Error::other("oops"))
@@ -644,8 +552,6 @@ mod tests {
     use crate::test_utils::{FlakyObjectStore, RecordingObjectStore};
     use crate::types::RowEntry;
     use object_store::memory::InMemory;
-    use object_store::ObjectStoreExt;
-    use rstest::rstest;
 
     fn test_store() -> WalTableStore {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -913,7 +819,14 @@ mod tests {
         let store = test_store();
 
         store.write_wal_fence(1.into()).await.unwrap();
-        assert_eq!(store.last_seen_wal_id(0.into()).await.unwrap().value(), 1);
+        assert_eq!(
+            store
+                .walk_to_frontier(1.into(), &WalExcludedRanges::none())
+                .await
+                .unwrap()
+                .value(),
+            2
+        );
         assert!(matches!(
             store.write_wal_fence(1.into()).await,
             Err(SlateDBError::Fenced)
@@ -934,43 +847,6 @@ mod tests {
             Err(SlateDBError::Fenced)
         ));
     }
-    #[rstest]
-    #[tokio::test]
-    async fn finds_last_seen_wal_id(
-        #[values(0, 100)] start_after: u64,
-        #[values(0, 1, 5, 7, 8, 9, 16, 127, 128, 129, 200, 255, 256, 257)] n_above: u64,
-    ) {
-        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let store = WalTableStore::new(
-            object_store.clone(),
-            SsTableFormat::default(),
-            Path::from("probe-wal-store"),
-            TableStoreKind::Main,
-        );
-
-        for wal_id in 1..=start_after {
-            object_store
-                .put(&store.path(wal_id.into()), Bytes::new().into())
-                .await
-                .unwrap();
-        }
-        for wal_id in (start_after + 1)..=(start_after + n_above) {
-            object_store
-                .put(&store.path(wal_id.into()), Bytes::new().into())
-                .await
-                .unwrap();
-        }
-
-        assert_eq!(
-            store
-                .last_seen_wal_id(start_after.into())
-                .await
-                .unwrap()
-                .value(),
-            start_after + n_above
-        );
-    }
-
     #[tokio::test]
     async fn object_store_calls_carry_wal_tag() {
         let recording = Arc::new(RecordingObjectStore::new(Arc::new(InMemory::new())));
