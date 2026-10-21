@@ -1268,6 +1268,8 @@ pub(crate) struct GatedObjectStore {
     pub(crate) get_opts_gate: Gate,
     pub(crate) head_gate: Gate,
     pub(crate) put_opts_gate: Gate,
+    /// If set, only `put_opts` calls for these paths wait at `put_opts_gate`.
+    pub(crate) put_opts_gated_paths: std::sync::Mutex<Option<Vec<Path>>>,
     pub(crate) put_multipart_opts_gate: Gate,
     pub(crate) multipart_created_gate: Arc<Gate>,
     pub(crate) multipart_put_part_gate: Arc<Gate>,
@@ -1288,6 +1290,7 @@ impl GatedObjectStore {
             get_opts_gate: Gate::default(),
             head_gate: Gate::default(),
             put_opts_gate: Gate::default(),
+            put_opts_gated_paths: std::sync::Mutex::new(None),
             put_multipart_opts_gate: Gate::default(),
             multipart_created_gate: Arc::new(Gate::default()),
             multipart_put_part_gate: Arc::new(Gate::default()),
@@ -1357,7 +1360,15 @@ impl ObjectStore for GatedObjectStore {
         payload: PutPayload,
         opts: OS_PutOptions,
     ) -> object_store::Result<PutResult> {
-        self.put_opts_gate.wait().await?;
+        let gated = self
+            .put_opts_gated_paths
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_none_or(|paths| paths.contains(location));
+        if gated {
+            self.put_opts_gate.wait().await?;
+        }
         self.inner.put_opts(location, payload, opts).await
     }
 

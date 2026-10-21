@@ -2260,7 +2260,7 @@ mod tests {
     };
     use crate::types::RowEntry;
     use crate::wal::slatedb::iterator::WalExcludedRanges;
-    use crate::wal::slatedb::store::WalTableStore;
+    use crate::wal::slatedb::store::{WalFileId, WalTableStore};
     use crate::wal::{SlateDbWalReaderBuilder, WalError, WalReader as _};
     use crate::{proptest_util, test_utils, CloseReason, CompactorBuilder, KeyValue};
     use async_trait::async_trait;
@@ -7337,6 +7337,187 @@ mod tests {
                 WalExcludedRange { start: 7, end: 9 },
             ]
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_late_upload_after_takeover_is_not_acknowledged_or_replayed() {
+        // given: a writer with three upload slots. Its WAL store can hold back
+        // the upload of one WAL ID.
+        let main_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let wal_inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let gated = Arc::new(GatedObjectStore::new(Arc::clone(&wal_inner)));
+        let path = Path::from("/tmp/test_late_upload_after_takeover");
+        let wal_store = WalTableStore::new(
+            Arc::clone(&wal_inner),
+            SsTableFormat::default(),
+            path.clone(),
+            TableStoreKind::Main,
+        );
+        let mut settings = test_db_options(0, 1024 * 1024, None);
+        settings.max_inflight_wal_uploads = 3;
+        settings.flush_interval = Some(Duration::from_millis(10));
+        let db1 = Db::builder(path.clone(), Arc::clone(&main_store))
+            .with_wal_object_store(gated.clone())
+            .with_settings(settings.clone())
+            .build()
+            .await
+            .unwrap();
+        let put = |db: &Db, key: &'static [u8]| {
+            let db = db.clone();
+            async move {
+                db.put_with_options(key, key, &PutOptions::default(), &WriteOptions::default())
+                    .await
+                    .unwrap()
+            }
+        };
+        put(&db1, b"1").await.await_durable().await.unwrap();
+
+        // when: the upload of the next WAL is held back, and the WAL after it
+        // lands. The writer cannot acknowledge either write.
+        let held_id = db1.inner.wal_observer.status().unwrap().last_flushed_wal_id + 1;
+        let path_resolver = PathResolver::from_root(path.clone());
+        *gated.put_opts_gated_paths.lock().unwrap() =
+            Some(vec![path_resolver.wal_sst_path(&WalFileId::from(held_id))]);
+        gated.put_opts_gate.close();
+        // The gate counts every earlier PUT, so wait for one more arrival.
+        let arrivals = gated.put_opts_gate.arrivals();
+        let held = put(&db1, b"2").await;
+        gated.put_opts_gate.wait_for_arrivals(arrivals + 1).await;
+        let orphan = put(&db1, b"3").await;
+        while wal_store
+            .metadata(WalFileId::from(held_id + 1))
+            .await
+            .is_err()
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // when: a new writer takes over, and then the held upload is released.
+        let db2 = Db::builder(path.clone(), Arc::clone(&main_store))
+            .with_wal_object_store(Arc::clone(&wal_inner))
+            .with_settings(settings.clone())
+            .build()
+            .await
+            .unwrap();
+        gated.put_opts_gate.release();
+
+        // then: the old writer fails both writes, and neither is recovered.
+        assert!(held.await_durable().await.is_err());
+        assert!(orphan.await_durable().await.is_err());
+        assert_eq!(db2.get(b"1").await.unwrap(), Some(Bytes::from_static(b"1")));
+        assert_eq!(db2.get(b"2").await.unwrap(), None);
+        assert_eq!(db2.get(b"3").await.unwrap(), None);
+        // A third writer takes over without an L0 flush, so its replay walks
+        // through the excluded range and the orphan.
+        let db3 = Db::builder(path.clone(), Arc::clone(&main_store))
+            .with_wal_object_store(Arc::clone(&wal_inner))
+            .with_settings(settings)
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(db3.get(b"1").await.unwrap(), Some(Bytes::from_static(b"1")));
+        assert_eq!(db3.get(b"2").await.unwrap(), None);
+        assert_eq!(db3.get(b"3").await.unwrap(), None);
+    }
+
+    /// Opens a database after a takeover that recorded the range 3 to 5 and
+    /// crashed, either before or after its fence at 3. WAL 4 holds an orphan,
+    /// and WAL 5 is missing.
+    async fn takeover_after_an_interrupted_takeover(fence_written: bool) {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from(format!(
+            "/tmp/test_takeover_after_an_interrupted_takeover_{fence_written}"
+        ));
+        let wal_store = WalTableStore::new(
+            object_store.clone(),
+            SsTableFormat::default(),
+            path.clone(),
+            TableStoreKind::Main,
+        );
+        let settings = test_db_options(0, 1024 * 1024, None);
+
+        // given: WAL 1 is a fence and WAL 2 holds key 1 at seq 1.
+        let db1 = Db::builder(path.clone(), object_store.clone())
+            .with_settings(settings.clone())
+            .build()
+            .await
+            .unwrap();
+        db1.put(b"1", b"1").await.unwrap();
+        db1.flush_with_options(FlushOptions {
+            flush_type: FlushType::Wal,
+        })
+        .await
+        .unwrap();
+        let manifest_store = Arc::new(ManifestStore::new(&path, object_store.clone()));
+        let mut stored_manifest = StoredManifest::load(
+            Arc::clone(&manifest_store),
+            Arc::new(DefaultSystemClock::new()),
+        )
+        .await
+        .unwrap();
+        let mut dirty = stored_manifest.prepare_dirty().unwrap();
+        dirty.value.core.wal_excluded_range_max_size = 3;
+        dirty.value.core.wal_excluded_ranges = vec![WalExcludedRange { start: 3, end: 5 }];
+        stored_manifest.update(dirty).await.unwrap();
+        if fence_written {
+            wal_store.write_wal_fence(3.into()).await.unwrap();
+        }
+        let mut builder = wal_store.table_builder();
+        builder
+            .add(RowEntry::new_value(b"orphan", b"orphan", 2))
+            .await
+            .unwrap();
+        let orphan = builder.build().await.unwrap();
+        wal_store.write_sst(4.into(), &orphan).await.unwrap();
+
+        // when: a new writer takes over.
+        let db2 = Db::builder(path.clone(), object_store.clone())
+            .with_settings(settings.clone())
+            .build()
+            .await
+            .unwrap();
+
+        // then: without the fence, the recorded range does not apply, so the
+        // new takeover excludes 3 to 5 itself. With the fence, the range
+        // applies, and the new takeover excludes 6 to 8.
+        let expected_ranges = if fence_written {
+            vec![
+                WalExcludedRange { start: 3, end: 5 },
+                WalExcludedRange { start: 6, end: 8 },
+            ]
+        } else {
+            vec![WalExcludedRange { start: 3, end: 5 }]
+        };
+        let manifest = manifest_store.read_latest_manifest().await.unwrap();
+        assert_eq!(manifest.manifest.core.wal_excluded_ranges, expected_ranges);
+        assert_eq!(db2.get(b"1").await.unwrap(), Some(Bytes::from_static(b"1")));
+        assert_eq!(db2.get(b"orphan").await.unwrap(), None);
+        db2.put(b"2", b"2").await.unwrap();
+        db2.flush_with_options(FlushOptions {
+            flush_type: FlushType::Wal,
+        })
+        .await
+        .unwrap();
+
+        // then: a later replay recovers both keys and not the orphan.
+        let db3 = Db::builder(path.clone(), object_store.clone())
+            .with_settings(settings)
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(db3.get(b"1").await.unwrap(), Some(Bytes::from_static(b"1")));
+        assert_eq!(db3.get(b"2").await.unwrap(), Some(Bytes::from_static(b"2")));
+        assert_eq!(db3.get(b"orphan").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn test_takeover_after_a_crash_before_the_fence() {
+        takeover_after_an_interrupted_takeover(false).await;
+    }
+
+    #[tokio::test]
+    async fn test_takeover_after_a_crash_before_the_fills() {
+        takeover_after_an_interrupted_takeover(true).await;
     }
 
     #[tokio::test]
