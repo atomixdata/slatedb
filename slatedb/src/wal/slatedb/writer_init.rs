@@ -45,10 +45,10 @@ impl From<&Settings> for SlateDbWalWriterInitOptions {
 
 /// Returns the maximum number of in-flight WAL uploads that this build can use.
 ///
-/// Recovery and fencing still require serial uploads in production. Only
+/// Production uploads stay serial until the feature is enabled. Only tests and
 /// `bench-internal` builds use a configured value above 1.
 fn usable_max_inflight_wal_uploads(configured: usize) -> usize {
-    if cfg!(feature = "bench-internal") {
+    if cfg!(any(test, feature = "bench-internal")) {
         return configured;
     }
     if configured > 1 {
