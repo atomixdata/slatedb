@@ -9,7 +9,6 @@ use crate::wal::{WalError, WriterInitResult, WriterManifest};
 use crate::{wal, Settings};
 use async_trait::async_trait;
 use fail_parallel::{fail_point_send, FailPointTx};
-use log::warn;
 use slatedb_common::metrics::MetricsRecorderHelper;
 use std::sync::Arc;
 use std::time::Duration;
@@ -34,30 +33,11 @@ impl From<&Settings> for SlateDbWalWriterInitOptions {
     fn from(settings: &Settings) -> Self {
         Self {
             max_wal_bytes_size: settings.l0_sst_size_bytes,
-            max_inflight_wal_uploads: usable_max_inflight_wal_uploads(
-                settings.max_inflight_wal_uploads,
-            ),
+            max_inflight_wal_uploads: settings.max_inflight_wal_uploads,
             max_wal_flushes_before_l0_flush: settings.max_wal_flushes_before_l0_flush,
             max_flush_interval: settings.flush_interval,
         }
     }
-}
-
-/// Returns the maximum number of in-flight WAL uploads that this build can use.
-///
-/// Production uploads stay serial until the feature is enabled. Only tests and
-/// `bench-internal` builds use a configured value above 1.
-fn usable_max_inflight_wal_uploads(configured: usize) -> usize {
-    if cfg!(any(test, feature = "bench-internal")) {
-        return configured;
-    }
-    if configured > 1 {
-        warn!(
-            "ignoring max_inflight_wal_uploads without the bench-internal feature [max_inflight_wal_uploads={}]",
-            configured
-        );
-    }
-    1
 }
 
 pub(crate) struct SlateDbWalWriterInit {

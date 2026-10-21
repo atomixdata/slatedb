@@ -732,8 +732,10 @@ pub struct Settings {
     /// in groups. The writer then makes about one upload request per
     /// `flush_interval` while writes arrive.
     ///
-    /// Only builds with the `bench-internal` feature use larger values. Those
-    /// builds do not yet have safe recovery or fencing for concurrent uploads.
+    /// Before you set this value above 1, upgrade every binary that opens the
+    /// database. A writer with a value above 1 records it in the manifest and
+    /// writes manifest format version 3, which older versions reject. Lowering
+    /// the value later is safe, but the manifest keeps the largest value.
     #[serde(default = "default_max_inflight_wal_uploads")]
     pub max_inflight_wal_uploads: usize,
 

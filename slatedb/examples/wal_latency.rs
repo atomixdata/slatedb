@@ -3,8 +3,7 @@
 //! Run with:
 //! `cargo run -p slatedb --release --example wal_latency --no-default-features`
 //!
-//! Set `WAL_MAX_INFLIGHT_UPLOADS` above 1 and add `--features bench-internal`
-//! for concurrent uploads.
+//! Set `WAL_MAX_INFLIGHT_UPLOADS` above 1 for concurrent uploads.
 
 // This standalone benchmark uses real time and prints JSON results.
 #![allow(clippy::disallowed_methods, clippy::disallowed_macros)]
@@ -96,10 +95,6 @@ async fn main() -> Result<()> {
             "flush interval, writes, max inflight, value bytes, and max inflight uploads must be positive"
                 .into(),
         );
-    }
-    // Without this feature, the writer ignores this limit and uploads serially.
-    if max_inflight_uploads > 1 && !cfg!(feature = "bench-internal") {
-        return Err("WAL_MAX_INFLIGHT_UPLOADS above 1 requires --features bench-internal".into());
     }
     let wal = Arc::new(ThrottledStore::new(InMemory::new(), Default::default()));
     let db = Arc::new(

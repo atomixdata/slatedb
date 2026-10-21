@@ -2032,3 +2032,58 @@ impl ObjectStore for RecordingObjectStore {
         self.inner.copy_opts(from, to, options).await
     }
 }
+
+/// Opens a database at `path` after a takeover that excluded a range with an
+/// orphan in it. Before the takeover, WAL 1 is a fence, WAL 2 holds key `1` at
+/// seq 1, the manifest stores a window of 3, and WAL 4 holds key `orphan` at
+/// seq 2. The returned writer recorded the range 3 to 5 and fenced 3 and 5.
+pub(crate) async fn open_after_takeover_with_an_orphan(
+    path: &Path,
+    object_store: Arc<dyn ObjectStore>,
+    settings: crate::Settings,
+) -> Db {
+    use crate::config::{FlushOptions, FlushType};
+    use crate::format::sst::SsTableFormat;
+    use crate::manifest::store::{ManifestStore, StoredManifest};
+    use crate::wal::slatedb::store::WalTableStore;
+    use slatedb_common::clock::DefaultSystemClock;
+
+    let db1 = Db::builder(path.clone(), object_store.clone())
+        .with_settings(settings.clone())
+        .build()
+        .await
+        .unwrap();
+    db1.put(b"1", b"1").await.unwrap();
+    db1.flush_with_options(FlushOptions {
+        flush_type: FlushType::Wal,
+    })
+    .await
+    .unwrap();
+    let manifest_store = Arc::new(ManifestStore::new(path, object_store.clone()));
+    let mut stored_manifest =
+        StoredManifest::load(manifest_store, Arc::new(DefaultSystemClock::new()))
+            .await
+            .unwrap();
+    let mut dirty = stored_manifest.prepare_dirty().unwrap();
+    dirty.value.core.wal_excluded_range_max_size = 3;
+    stored_manifest.update(dirty).await.unwrap();
+    let wal_store = WalTableStore::new(
+        object_store.clone(),
+        SsTableFormat::default(),
+        path.clone(),
+        TableStoreKind::Main,
+    );
+    let mut builder = wal_store.table_builder();
+    builder
+        .add(RowEntry::new_value(b"orphan", b"orphan", 2))
+        .await
+        .unwrap();
+    let orphan = builder.build().await.unwrap();
+    wal_store.write_sst(4.into(), &orphan).await.unwrap();
+
+    Db::builder(path.clone(), object_store)
+        .with_settings(settings)
+        .build()
+        .await
+        .unwrap()
+}
