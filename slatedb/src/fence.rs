@@ -91,19 +91,16 @@ impl WriterFencer {
     ) -> Result<WriterFenceResult, SlateDBError> {
         let wal_writer_init = match self.wal_writer_init.take() {
             Some(wal_writer_init) => wal_writer_init,
-            None => Box::new(
-                SlateDbWalWriterInit::load(
-                    self.closed_result_reader.clone(),
-                    self.recorder.clone(),
-                    self.wal_store.clone(),
-                    self.wal_writer_init_options,
-                    stored_manifest.manifest(),
-                    self.task_executor.clone(),
-                    self.fp_tx.clone(),
-                )
-                .await?,
-            ),
+            None => Box::new(SlateDbWalWriterInit::new(
+                self.closed_result_reader.clone(),
+                self.recorder.clone(),
+                self.wal_store.clone(),
+                self.wal_writer_init_options,
+                self.task_executor.clone(),
+                self.fp_tx.clone(),
+            )),
         };
+        self.fail_point_send("BeforeFenceManifest");
 
         let manifest = FenceableManifest::init_writer(
             stored_manifest,
@@ -119,7 +116,9 @@ impl WriterFencer {
         let result = wal_writer_init.fence_and_init(&mut manifest).await?;
         let mut manifest: FenceableManifest = manifest.into();
 
-        // Refresh validates that we own the latest epoch still.
+        // Refresh validates that we own the latest epoch still. We also need
+        // this refresh after the fences: if a newer writer has taken over,
+        // this writer stops before replay and before its first upload.
         manifest.refresh().await?;
         fail_point_send!(self.fp_tx, "FinalRefreshManifest");
 
@@ -181,6 +180,12 @@ mod tests {
 
     impl WriterFencerTestHarness {
         async fn new(path: &str) -> Self {
+            Self::new_with_window(path, 1).await
+        }
+
+        /// Creates the database with `window` as its stored
+        /// `wal_excluded_range_max_size`.
+        async fn new_with_window(path: &str, window: u64) -> Self {
             let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
             let settings = test_db_options();
             let system_clock: Arc<dyn SystemClock> = Arc::new(DefaultSystemClock::new());
@@ -202,13 +207,12 @@ mod tests {
                 Arc::clone(&fp_registry),
                 TableStoreKind::Main,
             ));
-            let stored_manifest = StoredManifest::create_new_db(
-                manifest_store.clone(),
-                ManifestCore::new(),
-                system_clock.clone(),
-            )
-            .await
-            .unwrap();
+            let mut core = ManifestCore::new();
+            core.wal_excluded_range_max_size = window;
+            let stored_manifest =
+                StoredManifest::create_new_db(manifest_store.clone(), core, system_clock.clone())
+                    .await
+                    .unwrap();
             let (fp_tx, event_rx) = fail_point_channel(fp_registry.clone());
             let cell = Arc::new(WatchableOnceCell::new());
             let recorder = MetricsRecorderHelper::new(
@@ -399,6 +403,7 @@ mod tests {
         event: &'static str,
         write_fenced: bool,
         flush_fenced: bool,
+        window: u64,
     }
 
     impl FencedWriterFlushTestCase {
@@ -407,7 +412,13 @@ mod tests {
                 event,
                 write_fenced,
                 flush_fenced,
+                window: 1,
             }
+        }
+
+        fn with_window(mut self, window: u64) -> Self {
+            self.window = window;
+            self
         }
     }
 
@@ -431,6 +442,7 @@ mod tests {
     struct FencerFencedTestCase {
         pause_event: &'static str,
         new_db_writes: bool,
+        window: u64,
     }
 
     impl FencerFencedTestCase {
@@ -438,41 +450,52 @@ mod tests {
             Self {
                 pause_event,
                 new_db_writes,
+                window: 1,
             }
+        }
+
+        const fn with_window(mut self, window: u64) -> Self {
+            self.window = window;
+            self
         }
     }
 
     #[rstest]
     #[case::fence_manifest(FencerFencedTestCase::new("FenceManifest", false))]
     #[case::fence_manifest_with_new_db_writes(FencerFencedTestCase::new("FenceManifest", true))]
-    #[case::reload_empty_wal_id(FencerFencedTestCase::new("ReloadEmptyWalId", false))]
-    #[case::reload_empty_wal_id_with_new_db_writes(FencerFencedTestCase::new(
-        "ReloadEmptyWalId",
-        true
-    ))]
+    #[case::walk_to_frontier(FencerFencedTestCase::new("WalkToFrontier", false))]
+    #[case::walk_to_frontier_with_new_db_writes(FencerFencedTestCase::new("WalkToFrontier", true))]
+    // With a window above 1, the newer writer's claim makes the fencer's range
+    // write fail.
+    #[case::walk_to_frontier_with_window(
+        FencerFencedTestCase::new("WalkToFrontier", true).with_window(3)
+    )]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_fencer_fenced_after_claiming_epoch(#[case] case: FencerFencedTestCase) {
         // initialize a fenced db
-        let mut h =
-            WriterFencerTestHarness::new("/tmp/test_fencer_fenced_after_claiming_epoch").await;
+        let mut h = WriterFencerTestHarness::new_with_window(
+            "/tmp/test_fencer_fenced_after_claiming_epoch",
+            case.window,
+        )
+        .await;
         let db = h.fenced_db().await;
         h.put(&db, 0, false).await;
 
-        // initialize a fencer. configure it to pause at LoadEmptyWalId (so the
-        // fenced writer can race ahead) and at the case's event (so a new
-        // writer can claim the epoch out from under the fencer).
-        fail_parallel::cfg(h.fp_registry.clone(), "LoadEmptyWalId", "pause").unwrap();
+        // initialize a fencer. configure it to pause at BeforeFenceManifest
+        // (so the fenced writer can race ahead) and at the case's event (so a
+        // new writer can claim the epoch out from under the fencer).
+        fail_parallel::cfg(h.fp_registry.clone(), "BeforeFenceManifest", "pause").unwrap();
         fail_parallel::cfg(h.fp_registry.clone(), case.pause_event, "pause").unwrap();
 
         let fencer = h.fencer.take().unwrap();
         let stored_manifest = h.stored_manifest.take().unwrap();
         let jh = tokio::task::spawn(async move { fencer.fence(stored_manifest, None).await });
-        // wait for LoadEmptyWalId pause
-        assert_eq!(h.event_rx.recv().await.unwrap(), "LoadEmptyWalId");
+        // wait for BeforeFenceManifest pause
+        assert_eq!(h.event_rx.recv().await.unwrap(), "BeforeFenceManifest");
 
-        // after LoadEmptyWalId pause, have the fenced db write some wals and flush and gc.
-        // This advances replay_after_wal_id past the fencer's stale empty_wal_id, so the
-        // recompute branch (and ReloadEmptyWalId fail_point_send) fires when the fencer resumes.
+        // after BeforeFenceManifest pause, have the fenced db write some wals
+        // and flush and gc. This advances replay_after_wal_id before the
+        // fencer claims the epoch.
         h.put(&db, 1, false).await;
         h.put(&db, 2, false).await;
         db.flush_with_options(FlushOptions {
@@ -492,11 +515,11 @@ mod tests {
 
         // Resume the fencer, but keep the case's pause active until the new writer takes ownership.
         // Setting "pause" again can release the fencer if it already reached that pause.
-        fail_parallel::cfg(h.fp_registry.clone(), "LoadEmptyWalId", "off").unwrap();
+        fail_parallel::cfg(h.fp_registry.clone(), "BeforeFenceManifest", "off").unwrap();
 
         // wait for the case's pause event. fp_notify sends an event for every
         // failpoint regardless of whether it pauses, so drain intermediate
-        // events (e.g. FenceManifest fires before ReloadEmptyWalId).
+        // events (e.g. FenceManifest fires before WalkToFrontier).
         loop {
             let event = h.event_rx.recv().await.unwrap();
             if event == case.pause_event {
@@ -508,8 +531,8 @@ mod tests {
         let db2 = h.db().await;
         if case.new_db_writes {
             // optionally let the new db write wals, flush, and gc — exercises the
-            // case where wals below the fencer's stale empty_wal_id get cleaned up
-            // while it is paused.
+            // case where wals below the fencer's frontier get cleaned up while
+            // it is paused.
             h.put(&db2, 3, false).await;
             h.put(&db2, 4, false).await;
             db2.flush_with_options(FlushOptions {
@@ -547,13 +570,26 @@ mod tests {
     }
 
     #[rstest]
-    #[case::load_empty_wal_id(FencedWriterFlushTestCase::new("LoadEmptyWalId", false, false))]
+    #[case::before_fence_manifest(FencedWriterFlushTestCase::new(
+        "BeforeFenceManifest",
+        false,
+        false
+    ))]
     #[case::fence_manifest(FencedWriterFlushTestCase::new("FenceManifest", false, true))]
+    #[case::walk_to_frontier(FencedWriterFlushTestCase::new("WalkToFrontier", false, true))]
+    // With a window above 1, the fencer records a range at g, loses g to the
+    // fenced writer's upload, and replaces that range with one after it.
+    #[case::walk_to_frontier_with_window(
+        FencedWriterFlushTestCase::new("WalkToFrontier", false, true).with_window(3)
+    )]
     #[case::write_wal_fence(FencedWriterFlushTestCase::new("WriteWalFence:1", true, true))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_fence_handles_fenced_writer_flush(#[case] case: FencedWriterFlushTestCase) {
-        let mut h =
-            WriterFencerTestHarness::new("/tmp/test_fence_handles_fenced_writer_flush").await;
+        let mut h = WriterFencerTestHarness::new_with_window(
+            "/tmp/test_fence_handles_fenced_writer_flush",
+            case.window,
+        )
+        .await;
         let db = h.fenced_db().await;
 
         // write a wal file
@@ -566,14 +602,15 @@ mod tests {
         let fencer = h.fencer.take().unwrap();
         let stored_manifest = h.stored_manifest.take().unwrap();
         let jh = tokio::task::spawn(async move { fencer.fence(stored_manifest, None).await });
-        // wait for fencer to load empty wal id and pause
-        h.event_rx.recv().await.unwrap();
+        // wait for the fencer to pause. fp_notify sends an event for every
+        // failpoint, so skip the events before the case's event.
+        while h.event_rx.recv().await.unwrap() != case.event {}
 
         // write 2 new wal files to fenced db (write with await durable twice)
         h.put(&db, 1, case.write_fenced).await;
         h.put(&db, 2, case.write_fenced).await;
-        // force l0 flush — advances replay_after_wal_id past the fencer's
-        // stale empty_wal_id.
+        // force l0 flush. If the fencer has not claimed the epoch yet, this
+        // advances replay_after_wal_id.
         let result = db
             .flush_with_options(FlushOptions {
                 flush_type: FlushType::MemTable,
@@ -603,17 +640,32 @@ mod tests {
         fail_parallel::cfg(h.fp_registry.clone(), case.event, "off").unwrap();
         // verify it returns successfully
         let mut result = jh.await.unwrap().unwrap();
-        // The fencer's stale empty_wal_id was retried above the fenced writer's possibly
-        // advanced replay_after_wal_id.
+        // The fencer walked from the fenced writer's possibly advanced
+        // replay_after_wal_id.
         let first_replayed_wal = result
             .replay_iterator
             .next()
             .await
             .unwrap()
             .expect("expected the replay iterator to contain the fencing WAL");
+        // A fence that starts an excluded range accounts for the whole range.
+        // With a window above 1, the fenced writer's own takeover recorded one.
+        let first_wal_id = replay_after_wal_id + 1;
+        let ranges = h
+            .manifest_store
+            .read_latest_manifest()
+            .await
+            .unwrap()
+            .manifest
+            .core
+            .wal_excluded_ranges;
+        let expected_consumed = ranges
+            .iter()
+            .find(|range| range.start == first_wal_id)
+            .map_or(first_wal_id, |range| range.end);
         assert_eq!(
             first_replayed_wal.last_consumed_wal_file_id,
-            replay_after_wal_id + 1
+            expected_consumed
         );
 
         // verify that fenced db is fenced (new write fails)

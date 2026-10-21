@@ -2259,6 +2259,7 @@ mod tests {
         OnDemandCompactionSchedulerSupplier, StringConcatMergeOperator,
     };
     use crate::types::RowEntry;
+    use crate::wal::slatedb::iterator::WalExcludedRanges;
     use crate::wal::slatedb::store::WalTableStore;
     use crate::wal::{SlateDbWalReaderBuilder, WalError, WalReader as _};
     use crate::{proptest_util, test_utils, CloseReason, CompactorBuilder, KeyValue};
@@ -6866,16 +6867,17 @@ mod tests {
         );
 
         // Get the next WAL SST ID based on what's currently in the object store
-        let next_wal_sst_id = wal_store.next_wal_sst_id(0.into()).await.unwrap();
+        let next_wal_sst_id = wal_store
+            .walk_to_frontier(1.into(), &WalExcludedRanges::none())
+            .await
+            .unwrap()
+            .value();
 
         // Get the latest manifest
         let manifest = manifest_store.read_latest_manifest().await.unwrap();
 
         // Assert that the manifest reflects only the flushed WAL
-        assert_eq!(
-            manifest.manifest.core.next_wal_sst_id,
-            next_wal_sst_id.value()
-        );
+        assert_eq!(manifest.manifest.core.next_wal_sst_id, next_wal_sst_id);
     }
 
     #[tokio::test]

@@ -13,7 +13,7 @@ use crate::db_status::DbStatus;
 use crate::error::SlateDBError;
 use crate::iter::{EmptyIterator, RowEntryIterator};
 use crate::manifest::store::ManifestStore;
-use crate::manifest::VersionedManifest;
+use crate::manifest::{VersionedManifest, WalExcludedRange};
 use crate::utils::panic_string;
 use crate::wal::{WalError, WalIterator as WalIteratorTrait, WalRows};
 use crate::RowEntry;
@@ -39,6 +39,43 @@ impl ManifestReader for ManifestStore {
     async fn manifest(&self) -> Result<VersionedManifest, SlateDBError> {
         self.read_latest_manifest().await
     }
+}
+
+/// Where a WAL reader finds the ranges that writer takeovers excluded.
+///
+/// A takeover records its range in the manifest before it writes the fence at
+/// the range start. A recorded range applies only if the WAL object at its
+/// start is a zero-byte fence.
+#[derive(Clone)]
+pub(crate) enum WalExcludedRanges {
+    /// Ranges that the caller already holds, from a manifest that is new
+    /// enough for every fence it can reach.
+    Known(Arc<[WalExcludedRange]>),
+}
+
+impl WalExcludedRanges {
+    pub(crate) fn none() -> Self {
+        Self::Known(Arc::from([]))
+    }
+
+    pub(crate) fn known(ranges: &[WalExcludedRange]) -> Self {
+        Self::Known(Arc::from(ranges))
+    }
+
+    /// Returns every recorded range, sorted by start.
+    pub(crate) async fn load(&self) -> Result<Arc<[WalExcludedRange]>, SlateDBError> {
+        match self {
+            Self::Known(ranges) => Ok(Arc::clone(ranges)),
+        }
+    }
+}
+
+/// Returns the end of the recorded range that starts at `wal_id`, if any.
+pub(crate) fn excluded_range_end(ranges: &[WalExcludedRange], wal_id: u64) -> Option<u64> {
+    ranges
+        .binary_search_by_key(&wal_id, |range| range.start)
+        .ok()
+        .map(|index| ranges[index].end)
 }
 
 pub(crate) struct SlateDbWalIteratorOptions {
@@ -85,8 +122,11 @@ impl WalFileIterator {
 struct WalRowsCollector {
     wal_id: u64,
     iter: WalFileIterator,
-    rows: Vec<RowEntry>,
     drained: bool,
+    /// What the file contributes. Empty for a fence.
+    rows: Vec<RowEntry>,
+    /// Set for a fence that starts an excluded range: the last ID of the range.
+    excluded_through: Option<u64>,
 }
 
 impl WalRowsCollector {
@@ -94,9 +134,26 @@ impl WalRowsCollector {
         Self {
             wal_id,
             iter,
-            rows: vec![],
             drained: false,
+            rows: vec![],
+            excluded_through: None,
         }
+    }
+
+    /// A zero-byte fence. If it starts an excluded range, `excluded_through`
+    /// is the last ID of the range.
+    fn fence(wal_id: u64, excluded_through: Option<u64>) -> Self {
+        let iter = WalFileIterator::Empty(EmptyIterator::new());
+        Self {
+            excluded_through,
+            ..Self::new(wal_id, iter)
+        }
+    }
+
+    /// Returns the last WAL ID that this file accounts for. A fence that starts
+    /// an excluded range accounts for the whole range.
+    fn consumed_through(&self) -> u64 {
+        self.excluded_through.unwrap_or(self.wal_id)
     }
 
     fn spawn_fetches(&mut self) -> SpawnFetchResult {
@@ -126,7 +183,7 @@ impl From<WalRowsCollector> for WalRows {
     fn from(reader: WalRowsCollector) -> Self {
         assert!(reader.drained);
         WalRows {
-            last_consumed_wal_file_id: reader.wal_id,
+            last_consumed_wal_file_id: reader.consumed_through(),
             rows: reader.rows,
         }
     }
@@ -187,7 +244,8 @@ pub(crate) struct SlateDbWalIterator {
     preload_limit: usize,
     end_bound: WalIteratorEndBound,
     wal_store: Arc<WalTableStore>,
-    next_files: VecDeque<JoinHandle<Result<WalRowsCollector, WalError>>>,
+    /// Open tasks in WAL ID order, with the WAL ID that each one opens.
+    next_files: VecDeque<(u64, JoinHandle<Result<WalRowsCollector, WalError>>)>,
     loading_files: VecDeque<Result<WalRowsCollector, WalError>>,
     next_wal_id: Option<u64>,
     /// The greatest seq returned so far, used to verify that WAL files arrive
@@ -197,6 +255,7 @@ pub(crate) struct SlateDbWalIterator {
     /// because an error was returned.
     terminal_result: Option<Result<Option<WalRows>, WalError>>,
     current_file: CurrentWalFile,
+    excluded_ranges: WalExcludedRanges,
 }
 
 #[derive(Clone)]
@@ -255,7 +314,13 @@ impl SlateDbWalIterator {
             last_seq: None,
             terminal_result: None,
             current_file: CurrentWalFile::initial(),
+            excluded_ranges: WalExcludedRanges::none(),
         })
+    }
+
+    pub(crate) fn with_excluded_ranges(mut self, excluded_ranges: WalExcludedRanges) -> Self {
+        self.excluded_ranges = excluded_ranges;
+        self
     }
 
     fn spawn_opens(&mut self) {
@@ -278,16 +343,18 @@ impl SlateDbWalIterator {
             wal_id: u64,
             sst_iter_options: WalSstIteratorOptions,
             wal_store: Arc<WalTableStore>,
+            excluded_ranges: WalExcludedRanges,
         ) -> Result<WalRowsCollector, SlateDBError> {
             let sst = match wal_store.open_sst(WalFileId::from(wal_id)).await {
                 Ok(sst) => sst,
+                // Zero-byte WAL files are fence markers; replay them as empty WALs
+                // so the last replayed WAL ID still advances past the marker. The
+                // ranges are read after the fence was seen, so they include a
+                // range that starts at it.
                 Err(SlateDBError::EmptySSTable) => {
-                    // Zero-byte WAL files are fence markers; replay them as empty WALs
-                    // so the last replayed WAL ID still advances past the marker.
-                    return Ok(WalRowsCollector::new(
-                        wal_id,
-                        WalFileIterator::Empty(EmptyIterator::new()),
-                    ));
+                    let ranges = excluded_ranges.load().await?;
+                    let excluded_through = excluded_range_end(&ranges, wal_id);
+                    return Ok(WalRowsCollector::fence(wal_id, excluded_through));
                 }
                 Err(err) => return Err(err),
             };
@@ -303,10 +370,16 @@ impl SlateDbWalIterator {
             sst_iter_options: WalSstIteratorOptions,
             wal_store: Arc<WalTableStore>,
             end_bound: WalIteratorEndBound,
+            excluded_ranges: WalExcludedRanges,
         ) -> Result<WalRowsCollector, WalError> {
             loop {
-                match try_open_file_iter(wal_id, sst_iter_options.clone(), Arc::clone(&wal_store))
-                    .await
+                match try_open_file_iter(
+                    wal_id,
+                    sst_iter_options.clone(),
+                    Arc::clone(&wal_store),
+                    excluded_ranges.clone(),
+                )
+                .await
                 {
                     Ok(iter) => return Ok(iter),
                     Err(err) if err.has_object_store_not_found() => {
@@ -337,9 +410,34 @@ impl SlateDbWalIterator {
             self.sst_iter_options.clone(),
             Arc::clone(&self.wal_store),
             self.end_bound.clone(),
+            self.excluded_ranges.clone(),
         ));
-        self.next_files.push_back(handle);
+        self.next_files.push_back((next_wal_id, handle));
         true
+    }
+
+    /// Drops the queued opens inside an excluded range.
+    ///
+    /// Opens finish in WAL ID order, so every task after the opened file is
+    /// still in `next_files`. A fence that starts an excluded range removes the
+    /// tasks inside the range, including tasks that poll for missing IDs.
+    fn skip_after_open(&mut self, result: &Result<WalRowsCollector, WalError>) {
+        let Ok(WalRowsCollector {
+            excluded_through: Some(end),
+            ..
+        }) = result
+        else {
+            return;
+        };
+        let end = *end;
+        // Queued opens are sorted by WAL ID, so the excluded ones come first.
+        let excluded = self.next_files.partition_point(|(id, _)| *id <= end);
+        for (_, task) in self.next_files.drain(..excluded) {
+            task.abort();
+        }
+        if self.next_wal_id.is_some_and(|id| id <= end) {
+            self.next_wal_id = end.checked_add(1);
+        }
     }
 
     fn open_task_result(
@@ -369,15 +467,21 @@ impl SlateDbWalIterator {
     /// Moves every completed open from the task queue into the metadata-loaded queue without
     /// waiting for an unfinished open.
     async fn move_finished_files(&mut self) {
-        while self.next_files.front().is_some_and(JoinHandle::is_finished) {
-            let result = self
+        while self
+            .next_files
+            .front()
+            .is_some_and(|(_, task)| task.is_finished())
+        {
+            let result = (&mut self
                 .next_files
                 .front_mut()
                 .expect("a finished open must exist")
+                .1)
                 .await;
             self.next_files.pop_front();
-            self.loading_files
-                .push_back(Self::open_task_result(&self.end_bound, result));
+            let result = Self::open_task_result(&self.end_bound, result);
+            self.skip_after_open(&result);
+            self.loading_files.push_back(result);
         }
     }
 
@@ -385,13 +489,14 @@ impl SlateDbWalIterator {
     async fn await_next_file(&mut self) -> bool {
         // Await a mutable reference so cancellation leaves the handle in the queue.
         // See https://docs.rs/tokio/latest/tokio/task/struct.JoinHandle.html#cancel-safety.
-        let Some(join_handle) = self.next_files.front_mut() else {
+        let Some((_, join_handle)) = self.next_files.front_mut() else {
             return false;
         };
         let result = join_handle.await;
         self.next_files.pop_front();
-        self.loading_files
-            .push_back(Self::open_task_result(&self.end_bound, result));
+        let result = Self::open_task_result(&self.end_bound, result);
+        self.skip_after_open(&result);
+        self.loading_files.push_back(result);
         true
     }
 
@@ -440,7 +545,7 @@ impl SlateDbWalIterator {
         result: Result<Option<WalRows>, WalError>,
     ) -> Result<Option<WalRows>, WalError> {
         self.terminal_result = Some(result.clone());
-        for task in self.next_files.drain(..) {
+        for (_, task) in self.next_files.drain(..) {
             task.abort();
         }
         self.loading_files.clear();
@@ -502,7 +607,7 @@ impl WalIteratorTrait for SlateDbWalIterator {
 
 impl Drop for SlateDbWalIterator {
     fn drop(&mut self) {
-        for task in self.next_files.drain(..) {
+        for (_, task) in self.next_files.drain(..) {
             task.abort();
         }
     }
@@ -934,11 +1039,7 @@ mod tests {
         .unwrap();
         iter.spawn_opens();
         // wait for all the file waits to finish
-        while !iter
-            .next_files
-            .iter()
-            .all(tokio::task::JoinHandle::is_finished)
-        {
+        while !iter.next_files.iter().all(|(_, task)| task.is_finished()) {
             tokio::task::yield_now().await;
         }
         // exhaust the current tasks's budget and ensure the future is pending even though
