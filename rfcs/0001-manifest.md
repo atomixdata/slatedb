@@ -28,6 +28,7 @@ Table of Contents:
    * [DeltaStream Protocol](#deltastream-protocol)
    * [`object_store` Locking](#object_store-locking)
    * [Atomic Deletes](#atomic-deletes)
+   * [Seal Records for Parallel Writes](#seal-records-for-parallel-writes)
 - [Addendum](#addendum)
 
 <!-- TOC end -->
@@ -44,6 +45,10 @@ References:
 
 * Add manifest design document. ([#24](https://github.com/slatedb/slatedb/pull/24))
 * Add an alternative manifest design document ([#39](https://github.com/slatedb/slatedb/pull/39))
+
+Updates:
+
+* 2026-10: Parallel WAL writes. The `wal` section defines accepted history, the writer protocol fences the WAL frontier with an excluded range, and _Parallel Writes_ replaces the earlier parallel write proposal.
 
 ## Current Design
 
@@ -265,6 +270,22 @@ message Manifest {
 
   // A list of read snapshots that are currently open.
   repeated Snapshot snapshots = 7;
+
+  // The largest `max_inflight_wal_uploads` that any writer has claimed. A
+  // missing value means 1.
+  uint64 wal_excluded_range_max_size = 8;
+
+  // WAL ID ranges that writer takeovers excluded from the WAL, sorted by
+  // start.
+  repeated WalExcludedRange wal_excluded_ranges = 9;
+}
+
+message WalExcludedRange {
+  // The first excluded WAL SST ID.
+  uint64 start = 1;
+
+  // The last excluded WAL SST ID, inclusive.
+  uint64 end = 2;
 }
 
 message SstInfo {
@@ -318,7 +339,11 @@ The size calculation (in bytes) for the manifest is:
 + 8                         // wal_id_last_seen
 + 4 + ~56 * leveled_ssts    // array length + leveled_ssts (~32 byte key + 24 bytes = ~56 bytes)
 + 4 + 28 * snapshots        // array length + snapshots (28 bytes each)
++ 8                         // wal_excluded_range_max_size
++ 4 + 16 * excluded_ranges  // array length + wal_excluded_ranges (16 bytes each)
 ```
+
+Each writer takeover with `wal_excluded_range_max_size` above 1 adds one excluded range. Takeovers are rare, so the ranges are left out of the estimate below.
 
 Conservatively, a manifest with 1000 snapshots and 100,000 compacted SSTs would be:
 
@@ -339,11 +364,13 @@ Whether this is reasonable or not depends on how frequently manifests are update
 
 #### `wal/00000000000000000000.sst`
 
-SlateDB's WAL is a sequentially ordered contiguous list of SSTs. SST object names are formatted as 20 digit zero-padded numbers to fit u64's maximum integer and to support lexicographical sorting. Each SST contains zero or more sorted key-value pairs. The WAL is used to store writes that have not yet been compacted.
+SlateDB's WAL is a sequentially ordered list of SSTs. SST object names are formatted as 20 digit zero-padded numbers to fit u64's maximum integer and to support lexicographical sorting. Each SST contains zero or more sorted key-value pairs. The WAL is used to store writes that have not yet been compacted.
 
 Traditionally, LSMs store WAL data in a different format from the SSTs; this is because each `put()` call results in a single key-value write to the WAL. But SlateDB doesn't write to the WAL on each `put()`. Instead, `put()`'s are batched together based on `flush_interval`, `flush_bytes` ([#30](https://github.com/slatedb/slatedb/issues/30)), or `skip_memtable_bytes` ([#31](https://github.com/slatedb/slatedb/issues/31)). Based on these configurations, multiple key-value pairs are stored in the WAL in a single write. Thus, SlateDB uses SSTs for both the WAL and compacted files.
 
 _NOTE: We discussed using a different format for the WAL [here](https://github.com/slatedb/slatedb/pull/39/files#r1590087062), but decided against it._
+
+With parallel writes, the `wal` can have gaps. A writer can store SST 3 while SST 2 is still uploading, and then crash. So the WAL that SlateDB replays and serves is its _accepted history_: the consecutive SSTs from the replay start up to the first missing ID, which we call the _frontier_. An empty fencing SST counts as an empty SST. If the manifest records an excluded range that starts at a fencing SST's ID, the IDs in that range are skipped. An SST after the frontier, or inside an excluded range, is never read. Its writer never acknowledged it, and we call it an _orphan_. See _Parallel Writes_ under _Writers_ for how excluded ranges are created.
 
 This design does not use [prefixes](https://docs.aws.amazon.com/AmazonS3/latest/userguide/using-prefixes.html). AWS allows, "3,500 PUT/COPY/POST/DELETE or 5,500 GET/HEAD requests per second per partitioned Amazon S3 prefix." This limits a single writer to 3,500 writes and 5,500 reads per-second. With a `flush_interval` set to 1ms, a client would write 1,000 writes per-second (not including compactions). With caching, the client should be far below the 5,500 reads per-second limit.
 
@@ -371,7 +398,7 @@ If the CAS write fails in (4), the client must retry the entire process. This is
 Three different processes update the manifest:
 
 * **Readers**: Readers can update `snapshots` to create, remove, or update a snapshot. Readers can also update `wal_id_last_seen` to update the latest `wal` SST ID when a new snapshot is created.
-* **Writers**: Writers must update `writer_epoch` once on startup.
+* **Writers**: Writers must update `writer_epoch` once on startup. With parallel writes, a writer also records an excluded range during startup.
 * **Compactors**: Compactors must update `compactor_epoch` once on startup. Compactors must also update `wal_id_last_compacted`, `wal_id_last_seen`, and `leveled_ssts` after each compaction pass.
 
 The union of these three processes means the manifest is updated whenever:
@@ -447,16 +474,17 @@ On startup, a writer client must increment `writer_epoch`.
 
 1. List `manifest` to find the manifest with the largest ID.
 2. Read the current manifest (e.g. `manifest/00000000000000000002.manifest`).
-3. Increment the `writer_epoch` in the current manifest in memory.
+3. Increment the `writer_epoch` in the current manifest in memory, and raise `wal_excluded_range_max_size` to at least the writer's `max_inflight_wal_uploads`.
 4. Create a new snapshot in the current manifest in memory.
 5. Write the manifest with the updated `writer_epoch` (e.g. `manifest/00000000000000000003.manifest`).
 
 _NOTE: A snapshot is created in (4) to prevent the compactor from deleting `wal` SSTs while the writer is writing its fencing SST. The timeout for the snapshot will be twice as long as the writer's snapshot refresh interval. See [here](https://github.com/slatedb/slatedb/pull/43#discussion_r1594460226) and [here](https://github.com/slatedb/slatedb/pull/43#discussion_r1601806626) for details._
 
-The writer client must then fence all older clients. This is done by writing an empty SST to the next SST ID in the WAL.
+The writer client must then fence all older clients. This is done by writing an empty SST at the frontier of the WAL.
 
-2. List the `wal` directory to find the next SST ID.
-3. Write an empty SST with the new `writer_epoch` to the next SST ID using CAS or object versioning.
+1. List the `wal` directory to find the frontier.
+2. If `wal_excluded_range_max_size` is above 1, record an excluded range that starts at the frontier in the manifest. See _Parallel Writes_ below.
+3. Write an empty SST with the new `writer_epoch` to the frontier using CAS or object versioning.
 
 _NOTE: The writer may choose to release its snapshot created in (1) after writing the fencing SST in (3), or it may periodically refresh its snapshot._
 
@@ -469,13 +497,13 @@ At this point, there are four potential outcomes:
 
 If the write was successful (1), all previous (older) writers have now been fenced.
 
-If an older writer beats the current writer to the SST slot (2), the newer writer increments its SST ID by 1 and tries again. This process repeats until the write is successful.
+If an older writer beats the current writer to the SST slot (2), that SST is part of the WAL, and the newer writer finds the next frontier and tries again. This process repeats until the write is successful.
 
 If another writer has the same `writer_epoch` (3), the client is in an illegal state. This should never happen since clients are transactionally updating `writer_epoch`. If this does happen, the client should panic.
 
 If a newer writer beats the current writer to the SST slot (4), the current writer has been fenced. The current writer should halt.
 
-_NOTE: This protocol implies the invariant that SST IDs in `wal` will be contiguous and monotonically increasing._
+_NOTE: With serial writes, this protocol implies the invariant that SST IDs in `wal` will be contiguous and monotonically increasing. Parallel writes relax this invariant to accepted history, as the `wal` section describes._
 
 #### Examples
 
@@ -521,84 +549,53 @@ In the example above, writer 1 successfully writes SSTs 0 and 1. Writer 2 tries 
 
 SlateDB's `put()` API is asynchronous. Clients that want to know when their `put()` has been durably persisted to object storage must call `await`. A writer client will not successfully acknowledge a `put()` call until the key-value pair has been successfully written to object storage in a `wal` SST.
 
+With parallel writes, a writer acknowledges SSTs in WAL ID order. It acknowledges the writes in SST N only after SSTs 0 to N are all stored. This semantic ensures that acknowledged writes always form a prefix in sequence order: if a newer write is durable, every older write is durable too.
+
 #### Parallel Writes
 
-The writer protocol we describe above assumes that writers are writing SSTs in sequence. That is, a writer will never write SST ID N until SST ID N-1 has been successfully written to object storage by the client.
+With serial writes, a writer never writes SST ID N until SST ID N-1 has been successfully written to object storage by the client. Parallel writes relax this: a single writer client can write multiple SSTs at the same time, which can reduce latency for the writer client.
 
-But we know we will want to support parallel writes in the future. Parallel writes allow a single writer client to write multiple SSTs at the same time. This can reduce latency for the writer client. Our design should not preclude parallel writes.
+To keep acknowledgements in order (see _Acknowledgements_), the writer holds back an uploaded SST's acknowledgement until every earlier SST is stored and acknowledged. A finished upload keeps its slot until every earlier SST is stored. The setting `max_inflight_wal_uploads` limits how many SSTs a writer has issued but not yet acknowledged. Its default is 1, which means serial writes.
 
-The current writer protocol can be extended to support parallel writes by defining a `max_parallel_writes` configuration parameter. A new writer must then write `max_parallel_writes` sequential fencing SSTs in a row starting from the first open SST position in the `wal`. `max_parallel_writes` would also need to be stored in the manifest so readers, writers, and compactors can agree on it.
+##### Writer Takeover
 
-_NOTE: This strategy is discussed in more detail [here](https://github.com/slatedb/slatedb/pull/24/files#r1585894110)._
+When a new writer takes over, the old writer can still have uploads in flight. Let `frontier` be the frontier of accepted history, as the `wal` section defines it. Every ID below `frontier` is stored, so the old writer acknowledged nothing at or after `frontier`. The old writer has at most `max_inflight_wal_uploads` uploads in flight. So every late upload can only land in `[frontier, frontier + max_inflight_wal_uploads - 1]`.
 
-Consider this example with `max_parallel_writes` set to 2:
+The new writer does not know the old writer's `max_inflight_wal_uploads`. So the manifest stores `wal_excluded_range_max_size` (W), the largest value that any writer has claimed. A writer raises it in the same manifest write that increments `writer_epoch`.
 
-```
-time 0, 00000000000000000000.sst, writer_epoch=1
-time 1, 00000000000000000001.sst, writer_epoch=1
-time 2, 00000000000000000002.sst, writer_epoch=2
-time 3, 00000000000000000003.sst, writer_epoch=1
-time 4, 00000000000000000002.sst, writer_epoch=1
-time 5, 00000000000000000003.sst, writer_epoch=2
-time 6, 00000000000000000004.sst, writer_epoch=2
-time 7, 00000000000000000005.sst, writer_epoch=2
-```
+The fencing steps in the writer protocol need these details when W is above 1:
 
-Writer 1 successfully writes SSTs 0, 1, and 3. Writer 1's SST 2 write fails at time 4 because writer 2 has already taken that location at time 2. At this point, writer 1 immediately stops writing new SSTs and halts. Existing parallel writes run to completion (either failure or success).
+* Fencing step (1) lists the `wal` with object sizes, and walks accepted history to `frontier`. It reads the excluded ranges from the manifest after the listing.
+* Fencing step (2) records `[frontier, frontier + W - 1]` in `wal_excluded_ranges` with a CAS write. The write fails if a newer writer claimed the epoch. It also removes any recorded range that ends at or after `frontier`, because such a range never applied and is stale.
+* If an older writer wins `frontier` in fencing step (3), its SST may be acknowledged. The writer reloads the manifest, halts if a newer writer exists, and otherwise repeats from fencing step (1). The old writer has at most W uploads left, so this loop terminates.
+* After fencing step (3) succeeds, the writer fences the other missing IDs in the range. A failed CAS write is fine, because the range already excludes the ID. Orphans stay in place. Nothing is deleted.
+* The writer then replays accepted history up to `frontier`, and starts writing at `frontier + W`. It reloads the manifest before its first write, and halts if a newer writer exists.
 
-Writer 2 does not know whether it's successfully fenced writer 1 yet. It attempts to write SST 3 at time 5, but fails because writer 1 has already written an SST at that location at time 3. At this point, writer 2 begins again at position 4. Writer 2 successfully writes SST 4, then SST 5. Writer 2 has now written two consecutive SSTs to the `wal`. Since `max_parallel_writes` is set to 2, writer 2 has successfully fenced writer 1; it's guaranteed that writer 1 will see at least one of these fencing writes in its `max_parallel_writes` window. Thus, no writes from writer 1 (or any older writer) will appear after SST 5.
+A recorded range applies only if the SST at its start is an empty fencing SST. The range is recorded before the fence, so a reader that sees the fence at `frontier` and then reads the manifest finds the range. Before the fence exists, nothing after `frontier` is read. After the fence exists, the whole range is skipped in one step.
 
-The next question is what to do about writer 1's SST 3 that was written at time 3.
+If a takeover crashes after it records the range and before it fences `frontier`, the range does not apply, and the next takeover replaces the record in the manifest. If a takeover crashes after the fence, the range applies, and the next takeover skips it.
 
-The writer must decide whether to:
-
-1. Block all ack's until all previous SST writes have been successfully written. In this case, `put()`s with key-value pairs in SST 3 would be notified of a failure since SST 2 was not successfully written.
-2. Successfully acknowledge SST 3 as soon as it's written.
-
-We propose allowing writers to successfully acknowledge writes as soon as they occur (2). This strategy has slightly looser semantics since it means a put in SST 3 would be durably persisted and readable in the future, while puts in SST 2 would not be durably persisted.
+Consider this example with `max_inflight_wal_uploads` set to 2:
 
 ```
-a = put(key1, value1)
-b = put(key2, value3)
-a.await() -> failed
-b.await() -> succeeded
+time 0, 00000000000000000000.sst, writer_epoch=1 // success, acknowledged
+time 1, 00000000000000000002.sst, writer_epoch=1 // success, not acknowledged: SST 1 is still uploading
+time 2, manifest: writer_epoch=2
+time 3, writer 2 lists the wal: SST 1 is missing, so the frontier is 1
+time 4, manifest: wal_excluded_ranges=[1, 2]
+time 5, 00000000000000000001.sst, writer_epoch=2 // success, empty fence
+time 6, 00000000000000000001.sst, writer_epoch=1 // failure, writer 1 halts
+time 7, 00000000000000000002.sst, writer_epoch=2 // failure, SST 2 already exists
+time 8, 00000000000000000003.sst, writer_epoch=2 // success
 ```
 
-This should be fine since the client can always retry the failed `put()` call. Clients that want strong ordering across puts can use transactions.
+Writer 1 never acknowledged the writes in SST 2, because SST 1 never succeeded. Readers accept SST 0, see the fence at SST 1, skip SSTs 1 and 2, and continue at SST 3. The orphan in SST 2 is never read.
 
-_NOTE: Transactions are not something we've considered in detail. The current idea is to keep all transactional writes within a single SST. Thus, transactions should work with this protocol._
+If writer 1 had stored SST 1 before time 5, writer 2's fence would fail. SSTs 1 and 2 are then part of the WAL, and writer 1 may acknowledge both. Writer 2 finds the frontier 3, records `[3, 4]`, and fences SST 3.
 
-All readers and the compactor must decide whether to:
+When W is above 1, the manifest uses format version 3, which older versions of SlateDB reject. An older version would read through the fence into orphans. All readers and writers must be upgraded before any writer sets `max_inflight_wal_uploads` above 1.
 
-1. Ignore SST 3 because an SST with a higher `writer_epoch` has been written to a previous slot.
-2. Treat SST 3 as valid because writer 2 has not yet written `max_parallel_writes` SSTs in a row.
-
-We propose allowing readers and the compactor to treat SST 3 as valid.
-
-_NOTE: Astute readers might notice that `max_parallel_writes` is equivalent to a Kafka producer's [`max.in.flight.requests.per.connection`](https://docs.confluent.io/platform/current/installation/configuration/producer-configs.html#max-in-flight-requests-per-connection) setting._
-
-If more than 2 writers are writing in parallel, the protocol is the same. The only difference is that readers will see writes from multiple epochs before the youngest writer wins the fencing race.
-
-To illustrate, consider an example where we have 3 writers. writer 1 is the old writer, while writer 2 and writer 3 are trying to fence:
-
-```
-time  0, 00000000000000000000.sst, writer_epoch=1 // success
-time  1, 00000000000000000001.sst, writer_epoch=1 // success
-time  2, 00000000000000000002.sst, writer_epoch=3 // success
-time  3, 00000000000000000003.sst, writer_epoch=1 // success
-time  4, 00000000000000000002.sst, writer_epoch=1 // failure (writer 3 won at time 2), writer 1 halts
-time  5, 00000000000000000003.sst, writer_epoch=2 // failure (writer 1 won at time 3)
-time  6, 00000000000000000003.sst, writer_epoch=3 // failure (writer 1 won at time 3)
-time  7, 00000000000000000004.sst, writer_epoch=2 // success
-time  8, 00000000000000000004.sst, writer_epoch=3 // failure (writer 2 won at time 7)
-time  9, 00000000000000000005.sst, writer_epoch=3 // success
-time 10, 00000000000000000005.sst, writer_epoch=2 // failure (writer 3 won at time 9), writer 2 halts
-time 11, 00000000000000000006.sst, writer_epoch=3 // success
-```
-
-At time 11, writer 3 has successfully fenced writer 1 and writer 2. Readers will consider all SSTs valid from 0-6, though only SSTs 0, 1, and 3 will have key-value pairs since fencing SST writes are always empty.
-
-_NOTE: Writers will only detect that they've been fenced when they go to write. Low-throughput writers can periodically scan `wal` for SSTs with a higher `writer_epoch` to proactively detect that they've been fenced. This would work with the current design, but isn't in scope._
+_NOTE: This protocol depends on CAS for SST writes holding when two writes race for the same ID. If both writes succeed, an old upload can replace the fence at `frontier`._
 
 ### Readers
 
@@ -607,9 +604,9 @@ _NOTE: Writers will only detect that they've been fenced when they go to write. 
 Readers must establish a snapshot on startup and load DbState:
 
 1. Read the current manifest
-2. List all `wal` to find the maximum contiguous SST
+2. List all `wal` to find the last SST of accepted history
 3. Update the current manifest in-memory
-   1. Set `wal_id_last_seen` to the ID of the maximum contiguous SST in (2)
+   1. Set `wal_id_last_seen` to the ID of the last SST of accepted history in (2)
    2. Create a new snapshot that references the new manifest
 4. Write the updated manifest to the next manifest slot, go to (1) if CAS fails
 5. Load all `leveled_sst`s into `DbState.leveled_ssts`
@@ -632,7 +629,7 @@ _NOTE: Readers can also skip snapshot creation if they wish. If they do so, they
 
 #### Parallel Writes
 
-The reader protocol above assumes that all SSTs are contiguous and monotonically increasing. If parallel writes are allowed, a reader might see a `wal` with gaps between SSTs:
+With serial writes, all SSTs are contiguous and monotonically increasing. With parallel writes, a reader might see a `wal` with gaps between SSTs:
 
 ```
 time 0, 00000000000000000000.sst, writer_epoch=1
@@ -649,7 +646,9 @@ If the reader includes SST 3 in its `DbState`, it will need to periodically chec
 
 We propose waiting for SST 2 to be written. This style simplifies polling: the reader simply polls for the next SST (SST 2 in the example above). When SST 2 appears, it's added to `l0` and the reader begins polling for SST 3.
 
-This does mean that SST 3 will not be served by a reader until SST 2 arrives. For the writer client, this is not a problem, since the writer client is fully consistent between its own reads and writes. But secondary reader clients might not see SST 3 for a significant period of time if the writer dies. This is a tradeoff that we are comfortable with. If it proves problematic, we can implement (1), above, and poll for missing SSTs periodically.
+This does mean that SST 3 will not be served by a reader until SST 2 arrives. For the writer client, this is not a problem, since the writer client is fully consistent between its own reads and writes. But secondary reader clients might not see SST 3 for a significant period of time if the writer dies. This is a tradeoff that we are comfortable with. Option (1) is not safe, because a new writer can exclude SST 3 when it takes over.
+
+A waiting reader can see the result of such a takeover. When the reader opens an empty fencing SST, it looks up an excluded range that starts at that ID. The lookup must use a manifest read made after the reader saw the fence. If it finds a range, the reader skips to the SST after the range end. In the example above, a takeover with W of 2 fences SST 2 and excludes SSTs 2 and 3, so the reader never serves SST 3.
 
 _NOTE: There is some interdependence between when `wal_id_last_seen` and the semantics of a snapshot. If `wal_id_last_seen` were to include SST 3 in our example above, we'd have to decide whether to include SST 2 when it eventually arrives. The current design does not have this issue. This is discussed more [here](https://github.com/slatedb/slatedb/pull/43#discussion_r1594783266)._
 
@@ -703,6 +702,8 @@ The garbage collector will periodically list all objects in the `manifest`, `wal
 
 _NOTE: These rules follow the definitions for active manifests and active SSTs in the _Snapshots_ section._
 
+_NOTE: With parallel writes, orphans and the fencing SSTs from a takeover follow the same rules as other `wal` SSTs. Garbage collection does not delete empty fencing SSTs by default, because a fence still blocks a stalled upload from an old writer. Excluded ranges are never removed from the manifest, because a reader that holds an older manifest can still need them._
+
 #### Transactional Store Deletion
 
 Two classes of records must be deleted from the transactional store:
@@ -752,6 +753,10 @@ Rust's `object_store` crate has a [locking mechanism](https://docs.rs/object_sto
 ### Atomic Deletes
 
 A [previous version](https://github.com/slatedb/slatedb/pull/43#discussion_r1600912132) of this design proposed using atomic deletes. This turned out to be unnecessary.
+
+### Seal Records for Parallel Writes
+
+This alternative applies only to parallel writes. Instead of an excluded range in the manifest, a takeover would write a seal record at the frontier: an SST with no entries whose metadata holds the end of the excluded range. It needs no manifest write. We rejected it because garbage collection must open each candidate SST to keep seals, and a LIST cannot tell a seal from a data SST. Both raise the cost of normal operation.
 
 ## Addendum
 
