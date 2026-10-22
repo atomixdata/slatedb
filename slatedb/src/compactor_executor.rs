@@ -429,6 +429,10 @@ impl TokioCompactionExecutorInner {
                 is_dest_last_run: job_args.is_dest_last_run,
                 compaction_clock_tick: job_args.compaction_clock_tick,
                 retention_min_seq,
+                key_range: (
+                    job_args.range.start_bound().cloned(),
+                    job_args.range.end_bound().cloned(),
+                ),
             };
             let filter = supplier.create_compaction_filter(&context).await?;
             let filter_iter = CompactionFilterIterator::new(retention_iter, filter);
@@ -2358,6 +2362,199 @@ mod tests {
         assert!(
             matches!(err, SlateDBError::CompactionFilterError(_)),
             "expected CompactionFilterError, got: {err:?}"
+        );
+    }
+
+    /// The filter context holds the key range of the subcompaction.
+    #[cfg(feature = "compaction_filters")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn should_give_the_filter_the_key_range_of_its_subcompaction() {
+        use crate::compaction_filter::{
+            CompactionFilter, CompactionFilterError, CompactionFilterSupplier, CompactionJobContext,
+        };
+
+        /// Records the key range and then fails, because the test needs no filter.
+        struct RecordRange(Mutex<Option<(Bound<Bytes>, Bound<Bytes>)>>);
+
+        #[async_trait::async_trait]
+        impl CompactionFilterSupplier for RecordRange {
+            async fn create_compaction_filter(
+                &self,
+                context: &CompactionJobContext,
+            ) -> Result<Box<dyn CompactionFilter>, CompactionFilterError> {
+                *self.0.lock() = Some(context.key_range.clone());
+                Err(CompactionFilterError::CreationError(
+                    "range recorded".into(),
+                ))
+            }
+        }
+
+        let supplier = Arc::new(RecordRange(Mutex::new(None)));
+        let (executor, _table_store, _rx) =
+            subcompaction_env("testdb-filter-key-range", Some(supplier.clone())).await;
+        let args = SubcompactionArgs {
+            index: 0,
+            segment: Bytes::new(),
+            range: BytesRange::from_slice(b"key00100".as_slice()..b"key00200".as_slice()),
+            destination: 0,
+            l0_sst_views: vec![],
+            sorted_runs: vec![],
+            compaction_clock_tick: 0,
+            is_dest_last_run: false,
+            retention_min_seq: None,
+            output_ssts: vec![],
+        };
+
+        let _ = executor
+            .inner
+            .load_iterators(&args, Arc::new(SequenceTracker::new()))
+            .await;
+
+        assert_eq!(
+            supplier.0.lock().clone(),
+            Some((
+                Bound::Included(Bytes::from_static(b"key00100")),
+                Bound::Excluded(Bytes::from_static(b"key00200")),
+            ))
+        );
+    }
+
+    /// A version GC filter for keys `record@inverted epoch` drops the first old
+    /// version of a record when it is a tombstone, because the tombstone hides
+    /// nothing in the last run. A planned boundary between `u@40` (a tombstone) and
+    /// `u@30` gives these versions to two filters. The filter of the first range
+    /// must keep the tombstone, because the filter of the second range keeps `u@30`
+    /// as its first old version. The filter knows this because the end of its range
+    /// starts with `u@`.
+    #[cfg(feature = "compaction_filters")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn should_let_a_filter_keep_a_tombstone_when_its_record_continues() {
+        use crate::compaction_filter::{
+            CompactionFilter, CompactionFilterDecision, CompactionFilterError,
+            CompactionFilterSupplier, CompactionJobContext,
+        };
+
+        const MIN_LIVE_EPOCH: u64 = 50;
+
+        fn key(record: &str, epoch: u64) -> Bytes {
+            Bytes::from(format!("{record}@{:05}", 99_999 - epoch))
+        }
+
+        /// Returns the record prefix, up to and including `@`, and the epoch.
+        fn decode(key: &[u8]) -> (&[u8], u64) {
+            let at = key.iter().position(|&byte| byte == b'@').unwrap();
+            let inverted: u64 = std::str::from_utf8(&key[at + 1..])
+                .unwrap()
+                .parse()
+                .unwrap();
+            (&key[..=at], 99_999 - inverted)
+        }
+
+        struct VersionGc {
+            context: CompactionJobContext,
+            previous: Option<(Vec<u8>, u64)>,
+        }
+
+        #[async_trait::async_trait]
+        impl CompactionFilter for VersionGc {
+            async fn filter(
+                &mut self,
+                entry: &RowEntry,
+            ) -> Result<CompactionFilterDecision, CompactionFilterError> {
+                let (record, epoch) = decode(&entry.key);
+                let is_tombstone = matches!(
+                    &entry.value,
+                    ValueDeletable::Value(value) if value.as_ref() == b"T"
+                );
+                let previous = self.previous.replace((record.to_vec(), epoch));
+                let drop = if epoch >= MIN_LIVE_EPOCH {
+                    false
+                } else if previous.is_some_and(|(previous_record, previous_epoch)| {
+                    previous_record == record && previous_epoch < MIN_LIVE_EPOCH
+                }) {
+                    true
+                } else {
+                    let continues = matches!(
+                        &self.context.key_range.1,
+                        Bound::Included(end) | Bound::Excluded(end) if end.starts_with(record)
+                    );
+                    is_tombstone && self.context.is_dest_last_run && !continues
+                };
+                Ok(if drop {
+                    CompactionFilterDecision::Drop
+                } else {
+                    CompactionFilterDecision::Keep
+                })
+            }
+
+            async fn on_compaction_end(&mut self) -> Result<(), CompactionFilterError> {
+                Ok(())
+            }
+        }
+
+        struct VersionGcSupplier;
+
+        #[async_trait::async_trait]
+        impl CompactionFilterSupplier for VersionGcSupplier {
+            async fn create_compaction_filter(
+                &self,
+                context: &CompactionJobContext,
+            ) -> Result<Box<dyn CompactionFilter>, CompactionFilterError> {
+                Ok(Box::new(VersionGc {
+                    context: context.clone(),
+                    previous: None,
+                }))
+            }
+        }
+
+        // given: a deleted record `u` with an older value, between two live records
+        let (executor, table_store, _rx) = subcompaction_env(
+            "testdb-filter-record-continues",
+            Some(Arc::new(VersionGcSupplier)),
+        )
+        .await;
+        let entries = vec![
+            RowEntry::new_value(&key("a", 70), b"V", 1),
+            RowEntry::new_value(&key("u", 40), b"T", 3),
+            RowEntry::new_value(&key("u", 30), b"V", 2),
+            RowEntry::new_value(&key("z", 70), b"V", 4),
+        ];
+        let sorted_runs =
+            build_sorted_runs(&table_store, &[vec![entries]], SUBCOMPACTION_SST_SIZE).await;
+        let run_into_last_run = |subcompactions: Vec<Subcompaction>| {
+            let mut args = job_with_subcompactions(vec![], sorted_runs.clone(), subcompactions);
+            args.is_dest_last_run = true;
+            executor.inner.plan_and_execute_compaction_job(args)
+        };
+        let newest_version_of_u = |rows: &[RowEntry]| {
+            rows.iter()
+                .find(|row| row.key.starts_with(b"u@"))
+                .map(|row| row.value.clone())
+        };
+
+        // when: the job runs as one range, and as two ranges cut inside `u`
+        let whole = run_into_last_run(vec![Subcompaction::new(BytesRange::unbounded())])
+            .await
+            .unwrap();
+        let boundary = key("u", 30);
+        let split = run_into_last_run(vec![
+            Subcompaction::new(BytesRange::new(
+                Bound::Unbounded,
+                Bound::Excluded(boundary.clone()),
+            )),
+            Subcompaction::new(BytesRange::new(Bound::Included(boundary), Bound::Unbounded)),
+        ])
+        .await
+        .unwrap();
+
+        // then: one range drops all of `u`, and two ranges keep its tombstone in
+        // front of the older value, so no read sees the deleted value
+        let whole = read_run_entries(&table_store, &whole).await;
+        assert_eq!(newest_version_of_u(&whole), None);
+        let split = read_run_entries(&table_store, &split).await;
+        assert_eq!(
+            newest_version_of_u(&split),
+            Some(ValueDeletable::Value(Bytes::from_static(b"T")))
         );
     }
 

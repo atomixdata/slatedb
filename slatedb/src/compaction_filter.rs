@@ -71,6 +71,8 @@
 
 use crate::types::{RowEntry, ValueDeletable};
 use async_trait::async_trait;
+use bytes::Bytes;
+use std::ops::Bound;
 use thiserror::Error;
 
 /// Context information about a compaction job.
@@ -92,6 +94,9 @@ pub struct CompactionJobContext {
     /// active snapshots. Dropping or modifying such entries may cause snapshot
     /// reads to return inconsistent results.
     pub retention_min_seq: Option<u64>,
+    /// The key range of the subcompaction that this filter runs in. A job that runs
+    /// as one subcompaction has an unbounded range.
+    pub key_range: (Bound<Bytes>, Bound<Bytes>),
 }
 
 /// Decision returned by a compaction filter for each entry.
@@ -203,6 +208,12 @@ pub trait CompactionFilterSupplier: Send + Sync {
     /// called again with a new filter instance. The new filter will only observe entries
     /// that have not yet been written to output SSTs. Entries already compacted in
     /// previous attempts will be skipped.
+    ///
+    /// A compaction job can also run as several subcompactions, one for each key
+    /// range. SlateDB calls this method for each subcompaction, so each filter sees
+    /// only the keys of its range, in key order. `context.key_range` holds that range.
+    /// If the decision for a key depends on other keys, some of those keys can be in
+    /// another subcompaction.
     ///
     /// This is async to allow I/O during initialization (loading config,
     /// connecting to external services, etc.) before the filter processes entries.
