@@ -688,6 +688,7 @@ impl DbReaderInner {
             // Skip entries that we already have in `imm_memtable` (that might be above
             // last_l0_seq).
             min_seq: Some(last_committed_seq),
+            prune_overwrites: reader_options.memtable_prune_overwrites,
         };
 
         let wal_iter = wal_reader
@@ -2660,6 +2661,63 @@ mod tests {
 
         let mut replayed_iter = replayed.table().iter();
         test_utils::assert_iterator(&mut replayed_iter, vec![wal_row]).await;
+    }
+
+    #[rstest]
+    #[case::off(false, vec![
+        RowEntry::new_value(b"key", b"v2", 2),
+        RowEntry::new_value(b"key", b"v1", 1),
+        RowEntry::new_value(b"other", b"x", 3),
+    ])]
+    #[case::on(true, vec![
+        RowEntry::new_value(b"key", b"v2", 2),
+        RowEntry::new_value(b"other", b"x", 3),
+    ])]
+    #[tokio::test]
+    async fn replay_wal_into_should_prune_overwrites_per_option(
+        #[case] memtable_prune_overwrites: bool,
+        #[case] expected: Vec<RowEntry>,
+    ) {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("/tmp/test_db_reader_replay_prune_overwrites");
+        let test_provider = TestProvider::new(path, Arc::clone(&object_store));
+        let table_store = test_provider.table_store();
+        let wal_store = test_provider.wal_store();
+
+        write_wal_sst(
+            Arc::clone(&wal_store),
+            1,
+            vec![
+                RowEntry::new_value(b"key", b"v1", 1),
+                RowEntry::new_value(b"key", b"v2", 2),
+                RowEntry::new_value(b"other", b"x", 3),
+            ],
+        )
+        .await
+        .unwrap();
+
+        let mut into_tables = VecDeque::new();
+        let core = ManifestCore::new();
+        let status_manager = status_manager_for_core(&core);
+
+        DbReaderInner::replay_wal_into(
+            Arc::clone(&table_store),
+            &native_wal_reader(&wal_store, &status_manager),
+            &DbReaderOptions {
+                memtable_prune_overwrites,
+                ..DbReaderOptions::default()
+            },
+            &core,
+            &mut into_tables,
+            WalReplayEnd::Latest,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(into_tables.len(), 1);
+        let mut replayed_iter = into_tables.front().unwrap().table().iter();
+        test_utils::assert_iterator(&mut replayed_iter, expected).await;
     }
 
     #[tokio::test]
