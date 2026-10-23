@@ -301,6 +301,7 @@ mod tests {
                 boundary_files_enabled: true,
                 object_store_max_retries: None,
                 wal_collect_by_id: false,
+                wal_deletes_per_second: None,
             };
             let gc = GarbageCollector::new(
                 self.manifest_store.clone(),

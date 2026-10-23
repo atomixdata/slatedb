@@ -183,6 +183,7 @@ pub fn build_settings_gc(rng: &mut impl Rng) -> GarbageCollectorOptions {
         boundary_files_enabled: true,
         object_store_max_retries: None,
         wal_collect_by_id: rng.random_bool(0.5),
+        wal_deletes_per_second: rng.random_bool(0.5).then(|| rng.random_range(10..10_000)),
     }
 }
 

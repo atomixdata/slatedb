@@ -46,6 +46,8 @@ The command above does not collect WAL fence objects. Enable `--wal-fence` only 
 
 If the WAL directory holds many files, add `--wal-collect-by-id`. The scheduled process then deletes WAL SSTs by ID instead of a listing of the directory on every run. It still lists to find the WAL fence objects after each new writer advances its replay boundary.
 
+To spread the WAL deletes over time, add `--wal-deletes-per-second <count>`. Set the count above the rate at which the writer creates WAL SSTs, or GC falls behind.
+
 ## Embed the garbage collector
 
 You can also embed the garbage collector in your own process using `GarbageCollectorBuilder` and call `run`:

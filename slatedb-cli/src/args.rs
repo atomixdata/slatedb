@@ -335,6 +335,11 @@ pub(crate) enum CliCommands {
         /// run.
         #[arg(long, default_value_t = false)]
         wal_collect_by_id: bool,
+
+        /// The most WAL files that GC deletes per second. Without this flag, GC
+        /// deletes them as fast as it can.
+        #[arg(long)]
+        wal_deletes_per_second: Option<u32>,
     },
 }
 
@@ -512,6 +517,33 @@ mod tests {
             } => {
                 assert!(wal.is_some());
                 assert!(wal_collect_by_id);
+            }
+            command => panic!("unexpected command: {command:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_schedule_gc_wal_deletes_per_second() {
+        let args = CliArgs::try_parse_from([
+            "slatedb",
+            "--path",
+            "/tmp/slatedb",
+            "schedule-garbage-collection",
+            "--wal",
+            "min_age=1m,period=10s",
+            "--wal-deletes-per-second",
+            "500",
+        ])
+        .unwrap();
+
+        match args.command {
+            CliCommands::ScheduleGarbageCollection {
+                wal,
+                wal_deletes_per_second,
+                ..
+            } => {
+                assert!(wal.is_some());
+                assert_eq!(wal_deletes_per_second, Some(500));
             }
             command => panic!("unexpected command: {command:?}"),
         }

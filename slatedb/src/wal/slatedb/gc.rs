@@ -125,6 +125,8 @@ pub(crate) struct SlateDbWalGc {
     /// Whether regular WAL GC deletes by ID after a listing found the fences.
     collect_by_id: bool,
     id_state: Arc<Mutex<IdState>>,
+    /// The most WAL objects GC deletes per second. `None` means no limit.
+    deletes_per_second: Option<u32>,
 }
 
 impl std::fmt::Debug for SlateDbWalGc {
@@ -132,6 +134,7 @@ impl std::fmt::Debug for SlateDbWalGc {
         f.debug_struct("SlateDbWalGc")
             .field("mode", &self.mode)
             .field("collect_by_id", &self.collect_by_id)
+            .field("deletes_per_second", &self.deletes_per_second)
             .finish()
     }
 }
@@ -152,6 +155,7 @@ impl SlateDbWalGc {
             system_clock,
             collect_by_id: false,
             id_state: Arc::new(Mutex::new(IdState::default())),
+            deletes_per_second: None,
         }
     }
 
@@ -159,6 +163,14 @@ impl SlateDbWalGc {
     /// [`crate::config::GarbageCollectorOptions::wal_collect_by_id`].
     pub(crate) fn with_collect_by_id(mut self, collect_by_id: bool) -> Self {
         self.collect_by_id = collect_by_id;
+        self
+    }
+
+    /// Limits how many WAL objects GC deletes per second. `None` or `0` means no
+    /// limit. See
+    /// [`crate::config::GarbageCollectorOptions::wal_deletes_per_second`].
+    pub(crate) fn with_deletes_per_second(mut self, deletes_per_second: Option<u32>) -> Self {
+        self.deletes_per_second = deletes_per_second.filter(|rate| *rate > 0);
         self
     }
 
@@ -250,8 +262,12 @@ impl SlateDbWalGc {
     /// Deletes WAL SSTs with at most `concurrency` deletes in flight and
     /// returns the IDs it could not delete. A missing object counts as deleted.
     async fn delete_wal_ssts(&self, sst_ids: Vec<WalFileId>, concurrency: usize) -> Vec<WalFileId> {
-        futures::stream::iter(sst_ids)
-            .map(|id| async move { (id, self.wal_store.delete_sst(id).await) })
+        let start = self.system_clock.now();
+        futures::stream::iter(sst_ids.into_iter().enumerate())
+            .map(|(position, id)| async move {
+                self.wait_for_delete_turn(start, position).await;
+                (id, self.wal_store.delete_sst(id).await)
+            })
             .buffer_unordered(concurrency)
             .filter_map(|(id, result)| async move {
                 match result {
@@ -271,6 +287,21 @@ impl SlateDbWalGc {
             })
             .collect()
             .await
+    }
+
+    /// With a delete limit, waits until the delete at `position` may start. That
+    /// is `position / deletes_per_second` seconds after `start`.
+    async fn wait_for_delete_turn(&self, start: DateTime<Utc>, position: usize) {
+        let Some(deletes_per_second) = self.deletes_per_second else {
+            return;
+        };
+        let offset = Duration::from_secs_f64(position as f64 / f64::from(deletes_per_second));
+        let due = start + chrono::Duration::from_std(offset).expect("invalid duration");
+        if let Ok(wait) = (due - self.system_clock.now()).to_std() {
+            if !wait.is_zero() {
+                self.system_clock.sleep(wait).await;
+            }
+        }
     }
 
     /// Lists the WAL directory, then deletes the WAL objects of this mode that
@@ -671,6 +702,39 @@ mod tests {
 
         clock.set((last_modified + chrono::Duration::minutes(61)).timestamp_millis());
         collector.collect(vec![], min_age, false).await.unwrap();
+        assert!(wal_ids(&wal_store).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_delete_wal_ssts_limits_deletes_per_second() {
+        let wal_store = build_wal_store();
+        let clock = Arc::new(MockSystemClock::new());
+        for wal_id in 1..=4 {
+            write_regular_wal(&wal_store, wal_id).await;
+        }
+        make_all_wals_older_than(&wal_store, &clock, Duration::ZERO).await;
+        // 10 deletes per second: one delete every 100 ms.
+        let collector = Arc::new(
+            build_collector(wal_store.clone(), clock.clone(), WalGcMode::Regular)
+                .with_deletes_per_second(Some(10)),
+        );
+        let collect = tokio::spawn({
+            let collector = collector.clone();
+            async move { collector.collect(vec![], Duration::ZERO, false).await }
+        });
+
+        for remaining in [3, 2, 1] {
+            while wal_ids(&wal_store).await.len() > remaining {
+                tokio::task::yield_now().await;
+            }
+            // The clock did not move, so the next delete must wait.
+            for _ in 0..100 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(wal_ids(&wal_store).await.len(), remaining);
+            clock.set(clock.now().timestamp_millis() + 100);
+        }
+        collect.await.unwrap().unwrap();
         assert!(wal_ids(&wal_store).await.is_empty());
     }
 

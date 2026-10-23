@@ -641,6 +641,12 @@ pub struct GarbageCollectorOptions {
     /// listing is slow.
     #[uniffi(default = false)]
     pub wal_collect_by_id: bool,
+    /// The most WAL objects that WAL garbage collection deletes per second. `None` (default) or
+    /// `0` means no limit. A burst of deletes can slow down the WAL uploads to the same object
+    /// store. If the limit is lower than the rate at which the writer creates WAL files, GC falls
+    /// behind.
+    #[uniffi(default = None)]
+    pub wal_deletes_per_second: Option<u32>,
 }
 
 impl Default for GarbageCollectorOptions {
@@ -656,6 +662,7 @@ impl Default for GarbageCollectorOptions {
             disable_boundary_files: !core.boundary_files_enabled,
             object_store_max_retries: core.object_store_max_retries,
             wal_collect_by_id: core.wal_collect_by_id,
+            wal_deletes_per_second: core.wal_deletes_per_second,
         }
     }
 }
@@ -691,6 +698,7 @@ impl From<GarbageCollectorOptions> for slatedb::config::GarbageCollectorOptions 
             boundary_files_enabled: !value.disable_boundary_files,
             object_store_max_retries: value.object_store_max_retries,
             wal_collect_by_id: value.wal_collect_by_id,
+            wal_deletes_per_second: value.wal_deletes_per_second,
         }
     }
 }
@@ -938,6 +946,20 @@ mod tests {
         }
         .into();
         assert!(gc.wal_collect_by_id);
+    }
+
+    #[test]
+    fn wal_deletes_per_second_defaults_to_no_limit_and_carries_over() {
+        let gc: slatedb::config::GarbageCollectorOptions =
+            GarbageCollectorOptions::default().into();
+        assert_eq!(gc.wal_deletes_per_second, None);
+
+        let gc: slatedb::config::GarbageCollectorOptions = GarbageCollectorOptions {
+            wal_deletes_per_second: Some(500),
+            ..GarbageCollectorOptions::default()
+        }
+        .into();
+        assert_eq!(gc.wal_deletes_per_second, Some(500));
     }
 
     #[test]

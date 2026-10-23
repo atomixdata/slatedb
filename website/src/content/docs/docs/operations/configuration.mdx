@@ -86,6 +86,14 @@ files and a listing is slow. GC still lists to find the WAL fence objects, after
 advances its replay boundary. The option is off by default. See
 [garbage collection](/docs/design/gc#collecting-wal-ssts-by-id) for how GC keeps the fences.
 
+## WAL delete rate
+
+`GarbageCollectorOptions::wal_deletes_per_second` limits how many WAL objects garbage collection
+deletes per second. A burst of deletes can slow down the WAL uploads to the same object store. The
+limit spreads the deletes of one GC run over time, with or without `wal_collect_by_id`. Set it
+above the rate at which the writer creates WAL SSTs, or GC falls behind. There is no limit by
+default.
+
 ## Reconfiguring Object Stores
 
 Reconfiguring an object store only changes how SlateDB reaches storage. It does not migrate data between stores for you. The new `ObjectStore` must still have the existing database contents for the database path.

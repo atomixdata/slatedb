@@ -1764,6 +1764,20 @@ pub struct GarbageCollectorOptions {
     /// filter needs the metadata of each WAL file. The default is `false`.
     #[serde(default)]
     pub wal_collect_by_id: bool,
+
+    /// The most WAL objects that WAL garbage collection deletes per second.
+    /// `None` or `0` means no limit.
+    ///
+    /// A WAL with a high flush rate leaves many small objects between GC runs.
+    /// A burst of deletes can slow down the WAL uploads to the same object store.
+    /// This limit spreads the deletes of one run over time. It applies to regular
+    /// WAL GC, with or without `wal_collect_by_id`, and to WAL fence GC.
+    ///
+    /// GC starts a run only after the previous run finished. If the limit is
+    /// lower than the rate at which the writer creates WAL files, GC falls
+    /// behind. The default is `None`.
+    #[serde(default)]
+    pub wal_deletes_per_second: Option<u32>,
 }
 
 impl GarbageCollectorOptions {
@@ -1867,6 +1881,7 @@ impl Default for GarbageCollectorOptions {
             boundary_files_enabled: true,
             object_store_max_retries: None,
             wal_collect_by_id: false,
+            wal_deletes_per_second: None,
         }
     }
 }

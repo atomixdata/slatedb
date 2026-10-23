@@ -323,19 +323,39 @@ impl<T: Send + std::fmt::Debug> MessageDispatcher<T> {
                                 Err(_) => break,
                             }
                         }
-                        self.handler.handle_batch(messages).await?;
+                        let cancellable = self.handler.cancel_on_shutdown();
+                        let handled = self.handler.handle_batch(messages);
+                        match run_handler(handled, cancellable, &self.cancellation_token).await {
+                            Some(result) => result?,
+                            None => break,
+                        }
                     } else {
-                        self.handler.handle(message).await?;
+                        let cancellable = self.handler.cancel_on_shutdown();
+                        let handled = self.handler.handle(message);
+                        match run_handler(handled, cancellable, &self.cancellation_token).await {
+                            Some(result) => result?,
+                            None => break,
+                        }
                     }
                 },
                 // if no messages, check tickers
                 Some((message, ticker)) = ticker_futures.next() => {
-                    self.handler.handle(message).await?;
+                    let cancellable = self.handler.cancel_on_shutdown();
+                    let handled = self.handler.handle(message);
+                    match run_handler(handled, cancellable, &self.cancellation_token).await {
+                        Some(result) => result?,
+                        None => break,
+                    }
                     ticker_futures.push(ticker.tick());
                 },
                 // if no messages or tickers, check notifiers
                 Some((message, notifier)) = notifier_futures.next() => {
-                    self.handler.handle(message).await?;
+                    let cancellable = self.handler.cancel_on_shutdown();
+                    let handled = self.handler.handle(message);
+                    match run_handler(handled, cancellable, &self.cancellation_token).await {
+                        Some(result) => result?,
+                        None => break,
+                    }
                     notifier_futures.push(notifier.next());
                 },
             }
@@ -459,6 +479,26 @@ impl<'a, T: Send> MessageDispatcherTicker<'a, T> {
     }
 }
 
+/// Runs one handler call. When `cancellable`, shutdown abandons it and this
+/// returns `None`.
+async fn run_handler<F>(
+    handled: F,
+    cancellable: bool,
+    cancellation_token: &CancellationToken,
+) -> Option<Result<(), SlateDBError>>
+where
+    F: Future<Output = Result<(), SlateDBError>>,
+{
+    if !cancellable {
+        return Some(handled.await);
+    }
+    tokio::select! {
+        biased;
+        _ = cancellation_token.cancelled() => None,
+        result = handled => Some(result),
+    }
+}
+
 /// [MessageDispatcher] event loop callbacks are implemented in a [MessageHandler].
 /// Handlers are responsible for:
 ///
@@ -510,6 +550,14 @@ pub(crate) trait MessageHandler<T: Send>: Send {
     ///
     /// The [Result] after handling the message.
     async fn handle(&mut self, message: T) -> Result<(), SlateDBError>;
+
+    /// Whether shutdown may abandon a running [MessageHandler::handle] call.
+    /// Then a long call, such as a paced garbage collection pass, doesn't hold
+    /// up shutdown. The handler must be safe to stop at any await point. By
+    /// default every call runs to completion.
+    fn cancel_on_shutdown(&self) -> bool {
+        false
+    }
 
     /// The most channel messages [MessageDispatcher::run] passes to one
     /// [MessageHandler::handle_batch] call. Above 1, the dispatcher takes the
@@ -1238,6 +1286,65 @@ mod test {
                 (Phase::Cleanup, TestMessage::Channel(77)),
             ]
         );
+    }
+
+    /// Never finishes a call, and records that one started.
+    struct StuckHandler {
+        started: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl MessageHandler<u8> for StuckHandler {
+        fn tickers(&mut self) -> Vec<MessageTickerDef<u8>> {
+            vec![MessageTickerDef::new(
+                Duration::from_millis(1),
+                Box::new(|| 0u8),
+            )]
+        }
+
+        async fn handle(&mut self, _message: u8) -> Result<(), SlateDBError> {
+            self.started.notify_one();
+            std::future::pending::<()>().await;
+            Ok(())
+        }
+
+        fn cancel_on_shutdown(&self) -> bool {
+            true
+        }
+
+        async fn cleanup(
+            &mut self,
+            _messages: BoxStream<'async_trait, u8>,
+            _result: Result<(), SlateDBError>,
+        ) -> Result<(), SlateDBError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_task_cancels_running_handler_call() {
+        let clock = Arc::new(DefaultSystemClock::new());
+        let task_executor = MessageHandlerExecutor::new(Arc::new(WatchableOnceCell::new()), clock);
+        let started = Arc::new(tokio::sync::Notify::new());
+        let (_tx, rx) = async_channel::unbounded();
+        task_executor
+            .add_handler(
+                "stuck".to_string(),
+                Box::new(StuckHandler {
+                    started: Arc::clone(&started),
+                }),
+                rx,
+                &Handle::current(),
+            )
+            .unwrap();
+        let monitor = task_executor.monitor_on(&Handle::current()).unwrap();
+        started.notified().await;
+
+        timeout(Duration::from_secs(5), task_executor.shutdown_task("stuck"))
+            .await
+            .expect("shutdown should abandon the running call")
+            .unwrap();
+        monitor.await.unwrap();
     }
 
     #[tokio::test]
