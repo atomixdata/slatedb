@@ -857,7 +857,8 @@ pub struct Settings {
 
     /// Removes the previous version of a key from the active memtable when a
     /// new write overwrites it. A key that is rewritten many times before a
-    /// flush then costs one row of memory instead of one row per write.
+    /// flush then costs one row of memory instead of one row per write. WAL
+    /// replay at open prunes the same way.
     ///
     /// The pruning does not protect readers. A snapshot, a transaction, a get
     /// or scan in flight, or a read with [`DurabilityLevel::Remote`] whose
@@ -1190,6 +1191,16 @@ pub struct DbReaderOptions {
     /// Defaults to unbounded retries.
     #[serde(default)]
     pub object_store_max_retries: Option<u32>,
+
+    /// Removes the previous version of a key from a table that WAL replay
+    /// builds when a newer replayed row overwrites it, like
+    /// [`Settings::memtable_prune_overwrites`] does for the writer. No read
+    /// can see a table until its replay finishes, so the pruning does not
+    /// affect reads.
+    ///
+    /// Defaults to false.
+    #[serde(default)]
+    pub memtable_prune_overwrites: bool,
 }
 
 impl Default for DbReaderOptions {
@@ -1202,6 +1213,7 @@ impl Default for DbReaderOptions {
             skip_wal_replay: false,
             metric_level: None,
             object_store_max_retries: None,
+            memtable_prune_overwrites: false,
         }
     }
 }
