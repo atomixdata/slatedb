@@ -86,16 +86,16 @@ impl PathResolver {
     }
 
     pub(crate) fn parse_wal_file_id(&self, path: &Path) -> Result<Option<WalFileId>, SlateDBError> {
-        if let Some(mut suffix_iter) = path.prefix_match(&self.root_path) {
-            match suffix_iter.next() {
-                Some(a) if a.as_ref() == WAL_PATH => suffix_iter
-                    .next()
-                    .and_then(|s| s.as_ref().split('.').next().map(|s| s.parse::<u64>()))
-                    .transpose()
-                    .map(|result| result.map(WalFileId::from))
-                    .map_err(|_| SlateDBError::InvalidDBState),
-                _ => Ok(None),
-            }
+        // Match against `wal_path`, which is built like the WAL SST paths. If
+        // the root holds characters that need escaping, formatting it into a
+        // new `Path` escapes it again, so `root_path` alone does not match.
+        if let Some(mut suffix_iter) = path.prefix_match(&self.wal_path()) {
+            suffix_iter
+                .next()
+                .and_then(|s| s.as_ref().split('.').next().map(|s| s.parse::<u64>()))
+                .transpose()
+                .map(|result| result.map(WalFileId::from))
+                .map_err(|_| SlateDBError::InvalidDBState)
         } else {
             Ok(None)
         }
@@ -160,6 +160,19 @@ mod tests {
             let parsed_table_id = path_resolver.parse_table_id(&path).unwrap();
             assert_eq!(Some(table_id), parsed_table_id);
         }
+    }
+
+    #[test]
+    fn should_parse_wal_paths_under_a_root_that_needs_escaping() {
+        // A Windows temporary directory, as tests on Windows use for a root.
+        let path_resolver =
+            PathResolver::from_root(Path::from(r"C:\Users\runner\AppData\Local\Temp\.tmp1"));
+        let wal_file_id = WalFileId::from(3);
+        let path = path_resolver.wal_sst_path(&wal_file_id);
+        assert_eq!(
+            path_resolver.parse_wal_file_id(&path).unwrap(),
+            Some(wal_file_id)
+        );
     }
 
     #[test]

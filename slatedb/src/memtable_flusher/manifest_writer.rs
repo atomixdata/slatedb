@@ -1361,6 +1361,7 @@ mod tests {
             Duration::from_secs(300),
             Arc::new(DefaultSystemClock::new()),
             None,
+            1,
         )
         .await
         .unwrap();
@@ -1387,6 +1388,7 @@ mod tests {
             Duration::from_secs(300),
             Arc::new(DefaultSystemClock::new()),
             None,
+            1,
         )
         .await
         .unwrap()
