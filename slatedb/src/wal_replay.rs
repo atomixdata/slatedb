@@ -22,6 +22,12 @@ pub(crate) struct WalReplayOptions {
     /// The minimum seq number to replay. If unset, will replay all
     /// entries after `last_l0_seq` in the manifest.
     pub(crate) min_seq: Option<u64>,
+
+    /// Prunes the next older version of a key when a replayed row overwrites
+    /// it, like [`Settings::memtable_prune_overwrites`](crate::config::Settings::memtable_prune_overwrites)
+    /// does on the write path. No reader can see a table while it is being
+    /// replayed, so the pruning cannot affect reads.
+    pub(crate) prune_overwrites: bool,
 }
 
 impl Default for WalReplayOptions {
@@ -29,6 +35,7 @@ impl Default for WalReplayOptions {
         Self {
             max_memtable_bytes: 64 * 1024 * 1024,
             min_seq: None,
+            prune_overwrites: false,
         }
     }
 }
@@ -154,7 +161,11 @@ impl WalReplayIterator {
                     self.last_tick = self.last_tick.max(ts);
                 }
                 self.last_seq = self.last_seq.max(row_entry.seq);
-                table.put(row_entry);
+                if self.options.prune_overwrites {
+                    table.put_and_prune_overwritten(row_entry);
+                } else {
+                    table.put(row_entry);
+                }
             }
 
             if !table.is_empty() {
