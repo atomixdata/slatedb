@@ -468,6 +468,7 @@ impl DbInner {
 
         let replay_options = WalReplayOptions {
             max_memtable_bytes: self.settings.l0_sst_size_bytes,
+            prune_overwrites: self.settings.memtable_prune_overwrites,
             ..Default::default()
         };
 
@@ -11097,6 +11098,65 @@ mod tests {
         assert_eq!(
             recovered.get(b"bbb-1").await.unwrap().unwrap().as_ref(),
             b"v2"
+        );
+        recovered.close().await.unwrap();
+    }
+
+    /// WAL replay prunes overwritten versions only when
+    /// `memtable_prune_overwrites` is on.
+    #[rstest::rstest]
+    #[case::off(false, 4)]
+    #[case::on(true, 2)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_wal_replay_prunes_overwrites_per_setting(
+        #[case] memtable_prune_overwrites: bool,
+        #[case] expected_entry_num: usize,
+    ) {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = "/tmp/test_wal_replay_prunes_overwrites_per_setting";
+
+        // Write without pruning so that the WAL and the memtable hold every version.
+        let source = Db::builder(path, object_store.clone())
+            .build()
+            .await
+            .unwrap();
+        source.put(b"key", b"v1").await.unwrap();
+        source.put(b"key", b"v2").await.unwrap();
+        source.put(b"key", b"v3").await.unwrap();
+        source.put(b"other", b"x").await.unwrap();
+        source
+            .flush_with_options(FlushOptions {
+                flush_type: FlushType::Wal,
+            })
+            .await
+            .unwrap();
+        // Drop without close so writes remain in WAL only.
+        drop(source);
+
+        let recovered = Db::builder(path, object_store)
+            .with_settings(Settings {
+                memtable_prune_overwrites,
+                ..Default::default()
+            })
+            .build()
+            .await
+            .unwrap();
+        let entry_num = recovered
+            .inner
+            .state
+            .read()
+            .memtable()
+            .table()
+            .metadata()
+            .entry_num;
+        assert_eq!(entry_num, expected_entry_num);
+        assert_eq!(
+            recovered.get(b"key").await.unwrap().unwrap().as_ref(),
+            b"v3"
+        );
+        assert_eq!(
+            recovered.get(b"other").await.unwrap().unwrap().as_ref(),
+            b"x"
         );
         recovered.close().await.unwrap();
     }
