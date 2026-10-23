@@ -147,6 +147,7 @@ mod instrumented_object_store;
 mod iter;
 mod mem_table;
 mod memtable_flusher;
+mod memtable_insert;
 mod merge_iterator;
 mod merge_operator;
 mod ops;
