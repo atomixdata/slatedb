@@ -329,6 +329,12 @@ pub(crate) enum CliCommands {
         /// Delete eligible metadata without advancing boundary files.
         #[arg(long, default_value_t = false)]
         disable_boundary_files: bool,
+
+        /// Delete WAL files by ID after a listing found the WAL fences of the
+        /// current writer. Without this flag, GC lists the WAL directory on every
+        /// run.
+        #[arg(long, default_value_t = false)]
+        wal_collect_by_id: bool,
     },
 }
 
@@ -480,6 +486,32 @@ mod tests {
                 assert!(matches!(resource, GcResource::WalFence));
                 assert_eq!(min_age, Duration::from_secs(60));
                 assert!(!disable_boundary_files);
+            }
+            command => panic!("unexpected command: {command:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_schedule_gc_wal_collect_by_id() {
+        let args = CliArgs::try_parse_from([
+            "slatedb",
+            "--path",
+            "/tmp/slatedb",
+            "schedule-garbage-collection",
+            "--wal",
+            "min_age=1m,period=10s",
+            "--wal-collect-by-id",
+        ])
+        .unwrap();
+
+        match args.command {
+            CliCommands::ScheduleGarbageCollection {
+                wal,
+                wal_collect_by_id,
+                ..
+            } => {
+                assert!(wal.is_some());
+                assert!(wal_collect_by_id);
             }
             command => panic!("unexpected command: {command:?}"),
         }

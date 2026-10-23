@@ -1738,6 +1738,32 @@ pub struct GarbageCollectorOptions {
     /// operations. Defaults to unbounded retries.
     #[serde(default)]
     pub object_store_max_retries: Option<u32>,
+
+    /// Whether regular WAL garbage collection deletes WAL files by ID.
+    ///
+    /// Without this option, GC lists the WAL directory on every run. WAL file IDs
+    /// are sequential, and the latest manifest references every WAL file from its
+    /// `replay_after_wal_id` on. With this option, GC deletes each ID from where its
+    /// previous run stopped. It stops at the `replay_after_wal_id` that it read at
+    /// least `wal_options.min_age` earlier. Thus every WAL file that it deletes is
+    /// at least that old. Use this option when the WAL directory holds many files
+    /// and a listing is slow. An example is a WAL on an object store with a high
+    /// flush rate.
+    ///
+    /// GC cannot tell a WAL fence object from a WAL file by its ID. A deleted fence
+    /// lets a stalled writer report a lost write as durable (see
+    /// `wal_fence_options`). Thus GC finds the fences with a listing. The listing
+    /// must run after the writer of the latest `writer_epoch` advanced
+    /// `replay_after_wal_id`, because that writer wrote its fence before it did
+    /// this. Until then, and again after each new writer fences the database, GC
+    /// lists on every run, as it does without this option. This works for a
+    /// garbage collector in the process of the writer and for a standalone garbage
+    /// collector.
+    ///
+    /// If a [`crate::GcFilter`] is set, GC also lists on every run, because the
+    /// filter needs the metadata of each WAL file. The default is `false`.
+    #[serde(default)]
+    pub wal_collect_by_id: bool,
 }
 
 impl GarbageCollectorOptions {
@@ -1840,6 +1866,7 @@ impl Default for GarbageCollectorOptions {
             metric_level: None,
             boundary_files_enabled: true,
             object_store_max_retries: None,
+            wal_collect_by_id: false,
         }
     }
 }

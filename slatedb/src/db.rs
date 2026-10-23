@@ -7524,6 +7524,7 @@ mod tests {
             metric_level: None,
             boundary_files_enabled: true,
             object_store_max_retries: None,
+            wal_collect_by_id: false,
         };
         GarbageCollectorBuilder::new(path.clone(), object_store.clone())
             .with_options(gc_options)
@@ -9147,6 +9148,7 @@ mod tests {
             metric_level: None,
             boundary_files_enabled: true,
             object_store_max_retries: None,
+            wal_collect_by_id: false,
         };
 
         let gc = GarbageCollectorBuilder::new(path.clone(), object_store.clone())

@@ -396,6 +396,16 @@ pub trait WalReader {
     async fn last_wal_file_id(&self, replay_after_wal_id: u64) -> Result<u64, WalError>;
 }
 
+/// What one garbage collection run knows about the database's manifests.
+pub struct WalGcContext {
+    /// Ranges of WAL Files that some active Manifest references. The range of the latest
+    /// Manifest starts at its `replay_after_wal_id` and is unbounded.
+    pub referenced_ranges: Vec<WalFileRange>,
+    /// The `writer_epoch` of the latest Manifest, read together with `referenced_ranges`. It
+    /// changes when a new writer fences the database.
+    pub writer_epoch: u64,
+}
+
 /// API for plugging into WAL GC
 #[async_trait]
 pub trait WalGc {
@@ -405,7 +415,22 @@ pub trait WalGc {
     async fn collect(
         &self,
         referenced_ranges: Vec<WalFileRange>,
+        min_age: Duration,
+        dry_run: bool,
     ) -> Result<(), WalError>;
+
+    /// The garbage collector calls this hook. It receives the same ranges as `collect` and the
+    /// writer epoch of the latest Manifest. An implementation that keeps state between runs can
+    /// use the epoch to find out when a new writer fenced the database. The default ignores the
+    /// epoch and calls `collect`.
+    async fn collect_with_context(
+        &self,
+        context: WalGcContext,
+        min_age: Duration,
+        dry_run: bool,
+    ) -> Result<(), WalError> {
+        self.collect(context.referenced_ranges, min_age, dry_run).await
+    }
 }
 
 /// Administrative operations for a WAL implementation.
@@ -640,8 +665,60 @@ As part of this change we will move tracking of early memtable flush via
 #### Garbage Collection
 
 `WalGcTask` lists manifests to determine the set of referenced WAL File IDs and then delegates 
-cleanup to `WalGc`. The native implementation of `WalGc` prunes wal files based on max-age and 
-then deletes them.
+cleanup to `WalGc` through `collect_with_context`. It passes the `writer_epoch` of the latest
+manifest together with the referenced ranges. The native implementation of `WalGc` prunes wal files
+based on max-age and then deletes them.
+
+##### Collecting WAL Files by ID
+
+By default, the native implementation lists the WAL directory on every run. With a high WAL flush
+rate on an object store, the directory holds hundreds of thousands of files. A listing then takes
+minutes, and GC falls behind.
+
+`GarbageCollectorOptions::wal_collect_by_id` lets regular WAL GC delete WAL Files by ID instead. WAL
+File IDs are sequential, and every ID below the latest `replay_after_wal_id` is in use. Thus GC
+deletes each ID from where its previous run stopped. It stops at the `replay_after_wal_id` that it
+read at least `min_age` earlier. A writer wrote every WAL File below that boundary before it
+published the boundary, so each of these WAL Files is at least `min_age` old. This is the same age
+rule as with a listing. GC tries again in a later run for the IDs that a checkpoint references,
+that were too young when listed, or whose delete failed.
+
+GC by ID cannot tell a Fencing WAL File from a WAL File by its ID, and it must never delete a
+Fencing WAL File. Each Fencing WAL File is at the next WAL ID of an older writer. If GC deletes it,
+the stalled upload of that ID by the older writer succeeds. The older writer then reports writes
+as durable, but no later writer replays them. Listing GC keeps the fences because they are empty.
+GC by ID keeps them because it knows their IDs. It uses these two properties of the fencing
+protocol:
+
+1. A writer bumps `writer_epoch`, then writes its Fencing WAL File above every WAL ID in use, then
+   serves writes. Thus it writes the fence before it first advances `replay_after_wal_id`. Only the
+   writer of the current epoch advances `replay_after_wal_id`.
+2. While the epoch of a writer is the latest, no Fencing WAL File that a writer depends on appears
+   below a replay boundary of that epoch. All IDs below the boundary were in use when the boundary
+   passed them. An older writer that is still opening can write its fence into a free ID. But that
+   writer then fails to open because the manifest moved on, so no writer depends on its fence.
+
+Thus GC by ID works for one writer epoch at a time. When the latest manifest has an epoch that GC
+did not see before, GC lists the directory on every run, as it does without the option. It does
+this until it reads a `replay_after_wal_id` for that epoch that is different from the first one.
+This change shows that the writer of the epoch wrote its fence (1). GC then lists one more time
+and records the fences above the boundary. After that, GC deletes by ID and skips the recorded
+fences while the epoch stays the same (2). A new epoch starts this process again. GC reads the
+epoch from the manifest, so this works for a garbage collector in the process of the writer and for
+a standalone garbage collector. A garbage collector in a fenced writer stops to delete by ID when
+it reads the manifest of the new writer.
+
+Limitations:
+
+- A garbage collector that runs one time (for example `run_gc_once`) always lists, because it does
+  not see the boundary move.
+- A `GcFilter` needs the metadata of each WAL File, so GC lists on every run when a filter is set.
+- GC by ID does not record the fence of a writer that failed to open (2), so it can delete that
+  fence. No writer depends on it, because that writer did not write a WAL File.
+- The WAL writer uploads one WAL File at a time. Parallel uploads need several fences for each
+  writer (see RFC-0001), and GC by ID then needs to record all of them.
+- Only the separate fence GC (`GarbageCollectorOptions::wal_fence_options`) collects Fencing WAL
+  Files. It lists, and it stays in dry-run mode by default.
 
 #### Readers
 

@@ -116,6 +116,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             compacted,
             compactions,
             disable_boundary_files,
+            wal_collect_by_id,
         } => {
             schedule_gc(
                 &admin,
@@ -125,6 +126,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 compacted,
                 compactions,
                 !disable_boundary_files,
+                wal_collect_by_id,
                 cancellation_token.clone(),
             )
             .await?
@@ -329,6 +331,7 @@ async fn exec_gc_once(
             metric_level: None,
             boundary_files_enabled,
             object_store_max_retries: None,
+            wal_collect_by_id: false,
         },
         GcResource::Wal => GarbageCollectorOptions {
             manifest_options: None,
@@ -340,6 +343,7 @@ async fn exec_gc_once(
             metric_level: None,
             boundary_files_enabled,
             object_store_max_retries: None,
+            wal_collect_by_id: false,
         },
         GcResource::WalFence => GarbageCollectorOptions {
             manifest_options: None,
@@ -351,6 +355,7 @@ async fn exec_gc_once(
             metric_level: None,
             boundary_files_enabled,
             object_store_max_retries: None,
+            wal_collect_by_id: false,
         },
         GcResource::Compacted => GarbageCollectorOptions {
             manifest_options: None,
@@ -362,6 +367,7 @@ async fn exec_gc_once(
             metric_level: None,
             boundary_files_enabled,
             object_store_max_retries: None,
+            wal_collect_by_id: false,
         },
         GcResource::Compactions => GarbageCollectorOptions {
             manifest_options: None,
@@ -373,6 +379,7 @@ async fn exec_gc_once(
             metric_level: None,
             boundary_files_enabled,
             object_store_max_retries: None,
+            wal_collect_by_id: false,
         },
     };
     admin.run_gc_once(gc_opts).await?;
@@ -388,6 +395,7 @@ async fn schedule_gc(
     compacted_schedule: Option<GcSchedule>,
     compactions_schedule: Option<GcSchedule>,
     boundary_files_enabled: bool,
+    wal_collect_by_id: bool,
     cancellation_token: CancellationToken,
 ) -> Result<(), Box<dyn Error>> {
     fn create_gc_dir_opts(schedule: GcSchedule) -> Option<GarbageCollectorDirectoryOptions> {
@@ -407,6 +415,7 @@ async fn schedule_gc(
         metric_level: None,
         boundary_files_enabled,
         object_store_max_retries: None,
+        wal_collect_by_id,
     };
 
     admin

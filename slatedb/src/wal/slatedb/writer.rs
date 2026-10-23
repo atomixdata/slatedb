@@ -1266,6 +1266,51 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_flush_uploads_one_wal_at_a_time() {
+        // With one upload slot, the default, a new writer writes one fence, at
+        // the next WAL ID of the old writer. The fence stops the old writer only
+        // if that writer uploads one WAL at a time.
+        let store = Arc::new(GatedObjectStore::new(Arc::new(InMemory::new())));
+        let (mut wal_buffer, _, _, _) = setup_wal_buffer_with_max_inflight_uploads(
+            Some(Duration::MAX),
+            Arc::new(|_status| {}),
+            store.clone(),
+            1,
+        )
+        .await;
+        store.put_opts_gate.close();
+
+        wal_buffer
+            .append(&[make_entry("key1", "value1", 1, None)])
+            .await
+            .unwrap();
+        let first_flush = wal_buffer.flush().await.unwrap().completion;
+        store.put_opts_gate.wait_for_arrivals(1).await;
+
+        // The upload of WAL 1 waits at the gate. WAL 2 is ready to upload.
+        wal_buffer
+            .append(&[make_entry("key2", "value2", 2, None)])
+            .await
+            .unwrap();
+        let second_flush = wal_buffer.flush().await.unwrap().completion;
+        let second_upload = tokio::time::timeout(
+            Duration::from_millis(200),
+            store.put_opts_gate.wait_for_arrivals(2),
+        )
+        .await;
+        assert!(
+            second_upload.is_err(),
+            "the writer started the upload of WAL 2 before the upload of WAL 1 finished"
+        );
+
+        store.put_opts_gate.release();
+        first_flush.await.unwrap();
+        second_flush.await.unwrap();
+        assert_eq!(store.put_opts_gate.arrivals(), 2);
+        assert_eq!(wal_buffer.status().unwrap().last_flushed_wal_id, 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_maybe_trigger_flush_spams_flush_requests() {
         let (mut wal_buffer, _, _, recorder) =
             setup_wal_buffer_with_flush_interval(Duration::MAX).await;

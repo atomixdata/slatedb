@@ -344,10 +344,31 @@ pub trait WalReader: Send + Sync + 'static {
     async fn last_wal_file_id(&self, replay_after_wal_id: u64) -> Result<u64, WalError>;
 }
 
+/// What one garbage collection run knows about the database's manifests.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WalGcContext {
+    /// Ranges of WAL Files that some active Manifest references. The range of the latest
+    /// Manifest starts at its `replay_after_wal_id` and is unbounded.
+    pub referenced_ranges: Vec<WalFileRange>,
+    /// The `writer_epoch` of the latest Manifest, read together with `referenced_ranges`. It
+    /// changes when a new writer fences the database.
+    pub writer_epoch: u64,
+}
+
+impl WalGcContext {
+    pub(crate) fn new(referenced_ranges: Vec<WalFileRange>, writer_epoch: u64) -> Self {
+        Self {
+            referenced_ranges,
+            writer_epoch,
+        }
+    }
+}
+
 /// Trait that defines the contract between SlateDB's garbage collector and a custom WAL
 /// implementation. SlateDB tracks the set of currently referenced WAL ranges in its manifest.
-/// When the Garbage Collector runs, it computes this set and calls [`WalGc::collect`] so that
-/// the implementation can clean up any un-referenced WAL storage.
+/// When the Garbage Collector runs, it computes this set and calls
+/// [`WalGc::collect_with_context`] so that the implementation can clean up any un-referenced WAL
+/// storage.
 #[async_trait]
 pub trait WalGc: Send + Sync + 'static {
     /// Hook for garbage collecting the WAL. Takes a list of ranges of WAL Files that are currently
@@ -359,6 +380,20 @@ pub trait WalGc: Send + Sync + 'static {
         min_age: Duration,
         dry_run: bool,
     ) -> Result<(), WalError>;
+
+    /// The garbage collector calls this hook. It receives the same ranges as [`WalGc::collect`]
+    /// and the writer epoch of the latest Manifest. An implementation that keeps state between
+    /// runs can use the epoch to find out when a new writer fenced the database. The default
+    /// ignores the epoch and calls [`WalGc::collect`].
+    async fn collect_with_context(
+        &self,
+        context: WalGcContext,
+        min_age: Duration,
+        dry_run: bool,
+    ) -> Result<(), WalError> {
+        self.collect(context.referenced_ranges, min_age, dry_run)
+            .await
+    }
 }
 
 /// Administrative operations for a WAL implementation.

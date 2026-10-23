@@ -44,6 +44,8 @@ The scheduled process runs until interrupted (Ctrl-C), then shuts down gracefull
 
 The command above does not collect WAL fence objects. Enable `--wal-fence` only when `min_age` is longer than any writer can run. Default garbage collection keeps WAL fence deletion in dry-run mode because deleting fences too early can allow stale WAL writes to succeed.
 
+If the WAL directory holds many files, add `--wal-collect-by-id`. The scheduled process then deletes WAL SSTs by ID instead of a listing of the directory on every run. It still lists to find the WAL fence objects after each new writer advances its replay boundary.
+
 ## Embed the garbage collector
 
 You can also embed the garbage collector in your own process using `GarbageCollectorBuilder` and call `run`:

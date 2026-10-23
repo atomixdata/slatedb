@@ -78,6 +78,14 @@ Metadata readers and writers always honor existing boundary files. Without bound
 configure manifest and compactions garbage collection `min_age` values longer than any stale writer
 or compactor can remain alive.
 
+## WAL garbage collection by ID
+
+`GarbageCollectorOptions::wal_collect_by_id` makes WAL garbage collection delete WAL SSTs by ID
+instead of a listing of the WAL directory on every run. Use it when the WAL directory holds many
+files and a listing is slow. GC still lists to find the WAL fence objects, after each new writer
+advances its replay boundary. The option is off by default. See
+[garbage collection](/docs/design/gc#collecting-wal-ssts-by-id) for how GC keeps the fences.
+
 ## Reconfiguring Object Stores
 
 Reconfiguring an object store only changes how SlateDB reaches storage. It does not migrate data between stores for you. The new `ObjectStore` must still have the existing database contents for the database path.

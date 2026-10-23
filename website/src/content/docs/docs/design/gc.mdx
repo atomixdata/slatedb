@@ -81,3 +81,17 @@ By default, garbage collection is enabled for all managed directories (manifest,
 WAL fence garbage collection runs in dry-run mode by default. This means it logs files that would be deleted without actually deleting them. This conservative default prevents accidental data loss while still providing visibility into what would be cleaned up.
 
 To enable actual deletion for WAL fence GC, set `dry_run: false` with a high `min_age` to safely clean up old fences. Alternatively, to silence the dry-run logging entirely, set `wal_fence_options: None`.
+
+## Collecting WAL SSTs by ID
+
+By default, WAL GC lists the WAL directory on every run. A WAL with a high flush rate on an object store can hold hundreds of thousands of files. A listing of that directory takes minutes, and GC falls behind.
+
+If you set `GarbageCollectorOptions::wal_collect_by_id`, WAL GC deletes WAL SSTs by ID. WAL SST IDs are sequential. Every ID below the `replay_after_wal_id` of the latest manifest is in use. GC deletes each ID from where its previous run stopped. It stops at the `replay_after_wal_id` that it read at least `min_age` earlier. Thus every WAL SST that it deletes is at least `min_age` old. GC keeps the WAL SSTs that a checkpoint references.
+
+GC must not delete a WAL fence object. A WAL fence object is the empty object that a new writer writes at the next WAL ID of the old writer. If GC deletes it, a stalled upload from the old writer succeeds, and that writer reports writes as durable that no writer replays. GC by ID cannot see object sizes, so it finds the fences with a listing:
+
+1. When GC reads a `writer_epoch` that it did not see before, it lists the WAL directory on every run, as it does without the option.
+2. When GC reads a different `replay_after_wal_id` for the same epoch, the writer of that epoch wrote its fence. GC then lists one more time and records the fences above the boundary.
+3. GC deletes by ID and skips the recorded fences while the epoch stays the same.
+
+This works for a garbage collector in the writer process and for a standalone garbage collector. A garbage collector that runs one time always lists. If a `GcFilter` is set, GC lists on every run. [RFC-0030](https://github.com/slatedb/slatedb/blob/main/rfcs/0030-pluggable-wal.md) gives the full argument.

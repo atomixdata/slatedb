@@ -634,6 +634,13 @@ pub struct GarbageCollectorOptions {
     /// up after `n` retries and surfaces the underlying error.
     #[uniffi(default = None)]
     pub object_store_max_retries: Option<u32>,
+    /// Whether WAL garbage collection deletes WAL files by ID instead of a listing of the WAL
+    /// directory on every run. GC still lists to find the WAL fence objects. It lists after the
+    /// writer of the latest `writer_epoch` advances its replay boundary, and again after each new
+    /// writer fences the database. Use this option when the WAL directory holds many files and a
+    /// listing is slow.
+    #[uniffi(default = false)]
+    pub wal_collect_by_id: bool,
 }
 
 impl Default for GarbageCollectorOptions {
@@ -648,6 +655,7 @@ impl Default for GarbageCollectorOptions {
             detach_options: core.detach_options.map(Into::into),
             disable_boundary_files: !core.boundary_files_enabled,
             object_store_max_retries: core.object_store_max_retries,
+            wal_collect_by_id: core.wal_collect_by_id,
         }
     }
 }
@@ -682,6 +690,7 @@ impl From<GarbageCollectorOptions> for slatedb::config::GarbageCollectorOptions 
             metric_level: None,
             boundary_files_enabled: !value.disable_boundary_files,
             object_store_max_retries: value.object_store_max_retries,
+            wal_collect_by_id: value.wal_collect_by_id,
         }
     }
 }
@@ -915,6 +924,20 @@ mod tests {
         .into();
 
         assert!(!gc.boundary_files_enabled);
+    }
+
+    #[test]
+    fn wal_collect_by_id_defaults_to_off_and_carries_over() {
+        let gc: slatedb::config::GarbageCollectorOptions =
+            GarbageCollectorOptions::default().into();
+        assert!(!gc.wal_collect_by_id);
+
+        let gc: slatedb::config::GarbageCollectorOptions = GarbageCollectorOptions {
+            wal_collect_by_id: true,
+            ..GarbageCollectorOptions::default()
+        }
+        .into();
+        assert!(gc.wal_collect_by_id);
     }
 
     #[test]
