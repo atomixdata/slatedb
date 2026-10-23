@@ -314,7 +314,19 @@ impl<T: Send + std::fmt::Debug> MessageDispatcher<T> {
                 }
                 // if no errors, prioritize messages
                 Ok(message) = self.rx.recv() => {
-                    self.handler.handle(message).await?;
+                    let max_batch = self.handler.max_batch();
+                    if max_batch > 1 {
+                        let mut messages = vec![message];
+                        while messages.len() < max_batch {
+                            match self.rx.try_recv() {
+                                Ok(message) => messages.push(message),
+                                Err(_) => break,
+                            }
+                        }
+                        self.handler.handle_batch(messages).await?;
+                    } else {
+                        self.handler.handle(message).await?;
+                    }
                 },
                 // if no messages, check tickers
                 Some((message, ticker)) = ticker_futures.next() => {
@@ -498,6 +510,25 @@ pub(crate) trait MessageHandler<T: Send>: Send {
     ///
     /// The [Result] after handling the message.
     async fn handle(&mut self, message: T) -> Result<(), SlateDBError>;
+
+    /// The most channel messages [MessageDispatcher::run] passes to one
+    /// [MessageHandler::handle_batch] call. Above 1, the dispatcher takes the
+    /// messages already queued behind the one it received, up to this many.
+    fn max_batch(&self) -> usize {
+        1
+    }
+
+    /// Handles channel messages that were queued together, in order. The
+    /// default handles each one with [MessageHandler::handle].
+    async fn handle_batch(&mut self, messages: Vec<T>) -> Result<(), SlateDBError>
+    where
+        T: 'async_trait,
+    {
+        for message in messages {
+            self.handle(message).await?;
+        }
+        Ok(())
+    }
 
     /// Cleans up resources. This method should not be used to continue processing
     /// messages or writing to the database.
