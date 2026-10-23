@@ -92,6 +92,7 @@ pub mod config;
 pub mod db_cache;
 pub mod db_stats;
 pub mod manifest;
+pub mod mirror_policy;
 pub mod object_store_tag;
 pub mod prefix_extractor;
 pub mod seq_tracker;
