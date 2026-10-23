@@ -61,6 +61,14 @@ pub trait Vfs: Debug + Send + Sync + 'static {
     /// Removes the file at `path`. Fails with [`io::ErrorKind::NotFound`] if it
     /// doesn't exist.
     async fn remove(&self, path: &Path) -> io::Result<()>;
+
+    /// Opens the file at `path` ahead of its first read, if this file system
+    /// keeps files open between reads. A missing file is not an error. The
+    /// default does nothing.
+    async fn warm(&self, path: &Path) -> io::Result<()> {
+        let _ = path;
+        Ok(())
+    }
 }
 
 /// Writes a file created by [`Vfs::create`], in order.
@@ -216,6 +224,22 @@ impl Vfs for StdVfs {
         })
         .await?
     }
+
+    async fn warm(&self, path: &Path) -> io::Result<()> {
+        // A full cache would evict a handle that a read opened.
+        if self.file_handle_cache.len() as u64 >= self.file_handle_cache.capacity() {
+            return Ok(());
+        }
+        let path = path.to_path_buf();
+        let file_handle_cache = self.file_handle_cache.clone();
+        #[allow(clippy::disallowed_methods)]
+        tokio::task::spawn_blocking(move || match file_handle_cache.try_get_or_open(&path) {
+            Ok(_) => Ok(()),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err),
+        })
+        .await?
+    }
 }
 
 #[derive(Debug)]
@@ -270,6 +294,23 @@ mod tests {
                 size: 11
             }]
         );
+    }
+
+    #[tokio::test]
+    async fn should_warm_files_until_the_handle_cache_is_full() {
+        let dir = tempfile::tempdir().unwrap();
+        let vfs = StdVfs::new().with_max_open_file_handles(2);
+        let paths = ["a", "b", "c"].map(|name| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, name).unwrap();
+            path
+        });
+        for path in &paths {
+            vfs.warm(path).await.unwrap();
+        }
+        assert_eq!(vfs.file_handle_cache.len(), 2);
+        vfs.warm(&dir.path().join("missing")).await.unwrap();
+        assert_eq!(vfs.read_range(&paths[2], 0..1).await.unwrap(), "c");
     }
 
     #[tokio::test]

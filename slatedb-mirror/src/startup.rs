@@ -10,7 +10,7 @@ use futures::stream::{self, StreamExt};
 use log::{info, warn};
 use object_store::path::Path;
 
-use crate::inner::{local_error, remove_quietly};
+use crate::inner::{local_error, remove_quietly, Inner};
 use crate::layout::{classify, FileKind, LocalName, LocalObject, PrefixMap};
 use crate::MirrorError;
 use slatedb_common::vfs::Vfs;
@@ -123,6 +123,29 @@ pub(crate) async fn recover(vfs: &dyn Vfs, root: &StdPath) -> Result<Recovered, 
 /// matches `size`. Otherwise returns a reason to log before removing the pair.
 ///
 /// Doesn't check for MD5 prefix conflicts; [`recover`] does that afterwards.
+/// Opens the data files of the recovered local copies ahead of their first
+/// reads, newest first. A VFS that keeps a bounded number of files open keeps
+/// the newest ones, which are the likeliest to be read soon.
+pub(crate) async fn warm(inner: Arc<Inner>) {
+    let mut objects = inner.entries.values();
+    objects.sort_by(|a, b| b.meta.last_modified.cmp(&a.meta.last_modified));
+    stream::iter(objects)
+        .for_each_concurrent(IO_CONCURRENCY, |object| {
+            let inner = &inner;
+            async move {
+                let path = inner.file(&LocalName::new(&object.meta.location).object_file_name);
+                if let Err(err) = inner.vfs.warm(&path).await {
+                    warn!(
+                        "failed to warm mirror file [path={}, error={}]",
+                        path.display(),
+                        err
+                    );
+                }
+            }
+        })
+        .await;
+}
+
 fn validate(
     data: &str,
     size: u64,

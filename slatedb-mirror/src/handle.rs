@@ -107,7 +107,7 @@ impl MirrorHandle {
 
     /// Returns true if `path` has a complete local copy.
     pub fn contains(&self, path: &Path) -> bool {
-        self.inner.entries.lock().contains_key(path)
+        self.inner.entries.contains(path)
     }
 
     /// The wrapped store. Calls made here skip the policy.
@@ -119,7 +119,7 @@ impl MirrorHandle {
 async fn fetch_one(inner: &Inner, path: Path, ticket: Ticket) -> object_store::Result<()> {
     // Downloads are never cancelled.
     ticket.ready().await;
-    if inner.entries.lock().contains_key(&path) {
+    if inner.entries.contains(&path) {
         return Ok(());
     }
     inner.download(&path).await?;

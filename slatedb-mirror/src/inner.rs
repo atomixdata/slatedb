@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io;
 use std::path::{Path as StdPath, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -15,7 +16,7 @@ use object_store::path::Path;
 use object_store::{
     GetOptions, GetResult, GetResultPayload, ObjectStore, ObjectStoreExt, PutPayload,
 };
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use slatedb_common::clock::SystemClock;
 use tokio::runtime::Handle;
 use tokio_util::sync::CancellationToken;
@@ -45,6 +46,73 @@ pub(crate) async fn remove_quietly(vfs: &dyn Vfs, path: &StdPath) {
     }
 }
 
+/// The number of shards in [`LocalEntries`].
+const LOCAL_ENTRY_SHARDS: usize = 64;
+
+/// One shard of [`LocalEntries`].
+type LocalEntryShard = RwLock<HashMap<Path, Arc<LocalObject>>>;
+
+/// Every complete local copy, by object path.
+///
+/// Every local read looks up its path here. The map is split into shards with
+/// a read-write lock each, so lookups of different paths do not wait for one
+/// lock.
+pub(crate) struct LocalEntries {
+    shards: Box<[LocalEntryShard]>,
+}
+
+impl LocalEntries {
+    fn new(entries: HashMap<Path, Arc<LocalObject>>) -> Self {
+        let local_entries = Self {
+            shards: (0..LOCAL_ENTRY_SHARDS)
+                .map(|_| RwLock::new(HashMap::new()))
+                .collect(),
+        };
+        for (path, object) in entries {
+            local_entries.insert(path, object);
+        }
+        local_entries
+    }
+
+    fn shard(&self, path: &Path) -> &LocalEntryShard {
+        let mut hasher = DefaultHasher::new();
+        path.hash(&mut hasher);
+        &self.shards[(hasher.finish() % self.shards.len() as u64) as usize]
+    }
+
+    pub(crate) fn get(&self, path: &Path) -> Option<Arc<LocalObject>> {
+        self.shard(path).read().get(path).cloned()
+    }
+
+    pub(crate) fn contains(&self, path: &Path) -> bool {
+        self.shard(path).read().contains_key(path)
+    }
+
+    pub(crate) fn insert(&self, path: Path, object: Arc<LocalObject>) {
+        self.shard(&path).write().insert(path, object);
+    }
+
+    pub(crate) fn remove(&self, path: &Path) -> Option<Arc<LocalObject>> {
+        self.shard(path).write().remove(path)
+    }
+
+    /// Returns every local copy. A copy that is installed or removed during
+    /// the call can be in the result or not.
+    pub(crate) fn values(&self) -> Vec<Arc<LocalObject>> {
+        self.shards
+            .iter()
+            .flat_map(|shard| shard.read().values().cloned().collect::<Vec<_>>())
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear(&self) {
+        for shard in self.shards.iter() {
+            shard.write().clear();
+        }
+    }
+}
+
 pub(crate) struct Inner {
     pub(crate) root: PathBuf,
     pub(crate) remote: Arc<dyn ObjectStore>,
@@ -57,7 +125,7 @@ pub(crate) struct Inner {
     /// tasks.
     pub(crate) shutdown: CancellationToken,
     /// Every complete local copy, by object path.
-    pub(crate) entries: Mutex<HashMap<Path, Arc<LocalObject>>>,
+    pub(crate) entries: LocalEntries,
     pub(crate) prefixes: Mutex<PrefixMap>,
     pub(crate) ordering: PathOrdering,
     pub(crate) downloads: Downloads,
@@ -89,7 +157,7 @@ impl Inner {
             retry,
             runtime,
             shutdown: CancellationToken::new(),
-            entries: Mutex::new(entries),
+            entries: LocalEntries::new(entries),
             prefixes: Mutex::new(prefixes),
             ordering: PathOrdering::default(),
             downloads: Downloads::new(download_concurrency),
@@ -103,7 +171,7 @@ impl Inner {
     }
 
     pub(crate) fn local(&self, path: &Path) -> Option<Arc<LocalObject>> {
-        self.entries.lock().get(path).cloned()
+        self.entries.get(path)
     }
 
     /// Returns a guard for a new temporary data file for `name`.
@@ -167,9 +235,7 @@ impl Inner {
         }
         temp.disarm();
         let object = Arc::new(object);
-        self.entries
-            .lock()
-            .insert(path.clone(), Arc::clone(&object));
+        self.entries.insert(path.clone(), Arc::clone(&object));
         Ok(object)
     }
 
@@ -207,7 +273,7 @@ impl Inner {
     /// Removes the local copy of `path`, if there is one. The caller must hold
     /// `path`'s turn in the ordering.
     pub(crate) async fn remove_local(&self, path: &Path) -> Result<(), MirrorError> {
-        if self.entries.lock().remove(path).is_none() {
+        if self.entries.remove(path).is_none() {
             return Ok(());
         }
         self.remove_files(path).await
@@ -256,7 +322,7 @@ impl Inner {
             .register(path, OpKind::Delete)
             .expect("deletes are always queued");
         ticket.ready().await;
-        self.entries.lock().remove(path);
+        self.entries.remove(path);
         self.remove_files(path).await
     }
 
@@ -350,5 +416,66 @@ impl Drop for TempFile {
             self.runtime
                 .spawn(async move { remove_quietly(vfs.as_ref(), &path).await });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeSet, HashMap};
+    use std::sync::Arc;
+
+    use chrono::DateTime;
+    use object_store::path::Path;
+    use object_store::{Attributes, ObjectMeta};
+
+    use super::LocalEntries;
+    use crate::layout::LocalObject;
+
+    fn object(path: &Path) -> Arc<LocalObject> {
+        Arc::new(LocalObject {
+            meta: ObjectMeta {
+                location: path.clone(),
+                last_modified: DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+                size: 1,
+                e_tag: None,
+                version: None,
+            },
+            attributes: Attributes::new(),
+        })
+    }
+
+    #[test]
+    fn should_find_and_remove_entries_in_every_shard() {
+        let paths: Vec<_> = (0..256)
+            .map(|i| Path::from(format!("db/compacted/{i:04}.sst")))
+            .collect();
+        let entries = LocalEntries::new(
+            paths[..128]
+                .iter()
+                .map(|path| (path.clone(), object(path)))
+                .collect::<HashMap<_, _>>(),
+        );
+        for path in &paths[128..] {
+            entries.insert(path.clone(), object(path));
+        }
+        for path in &paths {
+            assert!(entries.contains(path));
+            assert_eq!(&entries.get(path).unwrap().meta.location, path);
+        }
+        assert_eq!(entries.values().len(), paths.len());
+
+        for path in paths.iter().step_by(2) {
+            assert!(entries.remove(path).is_some());
+            assert!(entries.remove(path).is_none());
+        }
+        let remaining: BTreeSet<_> = entries
+            .values()
+            .into_iter()
+            .map(|object| object.meta.location.clone())
+            .collect();
+        let expected: BTreeSet<_> = paths.iter().skip(1).step_by(2).cloned().collect();
+        assert_eq!(remaining, expected);
+        assert!(!entries.contains(&paths[0]));
+        assert!(entries.get(&paths[0]).is_none());
     }
 }

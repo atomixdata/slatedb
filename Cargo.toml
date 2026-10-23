@@ -56,7 +56,6 @@ futures = "0.3.30"
 hex = "0.4.3"
 humantime = "2.1.0"
 log = "0.4.27"
-lru = "0.18"
 quick_cache = "0.7.0"
 lz4_flex = "0.11.5"
 md-5 = { version = "0.11", default-features = false }
