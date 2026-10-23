@@ -1308,6 +1308,23 @@ pub struct CompactorOptions {
     #[serde(serialize_with = "serialize_duration")]
     pub commit_compacted_interval: Duration,
 
+    /// Whether a running compaction publishes the output that it already wrote before
+    /// the compaction finishes. Defaults to false.
+    ///
+    /// When this option is false, readers use the input SSTs of a compaction until the
+    /// compaction finishes. When this option is true, the compactor publishes the
+    /// written output at most once a minute, and readers use that output for its keys.
+    /// During a long compaction, this frees storage earlier, and reads of those keys
+    /// search fewer SSTs.
+    ///
+    /// Garbage collection deletes an input SST only after readers need none of its
+    /// keys and the compactor checkpoint expires. See [`Self::checkpoint_lifetime`].
+    ///
+    /// This option applies to compactions that merge sorted runs. A compaction with L0
+    /// SSTs in its inputs publishes its output only when it finishes.
+    #[serde(default)]
+    pub enable_incremental_compaction: bool,
+
     /// How long the compactor checkpoint protects input SSTs while publishing a
     /// manifest that replaces them with compacted output.
     ///
@@ -1355,6 +1372,7 @@ impl Default for CompactorOptions {
             worker: Some(CompactionWorkerOptions::default()),
             metric_level: None,
             commit_compacted_interval: Duration::from_secs(1),
+            enable_incremental_compaction: false,
             checkpoint_lifetime: default_compactor_checkpoint_lifetime(),
             worker_heartbeat_timeout: Duration::from_secs(30),
             object_store_max_retries: None,
@@ -1377,6 +1395,10 @@ impl std::fmt::Debug for CompactorOptions {
             .field("worker", &self.worker)
             .field("metric_level", &self.metric_level)
             .field("commit_compacted_interval", &self.commit_compacted_interval)
+            .field(
+                "enable_incremental_compaction",
+                &self.enable_incremental_compaction,
+            )
             .field("checkpoint_lifetime", &self.checkpoint_lifetime)
             .field("worker_heartbeat_timeout", &self.worker_heartbeat_timeout)
             .field("object_store_max_retries", &self.object_store_max_retries)
@@ -1964,6 +1986,26 @@ mod tests {
     fn test_db_options_default_metric_level() {
         let options = Settings::default();
         assert_eq!(MetricLevel::default(), options.metric_level);
+    }
+
+    #[test]
+    fn test_compactor_enable_incremental_compaction_config() {
+        assert!(!CompactorOptions::default().enable_incremental_compaction);
+
+        let mut value = serde_json::to_value(CompactorOptions::default()).unwrap();
+        value.as_object_mut().unwrap().insert(
+            "enable_incremental_compaction".to_string(),
+            serde_json::Value::Bool(true),
+        );
+        let configured: CompactorOptions = serde_json::from_value(value.clone()).unwrap();
+        assert!(configured.enable_incremental_compaction);
+
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("enable_incremental_compaction");
+        let omitted: CompactorOptions = serde_json::from_value(value).unwrap();
+        assert!(!omitted.enable_incremental_compaction);
     }
 
     #[test]
