@@ -829,6 +829,134 @@ impl<'a> flatbuffers::Verifiable for CheckpointMetadata {
 impl flatbuffers::SimpleToVerifyInSlice for CheckpointMetadata {}
 pub struct CheckpointMetadataUnionTableOffset {}
 
+// struct WalExcludedRange, aligned to 8
+#[repr(transparent)]
+#[derive(Clone, Copy, PartialEq)]
+pub struct WalExcludedRange(pub [u8; 16]);
+impl Default for WalExcludedRange { 
+  fn default() -> Self { 
+    Self([0; 16])
+  }
+}
+impl core::fmt::Debug for WalExcludedRange {
+  fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+    f.debug_struct("WalExcludedRange")
+      .field("start", &self.start())
+      .field("end", &self.end())
+      .finish()
+  }
+}
+
+impl flatbuffers::SimpleToVerifyInSlice for WalExcludedRange {}
+impl<'a> flatbuffers::Follow<'a> for WalExcludedRange {
+  type Inner = &'a WalExcludedRange;
+  #[inline]
+  unsafe fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
+    <&'a WalExcludedRange>::follow(buf, loc)
+  }
+}
+impl<'a> flatbuffers::Follow<'a> for &'a WalExcludedRange {
+  type Inner = &'a WalExcludedRange;
+  #[inline]
+  unsafe fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
+    flatbuffers::follow_cast_ref::<WalExcludedRange>(buf, loc)
+  }
+}
+impl<'b> flatbuffers::Push for WalExcludedRange {
+    type Output = WalExcludedRange;
+    #[inline]
+    unsafe fn push(&self, dst: &mut [u8], _written_len: usize) {
+        let src = ::core::slice::from_raw_parts(self as *const WalExcludedRange as *const u8, <Self as flatbuffers::Push>::size());
+        dst.copy_from_slice(src);
+    }
+    #[inline]
+    fn alignment() -> flatbuffers::PushAlignment {
+        flatbuffers::PushAlignment::new(8)
+    }
+}
+
+impl<'a> flatbuffers::Verifiable for WalExcludedRange {
+  #[inline]
+  fn run_verifier(
+    v: &mut flatbuffers::Verifier, pos: usize
+  ) -> Result<(), flatbuffers::InvalidFlatbuffer> {
+    use self::flatbuffers::Verifiable;
+    v.in_buffer::<Self>(pos)
+  }
+}
+
+impl<'a> WalExcludedRange {
+  #[allow(clippy::too_many_arguments)]
+  pub fn new(
+    start: u64,
+    end: u64,
+  ) -> Self {
+    let mut s = Self([0; 16]);
+    s.set_start(start);
+    s.set_end(end);
+    s
+  }
+
+  pub fn start(&self) -> u64 {
+    let mut mem = core::mem::MaybeUninit::<<u64 as EndianScalar>::Scalar>::uninit();
+    // Safety:
+    // Created from a valid Table for this object
+    // Which contains a valid value in this slot
+    EndianScalar::from_little_endian(unsafe {
+      core::ptr::copy_nonoverlapping(
+        self.0[0..].as_ptr(),
+        mem.as_mut_ptr() as *mut u8,
+        core::mem::size_of::<<u64 as EndianScalar>::Scalar>(),
+      );
+      mem.assume_init()
+    })
+  }
+
+  pub fn set_start(&mut self, x: u64) {
+    let x_le = x.to_little_endian();
+    // Safety:
+    // Created from a valid Table for this object
+    // Which contains a valid value in this slot
+    unsafe {
+      core::ptr::copy_nonoverlapping(
+        &x_le as *const _ as *const u8,
+        self.0[0..].as_mut_ptr(),
+        core::mem::size_of::<<u64 as EndianScalar>::Scalar>(),
+      );
+    }
+  }
+
+  pub fn end(&self) -> u64 {
+    let mut mem = core::mem::MaybeUninit::<<u64 as EndianScalar>::Scalar>::uninit();
+    // Safety:
+    // Created from a valid Table for this object
+    // Which contains a valid value in this slot
+    EndianScalar::from_little_endian(unsafe {
+      core::ptr::copy_nonoverlapping(
+        self.0[8..].as_ptr(),
+        mem.as_mut_ptr() as *mut u8,
+        core::mem::size_of::<<u64 as EndianScalar>::Scalar>(),
+      );
+      mem.assume_init()
+    })
+  }
+
+  pub fn set_end(&mut self, x: u64) {
+    let x_le = x.to_little_endian();
+    // Safety:
+    // Created from a valid Table for this object
+    // Which contains a valid value in this slot
+    unsafe {
+      core::ptr::copy_nonoverlapping(
+        &x_le as *const _ as *const u8,
+        self.0[8..].as_mut_ptr(),
+        core::mem::size_of::<<u64 as EndianScalar>::Scalar>(),
+      );
+    }
+  }
+
+}
+
 pub enum UuidOffset {}
 #[derive(Copy, Clone, PartialEq)]
 
@@ -4356,6 +4484,8 @@ impl<'a> ManifestV2<'a> {
   pub const VT_SEQUENCE_TRACKER: flatbuffers::VOffsetT = 34;
   pub const VT_SEGMENTS: flatbuffers::VOffsetT = 36;
   pub const VT_SEGMENT_EXTRACTOR_NAME: flatbuffers::VOffsetT = 38;
+  pub const VT_WAL_EXCLUDED_RANGE_MAX_SIZE: flatbuffers::VOffsetT = 40;
+  pub const VT_WAL_EXCLUDED_RANGES: flatbuffers::VOffsetT = 42;
 
   #[inline]
   pub unsafe fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
@@ -4367,6 +4497,7 @@ impl<'a> ManifestV2<'a> {
     args: &'args ManifestV2Args<'args>
   ) -> flatbuffers::WIPOffset<ManifestV2<'bldr>> {
     let mut builder = ManifestV2Builder::new(_fbb);
+    builder.add_wal_excluded_range_max_size(args.wal_excluded_range_max_size);
     builder.add_recent_snapshot_min_seq(args.recent_snapshot_min_seq);
     builder.add_last_l0_seq(args.last_l0_seq);
     builder.add_last_l0_clock_tick(args.last_l0_clock_tick);
@@ -4375,6 +4506,7 @@ impl<'a> ManifestV2<'a> {
     builder.add_compactor_epoch(args.compactor_epoch);
     builder.add_writer_epoch(args.writer_epoch);
     builder.add_manifest_id(args.manifest_id);
+    if let Some(x) = args.wal_excluded_ranges { builder.add_wal_excluded_ranges(x); }
     if let Some(x) = args.segment_extractor_name { builder.add_segment_extractor_name(x); }
     if let Some(x) = args.segments { builder.add_segments(x); }
     if let Some(x) = args.sequence_tracker { builder.add_sequence_tracker(x); }
@@ -4515,6 +4647,20 @@ impl<'a> ManifestV2<'a> {
     // which contains a valid value in this slot
     unsafe { self._tab.get::<flatbuffers::ForwardsUOffset<&str>>(ManifestV2::VT_SEGMENT_EXTRACTOR_NAME, None)}
   }
+  #[inline]
+  pub fn wal_excluded_range_max_size(&self) -> u64 {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<u64>(ManifestV2::VT_WAL_EXCLUDED_RANGE_MAX_SIZE, Some(1)).unwrap()}
+  }
+  #[inline]
+  pub fn wal_excluded_ranges(&self) -> Option<flatbuffers::Vector<'a, WalExcludedRange>> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'a, WalExcludedRange>>>(ManifestV2::VT_WAL_EXCLUDED_RANGES, None)}
+  }
 }
 
 impl flatbuffers::Verifiable for ManifestV2<'_> {
@@ -4542,6 +4688,8 @@ impl flatbuffers::Verifiable for ManifestV2<'_> {
      .visit_field::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'_, u8>>>("sequence_tracker", Self::VT_SEQUENCE_TRACKER, false)?
      .visit_field::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'_, flatbuffers::ForwardsUOffset<Segment>>>>("segments", Self::VT_SEGMENTS, false)?
      .visit_field::<flatbuffers::ForwardsUOffset<&str>>("segment_extractor_name", Self::VT_SEGMENT_EXTRACTOR_NAME, false)?
+     .visit_field::<u64>("wal_excluded_range_max_size", Self::VT_WAL_EXCLUDED_RANGE_MAX_SIZE, false)?
+     .visit_field::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'_, WalExcludedRange>>>("wal_excluded_ranges", Self::VT_WAL_EXCLUDED_RANGES, false)?
      .finish();
     Ok(())
   }
@@ -4565,6 +4713,8 @@ pub struct ManifestV2Args<'a> {
     pub sequence_tracker: Option<flatbuffers::WIPOffset<flatbuffers::Vector<'a, u8>>>,
     pub segments: Option<flatbuffers::WIPOffset<flatbuffers::Vector<'a, flatbuffers::ForwardsUOffset<Segment<'a>>>>>,
     pub segment_extractor_name: Option<flatbuffers::WIPOffset<&'a str>>,
+    pub wal_excluded_range_max_size: u64,
+    pub wal_excluded_ranges: Option<flatbuffers::WIPOffset<flatbuffers::Vector<'a, WalExcludedRange>>>,
 }
 impl<'a> Default for ManifestV2Args<'a> {
   #[inline]
@@ -4588,6 +4738,8 @@ impl<'a> Default for ManifestV2Args<'a> {
       sequence_tracker: None,
       segments: None,
       segment_extractor_name: None,
+      wal_excluded_range_max_size: 1,
+      wal_excluded_ranges: None,
     }
   }
 }
@@ -4670,6 +4822,14 @@ impl<'a: 'b, 'b, A: flatbuffers::Allocator + 'a> ManifestV2Builder<'a, 'b, A> {
     self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(ManifestV2::VT_SEGMENT_EXTRACTOR_NAME, segment_extractor_name);
   }
   #[inline]
+  pub fn add_wal_excluded_range_max_size(&mut self, wal_excluded_range_max_size: u64) {
+    self.fbb_.push_slot::<u64>(ManifestV2::VT_WAL_EXCLUDED_RANGE_MAX_SIZE, wal_excluded_range_max_size, 1);
+  }
+  #[inline]
+  pub fn add_wal_excluded_ranges(&mut self, wal_excluded_ranges: flatbuffers::WIPOffset<flatbuffers::Vector<'b , WalExcludedRange>>) {
+    self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(ManifestV2::VT_WAL_EXCLUDED_RANGES, wal_excluded_ranges);
+  }
+  #[inline]
   pub fn new(_fbb: &'b mut flatbuffers::FlatBufferBuilder<'a, A>) -> ManifestV2Builder<'a, 'b, A> {
     let start = _fbb.start_table();
     ManifestV2Builder {
@@ -4709,6 +4869,8 @@ impl core::fmt::Debug for ManifestV2<'_> {
       ds.field("sequence_tracker", &self.sequence_tracker());
       ds.field("segments", &self.segments());
       ds.field("segment_extractor_name", &self.segment_extractor_name());
+      ds.field("wal_excluded_range_max_size", &self.wal_excluded_range_max_size());
+      ds.field("wal_excluded_ranges", &self.wal_excluded_ranges());
       ds.finish()
   }
 }

@@ -2136,12 +2136,15 @@ impl WriteHandle {
 
     /// Waits until this write has been durably persisted.
     ///
-    /// If the database closes before the write becomes durable, this returns a
-    /// closed error carrying the database's [`CloseReason`].
+    /// If the database closes before durability is confirmed, this returns a
+    /// closed error carrying the database's [`CloseReason`]. The outcome is
+    /// then unknown: the write can still be stored and appear after the
+    /// database reopens.
     ///
     /// # Errors
     ///
-    /// Returns a closed error if the database closes first.
+    /// Returns a closed error if the database closes before durability is
+    /// confirmed.
     pub async fn await_durable(&self) -> Result<(), crate::Error> {
         (self.durability_waiter)(self.seq).await
     }
@@ -2242,7 +2245,7 @@ mod tests {
     };
     use crate::iter::{IterationOrder, RowEntryIterator};
     use crate::manifest::store::{ManifestStore, StoredManifest};
-    use crate::manifest::{ManifestCore, VersionedManifest};
+    use crate::manifest::{ManifestCore, VersionedManifest, WalExcludedRange};
     use crate::merge_operator::{
         MERGE_OPERATOR_COMPACT_PATH, MERGE_OPERATOR_FLUSH_PATH, MERGE_OPERATOR_READ_PATH,
     };
@@ -2256,7 +2259,8 @@ mod tests {
         OnDemandCompactionSchedulerSupplier, StringConcatMergeOperator,
     };
     use crate::types::RowEntry;
-    use crate::wal::slatedb::store::WalTableStore;
+    use crate::wal::slatedb::iterator::WalExcludedRanges;
+    use crate::wal::slatedb::store::{WalFileId, WalTableStore};
     use crate::wal::{SlateDbWalReaderBuilder, WalError, WalReader as _};
     use crate::{proptest_util, test_utils, CloseReason, CompactorBuilder, KeyValue};
     use async_trait::async_trait;
@@ -6802,7 +6806,7 @@ mod tests {
         assert_eq!(result.kind(), crate::ErrorKind::Closed(CloseReason::Panic));
         assert!(result
             .to_string()
-            .contains("background task panicked. name=`wal_writer`"));
+            .contains("background task panicked. name=`wal_uploader`"));
 
         // Close, which flushes the latest manifest to the object store
         // TODO: it might make sense to return an error if there're unflushed wals in memory
@@ -6818,16 +6822,17 @@ mod tests {
         );
 
         // Get the next WAL SST ID based on what's currently in the object store
-        let next_wal_sst_id = wal_store.next_wal_sst_id(0.into()).await.unwrap();
+        let next_wal_sst_id = wal_store
+            .walk_to_frontier(1.into(), &WalExcludedRanges::none())
+            .await
+            .unwrap()
+            .value();
 
         // Get the latest manifest
         let manifest = manifest_store.read_latest_manifest().await.unwrap();
 
         // Assert that the manifest reflects only the flushed WAL
-        assert_eq!(
-            manifest.manifest.core.next_wal_sst_id,
-            next_wal_sst_id.value()
-        );
+        assert_eq!(manifest.manifest.core.next_wal_sst_id, next_wal_sst_id);
     }
 
     #[tokio::test]
@@ -7153,6 +7158,414 @@ mod tests {
             db.inner.wal_observer.status().unwrap().last_flushed_wal_id,
             3
         );
+    }
+
+    #[tokio::test]
+    async fn test_db_open_should_fence_the_stored_window() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("/tmp/test_db_open_should_fence_the_stored_window");
+        let wal_store = WalTableStore::new(
+            object_store.clone(),
+            SsTableFormat::default(),
+            path.clone(),
+            TableStoreKind::Main,
+        );
+
+        // given: WAL 1 is the first fence and WAL 2 holds key 1 at seq 1. The
+        // manifest stores a window of 3, and WAL 4 holds an orphan at seq
+        // 2. A replayed orphan would be visible to reads. A large L0 size
+        // avoids L0 flushes, so every open replays from WAL 1.
+        let db1 = Db::builder(path.clone(), object_store.clone())
+            .with_settings(test_db_options(0, 1024 * 1024, None))
+            .build()
+            .await
+            .unwrap();
+        db1.put(b"1", b"1").await.unwrap();
+        db1.flush_with_options(FlushOptions {
+            flush_type: FlushType::Wal,
+        })
+        .await
+        .unwrap();
+        let manifest_store = Arc::new(ManifestStore::new(&path, object_store.clone()));
+        let mut stored_manifest =
+            StoredManifest::load(manifest_store, Arc::new(DefaultSystemClock::new()))
+                .await
+                .unwrap();
+        let mut dirty = stored_manifest.prepare_dirty().unwrap();
+        dirty.value.core.wal_excluded_range_max_size = 3;
+        stored_manifest.update(dirty).await.unwrap();
+        let mut builder = wal_store.table_builder();
+        builder
+            .add(RowEntry::new_value(b"orphan", b"orphan", 2))
+            .await
+            .unwrap();
+        let orphan = builder.build().await.unwrap();
+        wal_store.write_sst(4.into(), &orphan).await.unwrap();
+
+        // when: a new writer takes over.
+        let db2 = Db::builder(path.clone(), object_store.clone())
+            .with_settings(test_db_options(0, 1024 * 1024, None))
+            .build()
+            .await
+            .unwrap();
+
+        // then: the takeover records the range 3 to 5 in the manifest,
+        // fences 3 and 5, leaves the orphan at 4, and starts the writer after
+        // the range. The orphan is not replayed.
+        let manifest = ManifestStore::new(&path, object_store.clone())
+            .read_latest_manifest()
+            .await
+            .unwrap();
+        assert_eq!(
+            manifest.manifest.core.wal_excluded_ranges,
+            vec![WalExcludedRange { start: 3, end: 5 }]
+        );
+        for wal_id in [3, 5] {
+            assert!(matches!(
+                wal_store.open_sst(wal_id.into()).await,
+                Err(SlateDBError::EmptySSTable)
+            ));
+        }
+        assert!(wal_store.open_sst(4.into()).await.is_ok());
+        assert_eq!(
+            db2.inner.wal_observer.status().unwrap().last_flushed_wal_id,
+            5
+        );
+        assert_eq!(db2.get(b"1").await.unwrap(), Some(Bytes::from_static(b"1")));
+        assert_eq!(db2.get(b"orphan").await.unwrap(), None);
+        db2.put(b"2", b"2").await.unwrap();
+        db2.flush_with_options(FlushOptions {
+            flush_type: FlushType::Wal,
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            db2.inner.wal_observer.status().unwrap().last_flushed_wal_id,
+            6
+        );
+
+        // then: a DbReader finds the tail with the walk and skips the excluded
+        // range. It sees both keys and not the orphan.
+        let reader = crate::DbReader::builder(path.clone(), object_store.clone())
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(
+            reader.get(b"1").await.unwrap(),
+            Some(Bytes::from_static(b"1"))
+        );
+        assert_eq!(
+            reader.get(b"2").await.unwrap(),
+            Some(Bytes::from_static(b"2"))
+        );
+        assert_eq!(reader.get(b"orphan").await.unwrap(), None);
+        reader.close().await.unwrap();
+
+        // then: a later replay skips the excluded range, so the orphan stays
+        // hidden.
+        let db3 = Db::builder(path.clone(), object_store.clone())
+            .with_settings(test_db_options(0, 1024 * 1024, None))
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(db3.get(b"1").await.unwrap(), Some(Bytes::from_static(b"1")));
+        assert_eq!(db3.get(b"2").await.unwrap(), Some(Bytes::from_static(b"2")));
+        assert_eq!(db3.get(b"orphan").await.unwrap(), None);
+
+        // then: db3 fenced 7 to 9. Its first L0 flush, with only replayed
+        // data, moves the replay boundary to the end of that window.
+        db3.flush_with_options(FlushOptions {
+            flush_type: FlushType::MemTable,
+        })
+        .await
+        .unwrap();
+        let manifest = ManifestStore::new(&path, object_store.clone())
+            .read_latest_manifest()
+            .await
+            .unwrap();
+        assert_eq!(manifest.manifest.core.replay_after_wal_id, 9);
+        // db3 kept the earlier range and added its own.
+        assert_eq!(
+            manifest.manifest.core.wal_excluded_ranges,
+            vec![
+                WalExcludedRange { start: 3, end: 5 },
+                WalExcludedRange { start: 7, end: 9 },
+            ]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_late_upload_after_takeover_is_not_acknowledged_or_replayed() {
+        // given: a writer with three upload slots. Its WAL store can hold back
+        // the upload of one WAL ID.
+        let main_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let wal_inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let gated = Arc::new(GatedObjectStore::new(Arc::clone(&wal_inner)));
+        let path = Path::from("/tmp/test_late_upload_after_takeover");
+        let wal_store = WalTableStore::new(
+            Arc::clone(&wal_inner),
+            SsTableFormat::default(),
+            path.clone(),
+            TableStoreKind::Main,
+        );
+        let mut settings = test_db_options(0, 1024 * 1024, None);
+        settings.max_inflight_wal_uploads = 3;
+        settings.flush_interval = Some(Duration::from_millis(10));
+        let db1 = Db::builder(path.clone(), Arc::clone(&main_store))
+            .with_wal_object_store(gated.clone())
+            .with_settings(settings.clone())
+            .build()
+            .await
+            .unwrap();
+        let put = |db: &Db, key: &'static [u8]| {
+            let db = db.clone();
+            async move {
+                db.put_with_options(key, key, &PutOptions::default(), &WriteOptions::default())
+                    .await
+                    .unwrap()
+            }
+        };
+        put(&db1, b"1").await.await_durable().await.unwrap();
+
+        // when: the upload of the next WAL is held back, and the WAL after it
+        // lands. The writer cannot acknowledge either write.
+        let held_id = db1.inner.wal_observer.status().unwrap().last_flushed_wal_id + 1;
+        let path_resolver = PathResolver::from_root(path.clone());
+        *gated.put_opts_gated_paths.lock().unwrap() =
+            Some(vec![path_resolver.wal_sst_path(&WalFileId::from(held_id))]);
+        gated.put_opts_gate.close();
+        // The gate counts every earlier PUT, so wait for one more arrival.
+        let arrivals = gated.put_opts_gate.arrivals();
+        let held = put(&db1, b"2").await;
+        gated.put_opts_gate.wait_for_arrivals(arrivals + 1).await;
+        let orphan = put(&db1, b"3").await;
+        while wal_store
+            .metadata(WalFileId::from(held_id + 1))
+            .await
+            .is_err()
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // when: a new writer takes over, and then the held upload is released.
+        let db2 = Db::builder(path.clone(), Arc::clone(&main_store))
+            .with_wal_object_store(Arc::clone(&wal_inner))
+            .with_settings(settings.clone())
+            .build()
+            .await
+            .unwrap();
+        gated.put_opts_gate.release();
+
+        // then: the old writer fails both writes, and neither is recovered.
+        assert!(held.await_durable().await.is_err());
+        assert!(orphan.await_durable().await.is_err());
+        assert_eq!(db2.get(b"1").await.unwrap(), Some(Bytes::from_static(b"1")));
+        assert_eq!(db2.get(b"2").await.unwrap(), None);
+        assert_eq!(db2.get(b"3").await.unwrap(), None);
+        // A third writer takes over without an L0 flush, so its replay walks
+        // through the excluded range and the orphan.
+        let db3 = Db::builder(path.clone(), Arc::clone(&main_store))
+            .with_wal_object_store(Arc::clone(&wal_inner))
+            .with_settings(settings)
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(db3.get(b"1").await.unwrap(), Some(Bytes::from_static(b"1")));
+        assert_eq!(db3.get(b"2").await.unwrap(), None);
+        assert_eq!(db3.get(b"3").await.unwrap(), None);
+    }
+
+    /// Opens a database after a takeover that recorded the range 3 to 5 and
+    /// crashed, either before or after its fence at 3. WAL 4 holds an orphan,
+    /// and WAL 5 is missing.
+    async fn takeover_after_an_interrupted_takeover(fence_written: bool) {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from(format!(
+            "/tmp/test_takeover_after_an_interrupted_takeover_{fence_written}"
+        ));
+        let wal_store = WalTableStore::new(
+            object_store.clone(),
+            SsTableFormat::default(),
+            path.clone(),
+            TableStoreKind::Main,
+        );
+        let settings = test_db_options(0, 1024 * 1024, None);
+
+        // given: WAL 1 is a fence and WAL 2 holds key 1 at seq 1.
+        let db1 = Db::builder(path.clone(), object_store.clone())
+            .with_settings(settings.clone())
+            .build()
+            .await
+            .unwrap();
+        db1.put(b"1", b"1").await.unwrap();
+        db1.flush_with_options(FlushOptions {
+            flush_type: FlushType::Wal,
+        })
+        .await
+        .unwrap();
+        let manifest_store = Arc::new(ManifestStore::new(&path, object_store.clone()));
+        let mut stored_manifest = StoredManifest::load(
+            Arc::clone(&manifest_store),
+            Arc::new(DefaultSystemClock::new()),
+        )
+        .await
+        .unwrap();
+        let mut dirty = stored_manifest.prepare_dirty().unwrap();
+        dirty.value.core.wal_excluded_range_max_size = 3;
+        dirty.value.core.wal_excluded_ranges = vec![WalExcludedRange { start: 3, end: 5 }];
+        stored_manifest.update(dirty).await.unwrap();
+        if fence_written {
+            wal_store.write_wal_fence(3.into()).await.unwrap();
+        }
+        let mut builder = wal_store.table_builder();
+        builder
+            .add(RowEntry::new_value(b"orphan", b"orphan", 2))
+            .await
+            .unwrap();
+        let orphan = builder.build().await.unwrap();
+        wal_store.write_sst(4.into(), &orphan).await.unwrap();
+
+        // when: a new writer takes over.
+        let db2 = Db::builder(path.clone(), object_store.clone())
+            .with_settings(settings.clone())
+            .build()
+            .await
+            .unwrap();
+
+        // then: without the fence, the recorded range does not apply, so the
+        // new takeover excludes 3 to 5 itself. With the fence, the range
+        // applies, and the new takeover excludes 6 to 8.
+        let expected_ranges = if fence_written {
+            vec![
+                WalExcludedRange { start: 3, end: 5 },
+                WalExcludedRange { start: 6, end: 8 },
+            ]
+        } else {
+            vec![WalExcludedRange { start: 3, end: 5 }]
+        };
+        let manifest = manifest_store.read_latest_manifest().await.unwrap();
+        assert_eq!(manifest.manifest.core.wal_excluded_ranges, expected_ranges);
+        assert_eq!(db2.get(b"1").await.unwrap(), Some(Bytes::from_static(b"1")));
+        assert_eq!(db2.get(b"orphan").await.unwrap(), None);
+        db2.put(b"2", b"2").await.unwrap();
+        db2.flush_with_options(FlushOptions {
+            flush_type: FlushType::Wal,
+        })
+        .await
+        .unwrap();
+
+        // then: a later replay recovers both keys and not the orphan.
+        let db3 = Db::builder(path.clone(), object_store.clone())
+            .with_settings(settings)
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(db3.get(b"1").await.unwrap(), Some(Bytes::from_static(b"1")));
+        assert_eq!(db3.get(b"2").await.unwrap(), Some(Bytes::from_static(b"2")));
+        assert_eq!(db3.get(b"orphan").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn test_takeover_after_a_crash_before_the_fence() {
+        takeover_after_an_interrupted_takeover(false).await;
+    }
+
+    #[tokio::test]
+    async fn test_takeover_after_a_crash_before_the_fills() {
+        takeover_after_an_interrupted_takeover(true).await;
+    }
+
+    #[tokio::test]
+    async fn test_l0_flush_and_wal_gc_after_takeover_keep_the_orphan_hidden() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("/tmp/test_l0_flush_and_wal_gc_after_takeover");
+        let settings = test_db_options(0, 1024 * 1024, None);
+        let wal_store = WalTableStore::new(
+            object_store.clone(),
+            SsTableFormat::default(),
+            path.clone(),
+            TableStoreKind::Main,
+        );
+
+        // given: a takeover excluded 3 to 5 with an orphan at 4. The new
+        // writer writes key 2 at WAL 6, and an L0 flush moves the replay
+        // boundary past the range.
+        let db2 = test_utils::open_after_takeover_with_an_orphan(
+            &path,
+            object_store.clone(),
+            settings.clone(),
+        )
+        .await;
+        db2.put(b"2", b"2").await.unwrap();
+        db2.flush_with_options(FlushOptions {
+            flush_type: FlushType::MemTable,
+        })
+        .await
+        .unwrap();
+        db2.close().await.unwrap();
+        let manifest = ManifestStore::new(&path, object_store.clone())
+            .read_latest_manifest()
+            .await
+            .unwrap();
+        assert!(manifest.manifest.core.replay_after_wal_id >= 5);
+
+        // when: WAL GC runs with no minimum age.
+        let gc_options = GarbageCollectorOptions {
+            wal_options: Some(GarbageCollectorDirectoryOptions {
+                interval: None,
+                min_age: Duration::from_millis(0),
+                dry_run: false,
+            }),
+            wal_fence_options: None,
+            manifest_options: None,
+            compacted_options: None,
+            compactions_options: None,
+            detach_options: None,
+            metric_level: None,
+            boundary_files_enabled: true,
+            object_store_max_retries: None,
+        };
+        GarbageCollectorBuilder::new(path.clone(), object_store.clone())
+            .with_options(gc_options)
+            .build()
+            .run_gc_once()
+            .await;
+
+        // then: GC deleted the data file and the orphan below the boundary,
+        // and kept the fences.
+        let remaining: Vec<(u64, u64)> = wal_store
+            .list_wal_ssts(..WalFileId::from(6))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|wal| (wal.id.value(), wal.metadata.size))
+            .collect();
+        assert_eq!(remaining, vec![(1, 0), (3, 0), (5, 0)]);
+
+        // then: later writers recover every acknowledged write and never the
+        // orphan.
+        let db3 = Db::builder(path.clone(), object_store.clone())
+            .with_settings(settings.clone())
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(db3.get(b"1").await.unwrap(), Some(Bytes::from_static(b"1")));
+        assert_eq!(db3.get(b"2").await.unwrap(), Some(Bytes::from_static(b"2")));
+        assert_eq!(db3.get(b"orphan").await.unwrap(), None);
+        db3.put(b"3", b"3").await.unwrap();
+        db3.flush_with_options(FlushOptions {
+            flush_type: FlushType::Wal,
+        })
+        .await
+        .unwrap();
+        let db4 = Db::builder(path.clone(), object_store.clone())
+            .with_settings(settings)
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(db4.get(b"2").await.unwrap(), Some(Bytes::from_static(b"2")));
+        assert_eq!(db4.get(b"3").await.unwrap(), Some(Bytes::from_static(b"3")));
+        assert_eq!(db4.get(b"orphan").await.unwrap(), None);
     }
 
     #[tokio::test]
@@ -7945,6 +8358,7 @@ mod tests {
             l0_max_ssts: 8,
             l0_max_ssts_per_key: 8,
             l0_flush_parallelism: 1,
+            max_inflight_wal_uploads: 1,
             min_filter_keys,
             l0_sst_size_bytes,
             max_wal_flushes_before_l0_flush: 4096,

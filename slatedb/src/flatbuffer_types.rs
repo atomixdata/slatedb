@@ -29,7 +29,7 @@ pub(crate) use root_generated::{
     BlockMeta, BlockMetaArgs, BlockStats as FbBlockStats, BlockStatsArgs as FbBlockStatsArgs,
     FilterFormat as FbFilterFormat, ManifestV1, ManifestV2, ManifestV2Args, SsTableIndex,
     SsTableIndexArgs, SsTableInfo as FbSsTableInfo, SsTableInfoArgs, SstStats as FbSstStats,
-    SstStatsArgs as FbSstStatsArgs,
+    SstStatsArgs as FbSstStatsArgs, WalExcludedRange as FbWalExcludedRange,
 };
 
 use crate::config::CompressionCodec;
@@ -54,13 +54,19 @@ use crate::flatbuffer_types::root_generated::{
     ManifestV1Args, SortedRun as FbSortedRunV1, SortedRunArgs as FbSortedRunV1Args,
 };
 use crate::format::sst::SST_FORMAT_VERSION;
-use crate::manifest::{ExternalDb, LsmTreeState, Manifest, ManifestCore, Segment};
+use crate::manifest::{
+    ExternalDb, LsmTreeState, Manifest, ManifestCore, Segment, WalExcludedRange,
+};
 use crate::partitioned_keyspace::RangePartitionedKeySpace;
 use crate::seq_tracker::SequenceTracker;
 use crate::utils::clamp_allocated_size_bytes;
 use slatedb_txn_obj::ObjectCodec;
 
 pub(crate) const MANIFEST_FORMAT_VERSION: u16 = 2;
+/// Same layout as version 2. A manifest uses it when
+/// `wal_excluded_range_max_size` is above 1, so binaries without excluded WAL
+/// ranges refuse the database.
+pub(crate) const MANIFEST_FORMAT_VERSION_WAL_EXCLUDED_RANGES: u16 = 3;
 /// v2 (current) adds the `DrainSegmentSpec` union variant per RFC-0024 and
 /// persists the tiered destination explicitly so L0-only compactions round-trip
 /// across restart. v1 files have no destination field and infer it from SR
@@ -194,7 +200,7 @@ impl ObjectCodec<Manifest> for FlatBufferManifestCodec {
                 )?;
                 Self::manifest_v1(&manifest)
             }
-            2 => {
+            MANIFEST_FORMAT_VERSION | MANIFEST_FORMAT_VERSION_WAL_EXCLUDED_RANGES => {
                 let manifest = flatbuffers::root_with_opts::<ManifestV2>(
                     &verifier_options(),
                     unversioned_bytes.as_ref(),
@@ -203,7 +209,7 @@ impl ObjectCodec<Manifest> for FlatBufferManifestCodec {
             }
             _ => Err(Box::new(SlateDBError::InvalidVersion {
                 format_name: "manifest",
-                supported_versions: vec![1, 2],
+                supported_versions: vec![1, 2, 3],
                 actual_version: version,
             })),
         }
@@ -337,6 +343,9 @@ impl FlatBufferManifestCodec {
             segment_extractor_name: None,
             next_wal_sst_id: manifest.wal_id_last_seen() + 1,
             replay_after_wal_id: manifest.replay_after_wal_id(),
+            // V1 manifests predate concurrent WAL uploads.
+            wal_excluded_range_max_size: 1,
+            wal_excluded_ranges: vec![],
             last_l0_seq: manifest.last_l0_seq(),
             last_l0_clock_tick: manifest.last_l0_clock_tick(),
             checkpoints,
@@ -372,6 +381,30 @@ impl FlatBufferManifestCodec {
     pub(crate) fn manifest_v2(
         manifest: &ManifestV2,
     ) -> Result<Manifest, Box<dyn std::error::Error + Send + Sync>> {
+        // A size of 0 would make a takeover exclude an empty range.
+        if manifest.wal_excluded_range_max_size() == 0 {
+            return Err(Box::new(SlateDBError::InvalidDBState));
+        }
+        let wal_excluded_ranges: Vec<WalExcludedRange> = manifest
+            .wal_excluded_ranges()
+            .map(|ranges| {
+                ranges
+                    .iter()
+                    .map(|range| WalExcludedRange {
+                        start: range.start(),
+                        end: range.end(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        // Ranges are sorted, do not overlap, and are not empty.
+        let mut previous_end = None;
+        for range in &wal_excluded_ranges {
+            if range.end < range.start || previous_end.is_some_and(|end| range.start <= end) {
+                return Err(Box::new(SlateDBError::InvalidDBState));
+            }
+            previous_end = Some(range.end);
+        }
         let sst_lookup: std::collections::HashMap<Ulid, SsTableHandle> = manifest
             .ssts()
             .iter()
@@ -454,6 +487,8 @@ impl FlatBufferManifestCodec {
             segment_extractor_name,
             next_wal_sst_id: manifest.wal_id_last_seen() + 1,
             replay_after_wal_id: manifest.replay_after_wal_id(),
+            wal_excluded_range_max_size: manifest.wal_excluded_range_max_size(),
+            wal_excluded_ranges,
             last_l0_seq: manifest.last_l0_seq(),
             last_l0_clock_tick: manifest.last_l0_clock_tick(),
             checkpoints,
@@ -1340,6 +1375,17 @@ impl<'b> DbFlatBufferBuilder<'b> {
         let sequence_tracker_data = core.sequence_tracker.to_bytes();
         let sequence_tracker = self.builder.create_vector(sequence_tracker_data.as_slice());
 
+        let wal_excluded_ranges = if core.wal_excluded_ranges.is_empty() {
+            None
+        } else {
+            let ranges: Vec<FbWalExcludedRange> = core
+                .wal_excluded_ranges
+                .iter()
+                .map(|range| FbWalExcludedRange::new(range.start, range.end))
+                .collect();
+            Some(self.builder.create_vector(&ranges))
+        };
+
         let manifest = ManifestV2::create(
             &mut self.builder,
             &ManifestV2Args {
@@ -1361,11 +1407,18 @@ impl<'b> DbFlatBufferBuilder<'b> {
                 sequence_tracker: Some(sequence_tracker),
                 segments: Some(segments),
                 segment_extractor_name,
+                wal_excluded_range_max_size: core.wal_excluded_range_max_size,
+                wal_excluded_ranges,
             },
         );
         self.builder.finish(manifest, None);
+        let version = if core.wal_excluded_range_max_size > 1 {
+            MANIFEST_FORMAT_VERSION_WAL_EXCLUDED_RANGES
+        } else {
+            MANIFEST_FORMAT_VERSION
+        };
         let mut bytes = BytesMut::new();
-        bytes.put_u16(MANIFEST_FORMAT_VERSION);
+        bytes.put_u16(version);
         bytes.put_slice(self.builder.finished_data());
         bytes.into()
     }
@@ -1571,7 +1624,9 @@ mod tests {
     use crate::flatbuffer_types::{
         FlatBufferCompactionsCodec, FlatBufferManifestCodec, SsTableIndexOwned,
     };
-    use crate::manifest::{ExternalDb, LsmTreeState, Manifest, ManifestCore, Segment};
+    use crate::manifest::{
+        ExternalDb, LsmTreeState, Manifest, ManifestCore, Segment, WalExcludedRange,
+    };
     use crate::subcompaction::Subcompaction;
     use crate::{checkpoint, error::SlateDBError};
     use rstest::rstest;
@@ -1587,7 +1642,10 @@ mod tests {
     use chrono::{DateTime, Utc};
 
     use super::root_generated::CompactionStatus as FbCompactionStatus;
-    use super::{root_generated, COMPACTIONS_FORMAT_VERSION, MANIFEST_FORMAT_VERSION};
+    use super::{
+        root_generated, COMPACTIONS_FORMAT_VERSION, MANIFEST_FORMAT_VERSION,
+        MANIFEST_FORMAT_VERSION_WAL_EXCLUDED_RANGES,
+    };
 
     #[test]
     fn test_should_encode_decode_manifest_checkpoints() {
@@ -1846,7 +1904,7 @@ mod tests {
 
         // Test unsupported version
         let mut bytes = BytesMut::with_capacity(2 + fb_data.len());
-        bytes.put_u16(MANIFEST_FORMAT_VERSION + 1);
+        bytes.put_u16(MANIFEST_FORMAT_VERSION_WAL_EXCLUDED_RANGES + 1);
         bytes.put_slice(fb_data);
         let invalid_bytes = bytes.freeze();
 
@@ -1861,11 +1919,36 @@ mod tests {
                     panic!("Expected SlateDBError::InvalidVersion but got {:?}", err);
                 };
                 assert_eq!(*format_name, "manifest");
-                assert_eq!(*supported_versions, vec![1u16, 2]);
-                assert_eq!(*actual_version, MANIFEST_FORMAT_VERSION + 1);
+                assert_eq!(*supported_versions, vec![1u16, 2, 3]);
+                assert_eq!(
+                    *actual_version,
+                    MANIFEST_FORMAT_VERSION_WAL_EXCLUDED_RANGES + 1
+                );
             }
             _ => panic!("Should fail with version mismatch"),
         }
+    }
+
+    #[test]
+    fn test_should_round_trip_wal_excluded_ranges() {
+        let mut manifest = Manifest::initial(ManifestCore::new());
+        assert_eq!(manifest.core.wal_excluded_range_max_size, 1);
+        assert!(manifest.core.wal_excluded_ranges.is_empty());
+        manifest.core.wal_excluded_range_max_size = 5;
+        manifest.core.wal_excluded_ranges = vec![
+            WalExcludedRange { start: 3, end: 5 },
+            WalExcludedRange { start: 9, end: 13 },
+        ];
+
+        let codec = FlatBufferManifestCodec {};
+        let bytes = FlatBufferManifestCodec::create_from_manifest(&manifest);
+        let decoded = codec.decode(&bytes).unwrap();
+
+        assert_eq!(
+            u16::from_be_bytes([bytes[0], bytes[1]]),
+            MANIFEST_FORMAT_VERSION_WAL_EXCLUDED_RANGES
+        );
+        assert_eq!(manifest, decoded);
     }
 
     #[test]
