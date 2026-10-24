@@ -84,6 +84,18 @@ pub use builder::DbReaderBuilder;
 
 pub(crate) mod builder;
 
+/// What [`DbInner::replay_wal`] replayed into memtables.
+#[derive(Debug, Default)]
+pub(crate) struct WalReplayStats {
+    /// The manifest's `replay_after_wal_id`.
+    pub(crate) after_wal_id: u64,
+    /// The last WAL ID replayed, or `after_wal_id` if none was.
+    pub(crate) last_wal_id: u64,
+    pub(crate) memtables: usize,
+    pub(crate) rows: usize,
+    pub(crate) bytes: usize,
+}
+
 pub(crate) struct DbInner {
     pub(crate) state: Arc<RwLock<DbState>>,
     pub(crate) settings: Settings,
@@ -449,7 +461,10 @@ impl DbInner {
         }
     }
 
-    async fn replay_wal(&self, wal_iterator: Box<dyn WalIterator>) -> Result<(), SlateDBError> {
+    async fn replay_wal(
+        &self,
+        wal_iterator: Box<dyn WalIterator>,
+    ) -> Result<WalReplayStats, SlateDBError> {
         let mut current_memtable_wal_id = self
             .state
             .read()
@@ -463,7 +478,7 @@ impl DbInner {
             Arc::clone(&self.fp_registry),
             "replay-wal-pause",
             writer_epoch == 1,
-            |_| -> Result<(), SlateDBError> { Ok(()) }
+            |_| -> Result<WalReplayStats, SlateDBError> { Ok(WalReplayStats::default()) }
         );
 
         let replay_options = WalReplayOptions {
@@ -472,6 +487,11 @@ impl DbInner {
             ..Default::default()
         };
 
+        let mut stats = WalReplayStats {
+            after_wal_id: current_memtable_wal_id,
+            last_wal_id: current_memtable_wal_id,
+            ..WalReplayStats::default()
+        };
         let db_state = self.state.read().state().core().clone();
         let mut replay_iter = WalReplayIterator::for_wal_iterator(
             wal_iterator,
@@ -530,6 +550,11 @@ impl DbInner {
             self.maybe_freeze_memtable(current_memtable_wal_id);
             self.maybe_apply_backpressure().await?;
             let replayed_table_last_wal_id = replayed_table.last_wal_id;
+            let metadata = replayed_table.table.table().metadata();
+            stats.memtables += 1;
+            stats.rows += metadata.entry_num;
+            stats.bytes += metadata.entries_size_in_bytes;
+            stats.last_wal_id = replayed_table_last_wal_id;
             self.replay_memtable(current_memtable_wal_id, replayed_table)?;
             current_memtable_wal_id = replayed_table_last_wal_id;
         }
@@ -538,7 +563,7 @@ impl DbInner {
         self.status_manager
             .report_memtable_segments(collect_touched_segments(&guard.view()));
 
-        Ok(())
+        Ok(stats)
     }
 
     async fn preload_cache(
@@ -699,6 +724,17 @@ impl Db {
         // Mark the database as closed before flushing.
         self.inner.status_manager.write_result(Ok(()));
 
+        // Each step's duration, for the closing log line.
+        let clock = Arc::clone(&self.inner.system_clock);
+        let started = clock.now();
+        let mut step_started = started;
+        let mut step_ms = || {
+            let now = clock.now();
+            let ms = (now - step_started).num_milliseconds();
+            step_started = now;
+            ms
+        };
+
         let result = if let Some(flush_type) = flush_type {
             self.inner
                 .flush(FlushOptions { flush_type }, false)
@@ -709,11 +745,15 @@ impl Db {
             Ok(())
         };
 
+        let flush_ms = step_ms();
+
         MemtableFlusher::shutdown(&self.task_executor).await;
+        let memtable_flusher_ms = step_ms();
 
         if let Err(e) = self.task_executor.shutdown_task(COMPACTOR_TASK_NAME).await {
             warn!("failed to shutdown compactor task [error={:?}]", e);
         }
+        let compactor_ms = step_ms();
 
         if let Err(e) = self
             .task_executor
@@ -722,10 +762,12 @@ impl Db {
         {
             warn!("failed to shutdown compaction worker task [error={:?}]", e);
         }
+        let compaction_worker_ms = step_ms();
 
         if let Err(e) = self.task_executor.shutdown_task(GC_TASK_NAME).await {
             warn!("failed to shutdown garbage collector task [error={:?}]", e);
         }
+        let gc_ms = step_ms();
 
         if let Err(e) = self
             .task_executor
@@ -734,12 +776,24 @@ impl Db {
         {
             warn!("failed to shutdown writer task [error={:?}]", e);
         }
+        let writer_ms = step_ms();
 
         if let Err(e) = self.inner.table_store.close_cache().await {
             warn!("failed to close block cache [error={:?}]", e);
         }
+        let cache_ms = step_ms();
 
-        info!("db closed");
+        info!(
+            "db closed [flush_ms={}, memtable_flusher_ms={}, compactor_ms={}, compaction_worker_ms={}, gc_ms={}, writer_ms={}, cache_ms={}, total_ms={}]",
+            flush_ms,
+            memtable_flusher_ms,
+            compactor_ms,
+            compaction_worker_ms,
+            gc_ms,
+            writer_ms,
+            cache_ms,
+            (clock.now() - started).num_milliseconds()
+        );
         result
     }
 

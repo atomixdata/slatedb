@@ -612,8 +612,11 @@ impl<P: Into<Path>> DbBuilder<P> {
             &path,
             retrying_main_object_store.clone(),
         ));
+        // Each step's duration, for the log line once the database is open.
+        let open_started = system_clock.now();
         let latest_manifest =
             StoredManifest::try_load(manifest_store.clone(), system_clock.clone()).await?;
+        let manifest_load_ms = (system_clock.now() - open_started).num_milliseconds();
 
         if let Some(latest_manifest) = &latest_manifest {
             latest_manifest
@@ -704,11 +707,13 @@ impl<P: Into<Path>> DbBuilder<P> {
             task_executor.clone(),
             self.wal_writer_init,
         );
+        let fence_started = system_clock.now();
         let WriterFenceResult {
             manifest,
             replay_iterator,
             mut wal_writer,
         } = fencer.fence(stored_manifest, self.expected_epoch).await?;
+        let fence_ms = (system_clock.now() - fence_started).num_milliseconds();
         let (wal_writer, wal_observer) = if DbInner::wal_enabled_in_options(&self.settings) {
             let wal_observer = wal_writer.observer();
             (Some(wal_writer), wal_observer)
@@ -914,7 +919,9 @@ impl<P: Into<Path>> DbBuilder<P> {
         task_executor.monitor_on(&tokio_handle)?;
 
         // Replay WAL
-        inner.replay_wal(replay_iterator).await?;
+        let replay_started = system_clock.now();
+        let replayed = inner.replay_wal(replay_iterator).await?;
+        let replay_ms = (system_clock.now() - replay_started).num_milliseconds();
 
         // Preload cache if enabled
         if let Some(cached_obj_store) = cached_object_store {
@@ -924,6 +931,17 @@ impl<P: Into<Path>> DbBuilder<P> {
         }
 
         // Create and return the Db instance
+        info!(
+            "opened db [manifest_load_ms={}, fence_ms={}, wal_replay_ms={}, replayed_wal_ids={}, replayed_memtables={}, replayed_rows={}, replayed_bytes={}, total_ms={}]",
+            manifest_load_ms,
+            fence_ms,
+            replay_ms,
+            replayed.last_wal_id - replayed.after_wal_id,
+            replayed.memtables,
+            replayed.rows,
+            replayed.bytes,
+            (system_clock.now() - open_started).num_milliseconds()
+        );
         Ok(Db {
             inner,
             task_executor,
