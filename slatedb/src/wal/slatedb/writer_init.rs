@@ -104,7 +104,7 @@ impl wal::WriterInit for SlateDbWalWriterInit {
                 WalExcludedRanges::known(&writer_manifest.manifest().core().wal_excluded_ranges);
             frontier = self
                 .table_store
-                .walk_to_frontier(frontier.into(), &excluded_ranges)
+                .walk_to_frontier_from_tail(frontier.into(), &excluded_ranges, window)
                 .await?
                 .value();
             fail_point_send!(self.fp_tx, "WalkToFrontier");
