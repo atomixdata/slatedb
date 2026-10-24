@@ -1778,6 +1778,17 @@ pub struct GarbageCollectorOptions {
     /// behind. The default is `None`.
     #[serde(default)]
     pub wal_deletes_per_second: Option<u32>,
+
+    /// How many WAL objects one GC delete request removes. `None` or `1` deletes
+    /// them one by one.
+    ///
+    /// On an object store with a bulk delete API, such as S3 DeleteObjects, a
+    /// batch removes many objects with one request. On RustFS this costs about a
+    /// third of the CPU per object, because the store takes one lock batch and
+    /// sends one delete call per drive for the whole batch. Batches keep the
+    /// `wal_deletes_per_second` limit. S3 takes up to 1,000 keys per request.
+    #[serde(default)]
+    pub wal_delete_batch_size: Option<usize>,
 }
 
 impl GarbageCollectorOptions {
@@ -1882,6 +1893,7 @@ impl Default for GarbageCollectorOptions {
             object_store_max_retries: None,
             wal_collect_by_id: false,
             wal_deletes_per_second: None,
+            wal_delete_batch_size: None,
         }
     }
 }

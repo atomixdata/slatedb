@@ -647,6 +647,11 @@ pub struct GarbageCollectorOptions {
     /// behind.
     #[uniffi(default = None)]
     pub wal_deletes_per_second: Option<u32>,
+    /// How many WAL objects one GC delete request removes. `None` (default) or `1` deletes them
+    /// one by one. On a store with a bulk delete API, a batch removes many objects with one
+    /// request.
+    #[uniffi(default = None)]
+    pub wal_delete_batch_size: Option<u64>,
 }
 
 impl Default for GarbageCollectorOptions {
@@ -663,6 +668,7 @@ impl Default for GarbageCollectorOptions {
             object_store_max_retries: core.object_store_max_retries,
             wal_collect_by_id: core.wal_collect_by_id,
             wal_deletes_per_second: core.wal_deletes_per_second,
+            wal_delete_batch_size: core.wal_delete_batch_size.map(|size| size as u64),
         }
     }
 }
@@ -699,6 +705,7 @@ impl From<GarbageCollectorOptions> for slatedb::config::GarbageCollectorOptions 
             object_store_max_retries: value.object_store_max_retries,
             wal_collect_by_id: value.wal_collect_by_id,
             wal_deletes_per_second: value.wal_deletes_per_second,
+            wal_delete_batch_size: value.wal_delete_batch_size.map(|size| size as usize),
         }
     }
 }

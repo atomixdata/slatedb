@@ -302,6 +302,7 @@ mod tests {
                 object_store_max_retries: None,
                 wal_collect_by_id: false,
                 wal_deletes_per_second: None,
+                wal_delete_batch_size: None,
             };
             let gc = GarbageCollector::new(
                 self.manifest_store.clone(),

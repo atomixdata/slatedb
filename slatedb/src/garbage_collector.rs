@@ -221,17 +221,6 @@ impl MessageHandler<GcMessage> for GarbageCollector {
     }
 }
 
-/// The environment variable with the number of WAL objects one GC delete
-/// request removes. Unset or 1 deletes them one by one.
-const WAL_DELETE_BATCH_ENV: &str = "SLATEDB_WAL_DELETE_BATCH";
-
-fn wal_delete_batch_size() -> usize {
-    std::env::var(WAL_DELETE_BATCH_ENV)
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(1)
-}
-
 impl GarbageCollector {
     /// Creates a new `GarbageCollector` instance.
     ///
@@ -278,7 +267,7 @@ impl GarbageCollector {
                     )
                     .with_collect_by_id(options.wal_collect_by_id)
                     .with_deletes_per_second(options.wal_deletes_per_second)
-                    .with_delete_batch_size(wal_delete_batch_size()),
+                    .with_delete_batch_size(options.wal_delete_batch_size.unwrap_or(1)),
                 )
             });
             WalGcTask::new(
@@ -299,7 +288,7 @@ impl GarbageCollector {
                     system_clock.clone(),
                 )
                 .with_deletes_per_second(options.wal_deletes_per_second)
-                .with_delete_batch_size(wal_delete_batch_size()),
+                .with_delete_batch_size(options.wal_delete_batch_size.unwrap_or(1)),
             );
             WalGcTask::new(
                 manifest_store.clone(),
@@ -1235,6 +1224,7 @@ mod tests {
             object_store_max_retries: None,
             wal_collect_by_id: false,
             wal_deletes_per_second: None,
+            wal_delete_batch_size: None,
         };
         let gc = GarbageCollector::new(
             manifest_store.clone(),
@@ -1308,6 +1298,7 @@ mod tests {
             object_store_max_retries: None,
             wal_collect_by_id: false,
             wal_deletes_per_second: None,
+            wal_delete_batch_size: None,
         };
         let recorder = Arc::new(DefaultMetricsRecorder::new());
         let helper = MetricsRecorderHelper::new(recorder.clone(), Default::default());
@@ -1380,6 +1371,7 @@ mod tests {
             object_store_max_retries: None,
             wal_collect_by_id: false,
             wal_deletes_per_second: None,
+            wal_delete_batch_size: None,
         };
         let gc = GarbageCollector::new(
             manifest_store.clone(),
@@ -1465,6 +1457,7 @@ mod tests {
             object_store_max_retries: None,
             wal_collect_by_id: false,
             wal_deletes_per_second: None,
+            wal_delete_batch_size: None,
         };
         let gc = GarbageCollector::new(
             manifest_store.clone(),
@@ -1953,6 +1946,7 @@ mod tests {
             object_store_max_retries: None,
             wal_collect_by_id: false,
             wal_deletes_per_second: None,
+            wal_delete_batch_size: None,
         };
 
         let gc = GarbageCollector::new(
@@ -2035,6 +2029,7 @@ mod tests {
             object_store_max_retries: None,
             wal_collect_by_id: false,
             wal_deletes_per_second: None,
+            wal_delete_batch_size: None,
         };
 
         let mut gc = GarbageCollector::new(
@@ -2112,6 +2107,7 @@ mod tests {
             object_store_max_retries: None,
             wal_collect_by_id: false,
             wal_deletes_per_second: None,
+            wal_delete_batch_size: None,
         };
 
         let gc = GarbageCollector::new(
@@ -2167,6 +2163,7 @@ mod tests {
             object_store_max_retries: None,
             wal_collect_by_id: false,
             wal_deletes_per_second: None,
+            wal_delete_batch_size: None,
         };
 
         let mut gc = GarbageCollector::new(
@@ -2226,6 +2223,7 @@ mod tests {
             object_store_max_retries: None,
             wal_collect_by_id: false,
             wal_deletes_per_second: None,
+            wal_delete_batch_size: None,
         };
 
         let gc = GarbageCollector::new(
@@ -2561,6 +2559,7 @@ mod tests {
             object_store_max_retries: None,
             wal_collect_by_id: false,
             wal_deletes_per_second: None,
+            wal_delete_batch_size: None,
         };
         let recorder = MetricsRecorderHelper::noop();
         let gc = GarbageCollector::new(
@@ -2666,6 +2665,7 @@ mod tests {
             object_store_max_retries: None,
             wal_collect_by_id: false,
             wal_deletes_per_second: None,
+            wal_delete_batch_size: None,
         };
         let recorder = Arc::new(DefaultMetricsRecorder::new());
         let helper = MetricsRecorderHelper::new(recorder.clone(), Default::default());
@@ -2802,6 +2802,7 @@ mod tests {
             object_store_max_retries: None,
             wal_collect_by_id: false,
             wal_deletes_per_second: None,
+            wal_delete_batch_size: None,
         };
         let recorder = MetricsRecorderHelper::noop();
         let gc = GarbageCollector::new(
