@@ -37,7 +37,7 @@ use futures::{FutureExt, StreamExt};
 use object_store::path::Path;
 use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions,
 };
 use slatedb_common::metrics::MetricsRecorderHelper;
 
@@ -215,20 +215,30 @@ impl ObjectStore for InstrumentedObjectStore {
         &self,
         locations: BoxStream<'static, object_store::Result<Path>>,
     ) -> BoxStream<'static, object_store::Result<Path>> {
+        // Passes on the batches that callers send, so a store with a bulk delete
+        // API deletes them with few requests. Each delete records the time of its
+        // batch.
         let stats = Arc::clone(&self.stats);
         let inner = Arc::clone(&self.inner);
         locations
-            .then(move |loc| {
+            .ready_chunks(crate::utils::DELETE_BATCH_MAX)
+            .then(move |batch| {
                 let stats = Arc::clone(&stats);
                 let inner = Arc::clone(&inner);
                 async move {
-                    let loc = loc?;
                     let start = Instant::now();
-                    let result = inner.delete(&loc).await;
-                    stats.delete.record(start.elapsed(), result.is_ok());
-                    result.map(|_| loc)
+                    let results: Vec<_> = inner
+                        .delete_stream(futures::stream::iter(batch).boxed())
+                        .collect()
+                        .await;
+                    let elapsed = start.elapsed();
+                    for result in &results {
+                        stats.delete.record(elapsed, result.is_ok());
+                    }
+                    futures::stream::iter(results)
                 }
             })
+            .flatten()
             .boxed()
     }
 

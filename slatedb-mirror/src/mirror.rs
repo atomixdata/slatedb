@@ -40,6 +40,10 @@ use crate::startup::{recover, warm};
 use crate::{scan, MirrorError, MirrorHandle, MirrorPolicy, MultipartRoute, ReadRoute, WriteRoute};
 use slatedb_common::vfs::{StdVfs, Vfs};
 
+/// The most paths that one batch of a `delete_stream` call passes to the remote
+/// store. S3's DeleteObjects takes up to 1,000 keys.
+const DELETE_BATCH_MAX: usize = 1000;
+
 /// The default for [`ObjectStoreMirrorBuilder::with_download_concurrency`].
 pub const DEFAULT_DOWNLOAD_CONCURRENCY: usize = 8;
 
@@ -447,16 +451,34 @@ impl ObjectStore for ObjectStoreMirror {
         &self,
         locations: BoxStream<'static, object_store::Result<Path>>,
     ) -> BoxStream<'static, object_store::Result<Path>> {
+        // Passes on the batches that callers send, so a store with a bulk delete
+        // API deletes them with few requests.
         let inner = Arc::clone(&self.inner);
         locations
-            .then(move |location| {
+            .ready_chunks(DELETE_BATCH_MAX)
+            .then(move |batch| {
                 let inner = Arc::clone(&inner);
                 async move {
-                    let location = location?;
-                    inner.delete(&location).await?;
-                    Ok(location)
+                    let mut results = Vec::with_capacity(batch.len());
+                    let mut paths = Vec::with_capacity(batch.len());
+                    for location in batch {
+                        match location {
+                            Ok(path) => paths.push(path),
+                            Err(e) => results.push(Err(e)),
+                        }
+                    }
+                    let unique: std::collections::HashSet<&Path> = paths.iter().collect();
+                    if unique.len() == paths.len() {
+                        results.extend(inner.delete_batch(paths).await);
+                    } else {
+                        for path in paths {
+                            results.push(inner.delete(&path).await.map(|()| path));
+                        }
+                    }
+                    stream::iter(results)
                 }
             })
+            .flatten()
             .boxed()
     }
 
@@ -707,6 +729,8 @@ mod tests {
         puts: AtomicUsize,
         /// When set, each PUT takes a permit first.
         put_gate: Mutex<Option<Arc<Semaphore>>>,
+        /// The number of paths in each `delete_stream` call.
+        delete_batches: Mutex<Vec<usize>>,
     }
 
     impl fmt::Display for TestStore {
@@ -774,7 +798,11 @@ mod tests {
             &self,
             locations: BoxStream<'static, object_store::Result<Path>>,
         ) -> BoxStream<'static, object_store::Result<Path>> {
-            self.inner.delete_stream(locations)
+            // The tests pass streams whose items are all ready.
+            let paths: Vec<_> = futures::executor::block_on(futures::StreamExt::collect(locations));
+            self.delete_batches.lock().push(paths.len());
+            self.inner
+                .delete_stream(futures::StreamExt::boxed(futures::stream::iter(paths)))
         }
 
         fn list(
@@ -1430,6 +1458,38 @@ mod tests {
         fixture.mirror.delete(&path).await.unwrap();
         assert!(!fixture.handle().contains(&path));
         assert!(fixture.store.head(&path).await.is_err());
+        assert_eq!(fixture.files(), fixture.expected_files(&[]));
+    }
+
+    #[tokio::test]
+    async fn should_delete_a_batch_with_one_remote_call() {
+        use futures::{stream, StreamExt};
+        let fixture = Fixture::new().await;
+        let paths = vec![
+            Path::from(SST),
+            Path::from(SST2),
+            Path::from("db/compacted/01C.sst"),
+        ];
+        for path in &paths {
+            fixture
+                .mirror
+                .put(path, PutPayload::from_static(b"x"))
+                .await
+                .unwrap();
+        }
+
+        let deleted: Vec<Path> = fixture
+            .mirror
+            .delete_stream(stream::iter(paths.clone().into_iter().map(Ok)).boxed())
+            .map(Result::unwrap)
+            .collect()
+            .await;
+        assert_eq!(deleted, paths);
+        assert_eq!(*fixture.store.delete_batches.lock(), vec![3]);
+        for path in &paths {
+            assert!(!fixture.handle().contains(path));
+            assert!(fixture.store.head(path).await.is_err());
+        }
         assert_eq!(fixture.files(), fixture.expected_files(&[]));
     }
 

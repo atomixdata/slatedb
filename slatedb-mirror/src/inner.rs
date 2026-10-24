@@ -313,6 +313,56 @@ impl Inner {
         Ok(())
     }
 
+    /// Like [`Self::delete`] for several paths, but deletes them from the remote
+    /// store with one `delete_stream` call, so a store with a bulk delete API
+    /// deletes them with few requests. Returns one result per path, in order. A
+    /// path that the remote call did not delete gets an error. `paths` must not
+    /// repeat a path, because a second ticket for a path waits for the first.
+    pub(crate) async fn delete_batch(&self, paths: Vec<Path>) -> Vec<object_store::Result<Path>> {
+        let tickets: Vec<_> = paths
+            .iter()
+            .map(|path| {
+                self.ordering
+                    .register(path, OpKind::Delete)
+                    .expect("deletes are always queued")
+            })
+            .collect();
+        future::join_all(tickets.iter().map(|ticket| ticket.ready())).await;
+        let remote = self
+            .remote
+            .delete_stream(stream::iter(paths.clone().into_iter().map(Ok)).boxed())
+            .collect::<Vec<_>>();
+        let local = future::join_all(paths.iter().map(|path| self.remove_local(path)));
+        let (remote, local) = future::join(remote, local).await;
+        drop(tickets);
+        let mut deleted = std::collections::HashSet::with_capacity(paths.len());
+        for result in remote {
+            match result {
+                Ok(path) => {
+                    deleted.insert(path);
+                }
+                Err(object_store::Error::NotFound { path, .. }) => {
+                    deleted.insert(Path::from(path));
+                }
+                Err(error) => warn!("bulk delete failed [error={error}]"),
+            }
+        }
+        paths
+            .into_iter()
+            .zip(local)
+            .map(|(path, local)| {
+                if !deleted.contains(&path) {
+                    return Err(object_store::Error::Generic {
+                        store: MIRROR_STORE_NAME,
+                        source: format!("the bulk delete did not delete {path}").into(),
+                    });
+                }
+                local?;
+                Ok(path)
+            })
+            .collect()
+    }
+
     /// Like [`Self::delete`]'s local half, but removes the files even if the
     /// in-memory map doesn't have `path`. Used by the remote scan, which finds
     /// paths on disk.
