@@ -747,7 +747,7 @@ impl Db {
 
         let flush_ms = step_ms();
 
-        MemtableFlusher::shutdown(&self.task_executor).await;
+        MemtableFlusher::shutdown(&self.task_executor, clock.as_ref()).await;
         let memtable_flusher_ms = step_ms();
 
         if let Err(e) = self.task_executor.shutdown_task(COMPACTOR_TASK_NAME).await {

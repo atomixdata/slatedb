@@ -27,7 +27,8 @@ use crate::memtable_flusher::manifest_writer::ManifestWriter;
 use crate::memtable_flusher::tracker::FlushTracker;
 use crate::memtable_flusher::uploader::Uploader;
 use crate::utils::SafeSender;
-use log::warn;
+use log::{info, warn};
+use slatedb_common::SystemClock;
 use std::sync::Arc;
 use tokio::runtime::Handle;
 use tokio::sync::{oneshot, watch};
@@ -172,11 +173,22 @@ impl MemtableFlusher {
     /// here matters mainly for error shutdown: shutting down the uploader
     /// and manifest writer first ensures their final completion messages
     /// reach the tracker before it drains.
-    pub(crate) async fn shutdown(executor: &MessageHandlerExecutor) {
+    ///
+    /// Logs how long each step took, from `clock`.
+    pub(crate) async fn shutdown(executor: &MessageHandlerExecutor, clock: &dyn SystemClock) {
+        let started = clock.now();
         Uploader::shutdown(executor).await;
+        let uploaded = clock.now();
         ManifestWriter::shutdown(executor).await;
+        let manifest_written = clock.now();
         if let Err(e) = executor.shutdown_task(TRACKER_TASK_NAME).await {
             warn!("failed to shutdown l0 flush tracker [error={:?}]", e);
         }
+        info!(
+            "memtable flusher shut down [uploader_ms={}, manifest_writer_ms={}, tracker_ms={}]",
+            (uploaded - started).num_milliseconds(),
+            (manifest_written - uploaded).num_milliseconds(),
+            (clock.now() - manifest_written).num_milliseconds()
+        );
     }
 }

@@ -195,6 +195,7 @@ impl UploadHandler {
         // below. Every retry reuses this same value, so every attempt
         // keeps the same entries.
         let min_retention_seq = self.db.compute_min_retention_seq();
+        let started = self.db.system_clock.now();
         let first_seq = job
             .imm_memtable
             .table()
@@ -234,6 +235,11 @@ impl UploadHandler {
 
         let written_bytes: u64 = segments.iter().map(|s| s.encoded_bytes).sum();
         self.db.db_stats.l0_flush_bytes.increment(written_bytes);
+        info!(
+            "uploaded l0 [bytes={}, elapsed_ms={}]",
+            written_bytes,
+            (self.db.system_clock.now() - started).num_milliseconds()
+        );
 
         Ok(UploadedMemtable {
             imm_memtable: Arc::clone(&job.imm_memtable),

@@ -881,7 +881,8 @@ mod tests {
 
     impl StartedFlusher {
         async fn shutdown(&self) {
-            MemtableFlusher::shutdown(&self.executor).await;
+            MemtableFlusher::shutdown(&self.executor, &slatedb_common::DefaultSystemClock::new())
+                .await;
         }
 
         async fn shutdown_uploader_with_error(&self, err: SlateDBError) {
