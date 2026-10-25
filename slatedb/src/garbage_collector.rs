@@ -59,6 +59,9 @@ pub use filter::GcFilter;
 pub(crate) const DEFAULT_MIN_AGE: Duration = Duration::from_secs(300);
 pub(crate) const DEFAULT_INTERVAL: Duration = Duration::from_secs(600);
 pub(crate) const GC_TASK_NAME: &str = "garbage_collector";
+/// The WAL tasks run as a task of their own, so a long WAL pass (paced deletes
+/// of a large backlog) cannot hold up the other GC tasks.
+pub(crate) const WAL_GC_TASK_NAME: &str = "wal_garbage_collector";
 /// Maximum number of concurrent object-store deletes issued by a GC task's
 /// deletion pass. Deletes are independent single-object operations, so a small
 /// bounded fan-out keeps large backlogs tractable without overwhelming the
@@ -361,24 +364,43 @@ impl GarbageCollector {
     }
 
     pub(crate) fn start(&self) -> Result<(), crate::Error> {
-        let (_, rx) = async_channel::unbounded();
-        self.task_executor
-            .add_handler(
-                GC_TASK_NAME.to_string(),
-                Box::new(self.clone()),
-                rx,
-                &Handle::current(),
-            )
-            .map_err(crate::Error::from)?;
+        for (name, handler) in self.clone().into_handlers() {
+            // The garbage collector only uses tickers, so it gets a dummy rx channel.
+            let (_, rx) = async_channel::unbounded();
+            self.task_executor
+                .add_handler(name.to_string(), Box::new(handler), rx, &Handle::current())
+                .map_err(crate::Error::from)?;
+        }
         self.task_executor.monitor_on(&Handle::current())?;
         Ok(())
     }
 
+    /// Splits the collector into the tasks to run, by task name: the WAL tasks
+    /// under [`WAL_GC_TASK_NAME`] and the others under [`GC_TASK_NAME`].
+    pub(crate) fn into_handlers(self) -> Vec<(&'static str, GarbageCollector)> {
+        let mut others = self.clone();
+        others.options.wal_options = None;
+        others.options.wal_fence_options = None;
+        let mut handlers = vec![(GC_TASK_NAME, others)];
+        if self.options.wal_options.is_some() || self.options.wal_fence_options.is_some() {
+            let mut wal = self;
+            wal.options.manifest_options = None;
+            wal.options.compacted_options = None;
+            wal.options.compactions_options = None;
+            wal.options.detach_options = None;
+            handlers.push((WAL_GC_TASK_NAME, wal));
+        }
+        handlers
+    }
+
     pub(crate) async fn join(&self) -> Result<(), crate::Error> {
-        self.task_executor
-            .join_task(GC_TASK_NAME)
-            .await
-            .map_err(crate::Error::from)
+        for name in [GC_TASK_NAME, WAL_GC_TASK_NAME] {
+            self.task_executor
+                .join_task(name)
+                .await
+                .map_err(crate::Error::from)?;
+        }
+        Ok(())
     }
 
     /// Gracefully stops the garbage collector task and waits for it to finish.
@@ -386,10 +408,13 @@ impl GarbageCollector {
     /// ## Returns
     /// - `Ok(())` once the task has shut down, or [`SlateDBError`] if shutdown fails.
     pub async fn stop(&self) -> Result<(), crate::Error> {
-        self.task_executor
-            .shutdown_task(GC_TASK_NAME)
-            .await
-            .map_err(crate::Error::from)
+        for name in [GC_TASK_NAME, WAL_GC_TASK_NAME] {
+            self.task_executor
+                .shutdown_task(name)
+                .await
+                .map_err(crate::Error::from)?;
+        }
+        Ok(())
     }
 
     /// Run the garbage collector once.
@@ -2239,6 +2264,93 @@ mod tests {
             None,
         );
         gc.start().expect("failed to start garbage collector");
+        gc.stop().await.expect("failed to stop garbage collector");
+    }
+
+    /// A WAL GC whose pass never finishes, like a paced pass over a large backlog.
+    struct StuckWalGc {
+        entered: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl WalGc for StuckWalGc {
+        async fn collect(
+            &self,
+            _referenced_ranges: Vec<crate::wal::WalFileRange>,
+            _min_age: Duration,
+            _dry_run: bool,
+        ) -> Result<(), crate::wal::WalError> {
+            self.entered.notify_one();
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn test_into_handlers_runs_wal_gc_apart() {
+        let (manifest_store, compactions_store, table_store, wal_store, local_object_store) =
+            build_objects();
+        let mut stored_manifest = StoredManifest::create_new_db(
+            manifest_store.clone(),
+            ManifestCore::new(),
+            Arc::new(DefaultSystemClock::new()),
+        )
+        .await
+        .unwrap();
+        stored_manifest
+            .update(stored_manifest.prepare_dirty().unwrap())
+            .await
+            .unwrap();
+
+        let directory = GarbageCollectorDirectoryOptions {
+            min_age: Duration::from_secs(3600),
+            interval: Some(Duration::from_millis(10)),
+            dry_run: false,
+        };
+        let gc_opts = GarbageCollectorOptions {
+            manifest_options: Some(directory),
+            wal_options: Some(directory),
+            wal_fence_options: None,
+            compacted_options: None,
+            compactions_options: None,
+            detach_options: None,
+            metric_level: None,
+            boundary_files_enabled: true,
+            object_store_max_retries: None,
+            wal_collect_by_id: false,
+            wal_deletes_per_second: None,
+            wal_delete_batch_size: None,
+        };
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let gc = GarbageCollector::new(
+            manifest_store.clone(),
+            compactions_store,
+            table_store,
+            wal_store,
+            Arc::new(object_store::memory::InMemory::new()),
+            gc_opts,
+            &MetricsRecorderHelper::noop(),
+            Arc::new(DefaultSystemClock::default()),
+            None,
+            Some(Arc::new(StuckWalGc {
+                entered: Arc::clone(&entered),
+            })),
+        );
+        gc.start().expect("failed to start garbage collector");
+        entered.notified().await;
+
+        // Manifest 1 becomes old enough to delete only while the WAL pass is stuck.
+        set_modified(
+            local_object_store,
+            &Path::from(format!("manifest/{:020}.{}", 1, "manifest")),
+            86400,
+        );
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while manifest_store.list_manifests(..).await.unwrap().len() > 1 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("manifest GC waited for the WAL GC");
         gc.stop().await.expect("failed to stop garbage collector");
     }
 
