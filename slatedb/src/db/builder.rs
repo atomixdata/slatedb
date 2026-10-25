@@ -147,7 +147,6 @@ use crate::error::SlateDBError;
 use crate::fence::{WriterFenceResult, WriterFencer};
 use crate::filter_policy::{BloomFilterPolicy, FilterPolicy};
 use crate::format::sst::{BlockTransformer, SsTableFormat};
-use crate::garbage_collector::GC_TASK_NAME;
 use crate::garbage_collector::{GarbageCollector, GcFilter};
 use crate::instrumented_object_store::{InstrumentedObjectStore, ObjectStoreComponent};
 use crate::manifest::store::{ManifestStore, StoredManifest};
@@ -908,10 +907,12 @@ impl<P: Into<Path>> DbBuilder<P> {
                     compactions_store.clone(),
                     gc_object_store,
                 );
-            // Garbage collector only uses tickers, so pass in a dummy rx channel
-            let (_, rx) = async_channel::unbounded();
             let gc_handle = self.gc_runtime.as_ref().unwrap_or(&tokio_handle);
-            task_executor.add_handler(GC_TASK_NAME.to_string(), Box::new(gc), rx, gc_handle)?;
+            for (name, handler) in gc.into_handlers() {
+                // Garbage collector only uses tickers, so pass in a dummy rx channel
+                let (_, rx) = async_channel::unbounded();
+                task_executor.add_handler(name.to_string(), Box::new(handler), rx, gc_handle)?;
+            }
         }
 
         // Start the memtable flusher before WAL replay so that

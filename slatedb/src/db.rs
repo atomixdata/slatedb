@@ -35,7 +35,7 @@ use object_store::{parse_url_opts, ObjectStore};
 use crate::compactor::COMPACTOR_TASK_NAME;
 use crate::db_transaction::DbTransaction;
 use crate::dispatcher::MessageHandlerExecutor;
-use crate::garbage_collector::GC_TASK_NAME;
+use crate::garbage_collector::{GC_TASK_NAME, WAL_GC_TASK_NAME};
 use crate::transaction_manager::IsolationLevel;
 use crate::{db_cache_manager, CloseReason};
 use log::{debug, info, trace, warn};
@@ -723,8 +723,13 @@ impl Db {
             warn!("failed to shutdown compaction worker task [error={:?}]", e);
         }
 
-        if let Err(e) = self.task_executor.shutdown_task(GC_TASK_NAME).await {
-            warn!("failed to shutdown garbage collector task [error={:?}]", e);
+        for name in [GC_TASK_NAME, WAL_GC_TASK_NAME] {
+            if let Err(e) = self.task_executor.shutdown_task(name).await {
+                warn!(
+                    "failed to shutdown garbage collector task [name={}, error={:?}]",
+                    name, e
+                );
+            }
         }
 
         if let Err(e) = self
