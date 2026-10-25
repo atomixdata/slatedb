@@ -118,6 +118,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             disable_boundary_files,
             wal_collect_by_id,
             wal_deletes_per_second,
+            wal_delete_batch_size,
         } => {
             schedule_gc(
                 &admin,
@@ -129,6 +130,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 !disable_boundary_files,
                 wal_collect_by_id,
                 wal_deletes_per_second,
+                wal_delete_batch_size,
                 cancellation_token.clone(),
             )
             .await?
@@ -335,6 +337,7 @@ async fn exec_gc_once(
             object_store_max_retries: None,
             wal_collect_by_id: false,
             wal_deletes_per_second: None,
+            wal_delete_batch_size: None,
         },
         GcResource::Wal => GarbageCollectorOptions {
             manifest_options: None,
@@ -348,6 +351,7 @@ async fn exec_gc_once(
             object_store_max_retries: None,
             wal_collect_by_id: false,
             wal_deletes_per_second: None,
+            wal_delete_batch_size: None,
         },
         GcResource::WalFence => GarbageCollectorOptions {
             manifest_options: None,
@@ -361,6 +365,7 @@ async fn exec_gc_once(
             object_store_max_retries: None,
             wal_collect_by_id: false,
             wal_deletes_per_second: None,
+            wal_delete_batch_size: None,
         },
         GcResource::Compacted => GarbageCollectorOptions {
             manifest_options: None,
@@ -374,6 +379,7 @@ async fn exec_gc_once(
             object_store_max_retries: None,
             wal_collect_by_id: false,
             wal_deletes_per_second: None,
+            wal_delete_batch_size: None,
         },
         GcResource::Compactions => GarbageCollectorOptions {
             manifest_options: None,
@@ -387,6 +393,7 @@ async fn exec_gc_once(
             object_store_max_retries: None,
             wal_collect_by_id: false,
             wal_deletes_per_second: None,
+            wal_delete_batch_size: None,
         },
     };
     admin.run_gc_once(gc_opts).await?;
@@ -404,6 +411,7 @@ async fn schedule_gc(
     boundary_files_enabled: bool,
     wal_collect_by_id: bool,
     wal_deletes_per_second: Option<u32>,
+    wal_delete_batch_size: Option<usize>,
     cancellation_token: CancellationToken,
 ) -> Result<(), Box<dyn Error>> {
     fn create_gc_dir_opts(schedule: GcSchedule) -> Option<GarbageCollectorDirectoryOptions> {
@@ -425,6 +433,7 @@ async fn schedule_gc(
         object_store_max_retries: None,
         wal_collect_by_id,
         wal_deletes_per_second,
+        wal_delete_batch_size,
     };
 
     admin

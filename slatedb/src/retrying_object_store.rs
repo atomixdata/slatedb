@@ -505,24 +505,48 @@ impl ObjectStore for RetryingObjectStore {
         &self,
         locations: BoxStream<'static, object_store::Result<Path>>,
     ) -> BoxStream<'static, object_store::Result<Path>> {
+        // Passes on the batches that callers send, so a store with a bulk delete
+        // API deletes them with few requests. Objects that a batch did not delete
+        // are deleted again one by one, with retries.
         let inner = Arc::clone(&self.inner);
         let sleeper = self.sleeper();
         let retry_builder = self.retry_builder();
         locations
-            .then(move |loc| {
+            .ready_chunks(crate::utils::DELETE_BATCH_MAX)
+            .then(move |batch| {
                 let inner = Arc::clone(&inner);
                 let sleeper = sleeper.clone();
                 async move {
-                    let loc = loc?;
-                    (|| async { inner.delete(&loc).await })
-                        .retry(retry_builder)
-                        .sleep(sleeper)
-                        .notify(Self::notify)
-                        .when(Self::should_retry)
-                        .await?;
-                    Ok(loc)
+                    let mut results = Vec::with_capacity(batch.len());
+                    let mut paths = Vec::with_capacity(batch.len());
+                    for location in batch {
+                        match location {
+                            Ok(path) => paths.push(path),
+                            Err(e) => results.push(Err(e)),
+                        }
+                    }
+                    let deleted: std::collections::HashSet<Path> = inner
+                        .delete_stream(stream::iter(paths.clone().into_iter().map(Ok)).boxed())
+                        .filter_map(|result| async move { result.ok() })
+                        .collect()
+                        .await;
+                    for loc in paths {
+                        if deleted.contains(&loc) {
+                            results.push(Ok(loc));
+                            continue;
+                        }
+                        let result = (|| async { inner.delete(&loc).await })
+                            .retry(retry_builder)
+                            .sleep(sleeper.clone())
+                            .notify(Self::notify)
+                            .when(Self::should_retry)
+                            .await;
+                        results.push(result.map(|_| loc));
+                    }
+                    stream::iter(results)
                 }
             })
+            .flatten()
             .boxed()
     }
 
@@ -688,6 +712,36 @@ mod tests {
 
         let got = retrying.get(&path).await.unwrap();
         assert_eq!(got.bytes().await.unwrap(), Bytes::from_static(b"hello"));
+    }
+
+    #[tokio::test]
+    async fn test_delete_stream_passes_batches_through() {
+        use futures::{stream, StreamExt};
+        let recording = Arc::new(crate::test_utils::DeleteBatchRecordingStore::new(Arc::new(
+            InMemory::new(),
+        )));
+        let retrying = RetryingObjectStore::new(recording.clone(), test_rand(), test_clock(), None);
+        let paths: Vec<Path> = (0..5)
+            .map(|i| Path::from(format!("/wal/{i}.sst")))
+            .collect();
+        for path in &paths {
+            retrying
+                .put(path, PutPayload::from_static(b"x"))
+                .await
+                .unwrap();
+        }
+
+        let deleted: Vec<Path> = retrying
+            .delete_stream(stream::iter(paths.clone().into_iter().map(Ok)).boxed())
+            .map(Result::unwrap)
+            .collect()
+            .await;
+
+        assert_eq!(deleted, paths);
+        assert_eq!(recording.batches(), vec![5]);
+        for path in &paths {
+            assert!(retrying.head(path).await.is_err());
+        }
     }
 
     #[tokio::test]

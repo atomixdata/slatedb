@@ -374,6 +374,34 @@ impl WalTableStore {
             .map_err(SlateDBError::from)
     }
 
+    /// Deletes the WAL SSTs in one `delete_stream` call, so an object store with
+    /// a bulk delete API deletes them with few requests. Returns the IDs that it
+    /// did not delete. A missing object counts as deleted.
+    pub(crate) async fn delete_ssts(&self, wal_ids: &[WalFileId]) -> Vec<WalFileId> {
+        let paths: Vec<Path> = wal_ids.iter().map(|id| self.path(*id)).collect();
+        let mut deleted = std::collections::HashSet::with_capacity(paths.len());
+        let mut results = self
+            .object_store
+            .delete_stream(futures::stream::iter(paths.clone().into_iter().map(Ok)).boxed());
+        while let Some(result) = results.next().await {
+            match result {
+                Ok(path) => {
+                    deleted.insert(path);
+                }
+                Err(object_store::Error::NotFound { path, .. }) => {
+                    deleted.insert(Path::from(path));
+                }
+                Err(e) => warn!("error deleting WAL SSTs [error={}]", e),
+            }
+        }
+        wal_ids
+            .iter()
+            .zip(paths)
+            .filter(|(_, path)| !deleted.contains(path))
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
     pub(crate) async fn metadata(&self, wal_id: WalFileId) -> Result<ObjectMetadata, SlateDBError> {
         let path = self.path(wal_id);
         let options = GetOptions {

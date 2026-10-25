@@ -1443,6 +1443,111 @@ impl ObjectStore for GatedObjectStore {
     }
 }
 
+/// Wraps an object store and records how many paths each `delete_stream` call
+/// carries.
+#[derive(Debug)]
+pub(crate) struct DeleteBatchRecordingStore {
+    inner: Arc<dyn ObjectStore>,
+    batches: Arc<std::sync::Mutex<Vec<usize>>>,
+}
+
+impl DeleteBatchRecordingStore {
+    pub(crate) fn new(inner: Arc<dyn ObjectStore>) -> Self {
+        Self {
+            inner,
+            batches: Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+
+    /// The number of paths in each `delete_stream` call so far.
+    pub(crate) fn batches(&self) -> Vec<usize> {
+        self.batches.lock().unwrap().clone()
+    }
+}
+
+impl fmt::Display for DeleteBatchRecordingStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "DeleteBatchRecordingStore({})", self.inner)
+    }
+}
+
+#[async_trait]
+impl ObjectStore for DeleteBatchRecordingStore {
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: GetOptions,
+    ) -> object_store::Result<GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: OS_PutOptions,
+    ) -> object_store::Result<PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, object_store::Result<Path>>,
+    ) -> BoxStream<'static, object_store::Result<Path>> {
+        let batches = Arc::clone(&self.batches);
+        let inner = Arc::clone(&self.inner);
+        stream::once(async move {
+            let paths: Vec<_> = locations.collect().await;
+            batches.lock().unwrap().push(paths.len());
+            inner.delete_stream(stream::iter(paths).boxed())
+        })
+        .flatten()
+        .boxed()
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    fn list_with_offset(
+        &self,
+        prefix: Option<&Path>,
+        offset: &Path,
+    ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list_with_offset(prefix, offset)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+
+    async fn rename_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: RenameOptions,
+    ) -> object_store::Result<()> {
+        self.inner.rename_opts(from, to, options).await
+    }
+}
+
 pub(crate) struct IdentityBlockTransformer;
 
 #[async_trait]

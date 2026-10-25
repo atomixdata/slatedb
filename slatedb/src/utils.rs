@@ -864,6 +864,10 @@ impl<T> Clone for SafeSender<T> {
     }
 }
 
+/// The most objects that one batch of a `delete_stream` call carries through
+/// SlateDB's object store wrappers. S3's DeleteObjects takes up to 1,000 keys.
+pub(crate) const DELETE_BATCH_MAX: usize = 1000;
+
 #[cfg(test)]
 mod tests {
     use rstest::rstest;

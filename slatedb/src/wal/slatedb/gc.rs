@@ -127,6 +127,9 @@ pub(crate) struct SlateDbWalGc {
     id_state: Arc<Mutex<IdState>>,
     /// The most WAL objects GC deletes per second. `None` means no limit.
     deletes_per_second: Option<u32>,
+    /// How many WAL objects one delete request removes. 1 deletes them one by
+    /// one.
+    delete_batch_size: usize,
 }
 
 impl std::fmt::Debug for SlateDbWalGc {
@@ -156,6 +159,7 @@ impl SlateDbWalGc {
             collect_by_id: false,
             id_state: Arc::new(Mutex::new(IdState::default())),
             deletes_per_second: None,
+            delete_batch_size: 1,
         }
     }
 
@@ -171,6 +175,14 @@ impl SlateDbWalGc {
     /// [`crate::config::GarbageCollectorOptions::wal_deletes_per_second`].
     pub(crate) fn with_deletes_per_second(mut self, deletes_per_second: Option<u32>) -> Self {
         self.deletes_per_second = deletes_per_second.filter(|rate| *rate > 0);
+        self
+    }
+
+    /// Deletes WAL objects in batches of `delete_batch_size`, one request per
+    /// batch where the object store has a bulk delete API. Batches keep the
+    /// `deletes_per_second` limit.
+    pub(crate) fn with_delete_batch_size(mut self, delete_batch_size: usize) -> Self {
+        self.delete_batch_size = delete_batch_size.max(1);
         self
     }
 
@@ -262,6 +274,9 @@ impl SlateDbWalGc {
     /// Deletes WAL SSTs with at most `concurrency` deletes in flight and
     /// returns the IDs it could not delete. A missing object counts as deleted.
     async fn delete_wal_ssts(&self, sst_ids: Vec<WalFileId>, concurrency: usize) -> Vec<WalFileId> {
+        if self.delete_batch_size > 1 {
+            return self.delete_wal_sst_batches(sst_ids, concurrency).await;
+        }
         let start = self.system_clock.now();
         futures::stream::iter(sst_ids.into_iter().enumerate())
             .map(|(position, id)| async move {
@@ -285,6 +300,36 @@ impl SlateDbWalGc {
                     }
                 }
             })
+            .collect()
+            .await
+    }
+
+    /// Like [`Self::delete_wal_ssts`], but deletes batches of
+    /// `delete_batch_size` objects with at most `concurrency` batches in flight.
+    async fn delete_wal_sst_batches(
+        &self,
+        sst_ids: Vec<WalFileId>,
+        concurrency: usize,
+    ) -> Vec<WalFileId> {
+        let start = self.system_clock.now();
+        let batch_size = self.delete_batch_size;
+        let batches: Vec<Vec<WalFileId>> = sst_ids.chunks(batch_size).map(<[_]>::to_vec).collect();
+        futures::stream::iter(batches.into_iter().enumerate())
+            .map(|(index, batch)| async move {
+                self.wait_for_delete_turn(start, index * batch_size).await;
+                let failed = self.wal_store.delete_ssts(&batch).await;
+                let deleted = (batch.len() - failed.len()) as u64;
+                match self.mode {
+                    WalGcMode::Regular => self.stats.gc_wal_count.increment(deleted),
+                    WalGcMode::Fence => self.stats.gc_wal_fence_count.increment(deleted),
+                }
+                if !failed.is_empty() {
+                    error!("error deleting WAL SSTs [count={}]", failed.len());
+                }
+                failed
+            })
+            .buffer_unordered(concurrency)
+            .flat_map(futures::stream::iter)
             .collect()
             .await
     }
@@ -736,6 +781,44 @@ mod tests {
         }
         collect.await.unwrap().unwrap();
         assert!(wal_ids(&wal_store).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_delete_wal_sst_batches() {
+        let recording = Arc::new(crate::test_utils::DeleteBatchRecordingStore::new(Arc::new(
+            InMemory::new(),
+        )));
+        let wal_store = Arc::new(WalTableStore::new(
+            recording.clone(),
+            SsTableFormat::default(),
+            Path::from("/"),
+            TableStoreKind::GC,
+        ));
+        let clock = Arc::new(MockSystemClock::new());
+        for wal_id in 1..=10 {
+            write_regular_wal(&wal_store, wal_id).await;
+        }
+        make_all_wals_older_than(&wal_store, &clock, Duration::ZERO).await;
+        let collector =
+            build_collector(wal_store.clone(), clock, WalGcMode::Regular).with_delete_batch_size(4);
+
+        collector
+            .collect(protect_outer_wals(), Duration::ZERO, false)
+            .await
+            .unwrap();
+
+        // WAL 1 and WALs from 4 on are referenced, so 2 and 3 go in one batch.
+        assert_eq!(wal_ids(&wal_store).await, vec![1, 4, 5, 6, 7, 8, 9, 10]);
+        assert_eq!(recording.batches(), vec![2]);
+
+        collector
+            .collect(vec![], Duration::ZERO, false)
+            .await
+            .unwrap();
+        assert!(wal_ids(&wal_store).await.is_empty());
+        let mut batches = recording.batches();
+        batches.sort_unstable();
+        assert_eq!(batches, vec![2, 4, 4]);
     }
 
     #[tokio::test]

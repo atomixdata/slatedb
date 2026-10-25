@@ -340,6 +340,11 @@ pub(crate) enum CliCommands {
         /// deletes them as fast as it can.
         #[arg(long)]
         wal_deletes_per_second: Option<u32>,
+
+        /// How many WAL files one GC delete request removes. Without this flag,
+        /// GC deletes them one by one.
+        #[arg(long)]
+        wal_delete_batch_size: Option<usize>,
     },
 }
 
