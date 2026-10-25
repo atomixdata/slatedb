@@ -11,7 +11,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use futures::future;
 use futures::stream::{self, StreamExt};
-use log::warn;
+use log::{info, warn};
 use object_store::path::Path;
 use object_store::{
     GetOptions, GetResult, GetResultPayload, ObjectStore, ObjectStoreExt, PutPayload,
@@ -306,6 +306,7 @@ impl Inner {
             .register(path, OpKind::Delete)
             .expect("deletes are always queued");
         ticket.ready().await;
+        self.log_local_copy_deleted(path);
         let (remote, local) = future::join(self.remote.delete(path), self.remove_local(path)).await;
         drop(ticket);
         remote?;
@@ -328,6 +329,9 @@ impl Inner {
             })
             .collect();
         future::join_all(tickets.iter().map(|ticket| ticket.ready())).await;
+        for path in &paths {
+            self.log_local_copy_deleted(path);
+        }
         let remote = self
             .remote
             .delete_stream(stream::iter(paths.clone().into_iter().map(Ok)).boxed())
@@ -361,6 +365,14 @@ impl Inner {
                 Ok(path)
             })
             .collect()
+    }
+
+    /// Logs a delete that finds a local copy. A policy that evicts what it no
+    /// longer needs leaves none for a garbage collector to delete.
+    fn log_local_copy_deleted(&self, path: &Path) {
+        if self.entries.contains(path) {
+            info!("mirror delete removes a local copy [path={}]", path);
+        }
     }
 
     /// Like [`Self::delete`]'s local half, but removes the files even if the

@@ -36,7 +36,7 @@ const MANIFEST_DIR: &str = "manifest";
 const MANIFEST_SUFFIX: &str = ".manifest";
 const DEFAULT_COMPACTIONS_POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// How often the policy logs the local SSTs that nothing references.
-const AUDIT_INTERVAL: Duration = Duration::from_secs(60);
+const AUDIT_INTERVAL: Duration = Duration::from_secs(20);
 /// How long the policy remembers an SST that is neither local nor retained.
 const HISTORY_RETENTION: Duration = Duration::from_secs(1800);
 
