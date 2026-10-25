@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use log::warn;
+use log::{info, warn};
 use object_store::path::Path;
 use object_store::{GetOptions, ObjectStoreExt, PutMode, PutMultipartOptions, PutOptions};
 use parking_lot::Mutex;
@@ -184,9 +184,10 @@ impl MirrorPolicy for SlateDbMirrorPolicy {
 
         // Take references to the cached checkpoint manifests while holding the
         // lock, then read the missing ones without it.
-        let (newer, mut checkpoints, missing) = {
+        let (newer, first, mut checkpoints, missing) = {
             let mut state = self.state.lock();
             state.root.get_or_insert_with(|| root.clone());
+            let first = state.newest_manifest.is_none();
             let newer = state
                 .newest_manifest
                 .is_none_or(|newest| manifest_id > newest);
@@ -202,7 +203,7 @@ impl MirrorPolicy for SlateDbMirrorPolicy {
                     }
                 }
             }
-            (newer, cached, missing)
+            (newer, first, cached, missing)
         };
         if newer {
             for id in missing {
@@ -210,6 +211,14 @@ impl MirrorPolicy for SlateDbMirrorPolicy {
                 checkpoints.insert(id, Arc::new(ssts));
             }
         }
+        // The first manifest sweeps out local copies that an earlier process
+        // left behind. Running compactions' output stays for the worker that
+        // resumes them.
+        let running = if newer && first {
+            Some(Self::running_compaction_ssts(mirror, &root).await)
+        } else {
+            None
+        };
 
         let warm: Vec<Path> = {
             let mut state = self.state.lock();
@@ -224,6 +233,28 @@ impl MirrorPolicy for SlateDbMirrorPolicy {
                 // Evictions are issued under the lock, so they reach the
                 // mirror in manifest order.
                 mirror.evict(state.retain.difference(&retain).cloned());
+                if state.newest_manifest.is_none() {
+                    let running = running.unwrap_or_default();
+                    let prefix = compacted_prefix(&root);
+                    let mut unused = Vec::new();
+                    let mut unused_bytes = 0;
+                    for (path, size) in mirror.local_objects() {
+                        if path.as_ref().starts_with(&prefix)
+                            && !retain.contains(&path)
+                            && !running.contains(&path)
+                        {
+                            unused_bytes += size;
+                            unused.push(path);
+                        }
+                    }
+                    info!(
+                        "evicting local SSTs that the first manifest does not reference [manifest_id={}, count={}, bytes={}]",
+                        manifest_id,
+                        unused.len(),
+                        unused_bytes
+                    );
+                    mirror.evict(unused);
+                }
                 state.retain = retain;
                 state.newest_manifest = Some(manifest_id);
                 state.checkpoints = checkpoints;
@@ -259,6 +290,31 @@ impl MirrorPolicy for SlateDbMirrorPolicy {
             mirror.prefetch(active_compaction_ssts(&root, &compactions.compactions));
         }
     }
+}
+
+impl SlateDbMirrorPolicy {
+    /// Reads the outputs of the running compactions. Returns none when the
+    /// compaction state can't be read.
+    async fn running_compaction_ssts(mirror: &MirrorHandle, root: &Path) -> HashSet<Path> {
+        let store = CompactionsStore::new(root, Arc::clone(mirror.remote()));
+        match store.try_read_latest_compactions().await {
+            Ok(Some(compactions)) => active_compaction_ssts(root, &compactions.compactions),
+            Ok(None) => HashSet::new(),
+            Err(error) => {
+                warn!("failed to read compactions for the first manifest [error={error}]");
+                HashSet::new()
+            }
+        }
+    }
+}
+
+/// The prefix of the database's compacted SSTs, the only objects the mirror
+/// keeps locally.
+fn compacted_prefix(root: &Path) -> String {
+    format!(
+        "{}/",
+        PathResolver::from_root(root.clone()).compacted_path()
+    )
 }
 
 /// The SSTs that active compactions have written: their recorded outputs and
@@ -336,6 +392,7 @@ fn policy_error(message: String) -> object_store::Error {
 mod tests {
     use super::*;
     use crate::bytes_range::BytesRange;
+    use crate::compactions_store::StoredCompactions;
     use crate::compactor_state::{
         Compaction, CompactionContext, CompactionSpec, CompactionStatus, SourceId,
     };
@@ -526,6 +583,88 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         done()
+    }
+
+    #[tokio::test]
+    async fn test_observe_evicts_unreferenced_local_ssts_on_the_first_manifest() {
+        let remote: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let root = Path::from("db");
+        let store = Arc::new(CompactionsStore::new(&root, Arc::clone(&remote)));
+        let mut compactions = StoredCompactions::create(store, 1).await.unwrap();
+        // Compaction IDs and output SSTs can't be older than the compaction
+        // state's clock, so the last SST is new.
+        let compaction_id = Ulid::new();
+        let ids: Vec<Ulid> = (1..=3)
+            .map(|n| Ulid::from_parts(n, 0))
+            .chain([Ulid::new()])
+            .collect();
+        let resolver = PathResolver::from_root(root.clone());
+        let ssts: Vec<Path> = ids
+            .iter()
+            .map(|id| resolver.sst_path(&SsTableId::from(*id)))
+            .collect();
+        for sst in &ssts {
+            remote
+                .put(sst, Bytes::from_static(b"sst").into())
+                .await
+                .unwrap();
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let open = |policy: Arc<SlateDbMirrorPolicy>| {
+            ObjectStoreMirror::builder(dir.path(), Arc::clone(&remote), policy)
+                .with_remote_scan_interval(None)
+                .build()
+        };
+
+        // An earlier process downloaded all four SSTs.
+        {
+            let policy = SlateDbMirrorPolicy::builder()
+                .with_compactions_poll_interval(None)
+                .build();
+            let mirror = open(policy.clone()).await.unwrap();
+            policy
+                .observe(
+                    &manifest_path(&root, 1),
+                    &manifest_bytes(&ids),
+                    &mirror.handle(),
+                )
+                .await
+                .unwrap();
+        }
+        // The fourth SST is the output of a running compaction.
+        let output = SsTableHandle::new(
+            SsTableId::from(ids[3]),
+            SST_FORMAT_VERSION_LATEST,
+            SsTableInfo::default(),
+        );
+        let running = Compaction::new(
+            compaction_id,
+            CompactionSpec::new(vec![SourceId::SortedRun(1)], 1),
+        )
+        .with_status(CompactionStatus::Compacted)
+        .with_output_ssts(vec![output]);
+        let mut dirty = compactions.prepare_dirty().unwrap();
+        dirty.value.insert(running);
+        compactions.update(dirty).await.unwrap();
+
+        // The next process's first manifest references only the second and third.
+        let policy = SlateDbMirrorPolicy::builder()
+            .with_compactions_poll_interval(None)
+            .build();
+        let mirror = open(policy.clone()).await.unwrap();
+        let handle = mirror.handle();
+        assert!(ssts.iter().all(|sst| handle.contains(sst)));
+        policy
+            .observe(
+                &manifest_path(&root, 2),
+                &manifest_bytes(&ids[1..3]),
+                &handle,
+            )
+            .await
+            .unwrap();
+
+        assert!(wait_until(|| !handle.contains(&ssts[0])).await);
+        assert!(ssts[1..].iter().all(|sst| handle.contains(sst)));
     }
 
     #[tokio::test]
