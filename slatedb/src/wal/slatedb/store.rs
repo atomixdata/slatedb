@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use fail_parallel::{fail_point, FailPointRegistry};
+use futures::future::join_all;
 use futures::StreamExt;
 use log::{debug, warn};
 use object_store::path::Path;
@@ -574,8 +575,147 @@ impl WalTableStore {
         Ok(WalFileId::from(next))
     }
 
+    /// Walks like [`Self::walk_to_frontier`], but lists only the WAL objects
+    /// near the last one. A takeover after thousands of WAL uploads then lists
+    /// one page, not one page for each thousand objects.
+    ///
+    /// The walk finds the last WAL object with [`Self::last_seen_wal_id`]. Then
+    /// it lists from `2 * window` IDs below that object. Use it only in a writer
+    /// that holds the epoch, with `start` at the replay boundary of its
+    /// manifest. GC deletes WAL objects only below that boundary. An older
+    /// writer leaves gaps only among its last `window` uploads. A takeover
+    /// covers those gaps with an excluded range that starts at a fence. So every
+    /// ID from `start` to the last `window` IDs exists or is in such a range. If
+    /// a range below the listing does not start at a fence, the walk lists from
+    /// `start`.
+    pub(crate) async fn walk_to_frontier_from_tail(
+        &self,
+        start: WalFileId,
+        excluded_ranges: &WalExcludedRanges,
+        window: u64,
+    ) -> Result<WalFileId, SlateDBError> {
+        let start = start.value();
+        let last = self
+            .last_seen_wal_id(WalFileId::from(start - 1))
+            .await?
+            .value();
+        let mut from = last.saturating_sub(2 * window).max(start);
+        let ranges = excluded_ranges.load().await?;
+        // Walk from the start of a range that `from` falls inside, so the walk
+        // sees its fence.
+        if let Some(range) = ranges
+            .iter()
+            .find(|range| range.start < from && from <= range.end)
+        {
+            from = range.start.max(start);
+        }
+        for range in ranges
+            .iter()
+            .filter(|range| range.start < from && range.end >= start)
+        {
+            if range.start < start || !self.is_fence(WalFileId::from(range.start)).await? {
+                from = start;
+                break;
+            }
+        }
+        self.walk_to_frontier(WalFileId::from(from), excluded_ranges)
+            .await
+    }
+
+    /// Find the highest WAL SST id present in the object store at or above
+    /// `start_after + 1`, returning `start_after` if none exist.
+    ///
+    /// Two phases:
+    ///   1. Parallel exponential probe at offsets `2^0, 2^1, ..., 2^k` from
+    ///      `start_after`. One RTT per round of 8 exponents. Brackets the
+    ///      frontier between two adjacent powers of two.
+    ///   2. Sequential binary search inside the bracketed range to find the
+    ///      exact frontier.
+    ///
+    /// The search is correct where "id exists" is monotone-decreasing in id.
+    /// With pipelined uploads, that is true below the last `window` uploads of
+    /// an older writer. So the result is within `window` of the last WAL object
+    /// (see [`Self::walk_to_frontier_from_tail`]). Total HEAD count is
+    /// `O(log N)` for a gap of size N, vs `O(N)` for a windowed scan.
+    async fn last_seen_wal_id(&self, start_after: WalFileId) -> Result<WalFileId, SlateDBError> {
+        const ROUND_SIZE: u32 = 8;
+        const MAX_EXP: u32 = 48;
+
+        let mut lo_offset = None;
+        let mut hi_offset = None;
+        let mut next_exp = 0;
+
+        while hi_offset.is_none() {
+            if next_exp >= MAX_EXP {
+                return Err(SlateDBError::InvalidDBState);
+            }
+            let end_exp = (next_exp + ROUND_SIZE).min(MAX_EXP);
+            let exps: Vec<u32> = (next_exp..end_exp).collect();
+            let probes = exps.iter().map(|&exp| {
+                let offset = 1u64 << exp;
+                let path = self.path(WalFileId::from(start_after.value() + offset));
+                let object_store = Arc::clone(&self.object_store);
+                async move { wal_object_exists(&object_store, &path).await }
+            });
+            let results = join_all(probes).await;
+
+            for (exp, result) in exps.iter().zip(results) {
+                let offset = 1u64 << exp;
+                if result? {
+                    lo_offset = Some(offset);
+                } else {
+                    hi_offset = Some(offset);
+                    break;
+                }
+            }
+            next_exp = end_exp;
+        }
+
+        let hi = hi_offset.expect("loop exits only after finding an upper bound");
+        let Some(lo) = lo_offset else {
+            return Ok(start_after);
+        };
+
+        let mut left = lo + 1;
+        let mut right = hi;
+        while left < right {
+            let mid = left + (right - left) / 2;
+            if wal_object_exists(
+                &self.object_store,
+                &self.path(WalFileId::from(start_after.value() + mid)),
+            )
+            .await?
+            {
+                left = mid + 1;
+            } else {
+                right = mid;
+            }
+        }
+        Ok(WalFileId::from(start_after.value() + left - 1))
+    }
+
+    /// Returns whether the WAL object at `wal_id` is a zero-byte fence.
+    async fn is_fence(&self, wal_id: WalFileId) -> Result<bool, SlateDBError> {
+        match self.object_store.head(&self.path(wal_id)).await {
+            Ok(meta) => Ok(meta.size == 0),
+            Err(object_store::Error::NotFound { .. }) => Ok(false),
+            Err(error) => Err(SlateDBError::from(error)),
+        }
+    }
+
     fn path(&self, wal_id: WalFileId) -> Path {
         self.path_resolver.wal_sst_path(&wal_id)
+    }
+}
+
+async fn wal_object_exists(
+    object_store: &Arc<dyn ObjectStore>,
+    path: &Path,
+) -> Result<bool, SlateDBError> {
+    match object_store.head(path).await {
+        Ok(_) => Ok(true),
+        Err(object_store::Error::NotFound { .. }) => Ok(false),
+        Err(error) => Err(SlateDBError::from(error)),
     }
 }
 
@@ -853,6 +993,139 @@ mod tests {
                 .unwrap()
                 .value(),
             8
+        );
+    }
+
+    /// A store over `observed`, with a fence at every ID in `ids`.
+    async fn store_with_fences(
+        observed: &Arc<FlakyObjectStore>,
+        ids: impl IntoIterator<Item = u64>,
+    ) -> WalTableStore {
+        let store = WalTableStore::new(
+            Arc::clone(observed) as Arc<dyn ObjectStore>,
+            SsTableFormat::default(),
+            Path::from("test-db"),
+            TableStoreKind::Main,
+        );
+        for id in ids {
+            store.write_wal_fence(id.into()).await.unwrap();
+        }
+        store
+    }
+
+    #[tokio::test]
+    async fn walk_to_frontier_from_tail_probes_then_lists_once() {
+        // given: 300 contiguous WALs, then an older writer's tail with a gap
+        // at 301 and an upload that landed at 302.
+        let observed = Arc::new(FlakyObjectStore::new(Arc::new(InMemory::new()), 0));
+        let store = store_with_fences(&observed, (1..=300).chain([302])).await;
+        let heads = observed.head_attempts();
+
+        // when
+        let frontier = store
+            .walk_to_frontier_from_tail(1.into(), &WalExcludedRanges::none(), 4)
+            .await
+            .unwrap();
+
+        // then: the frontier is the gap, found with O(log n) HEADs and one
+        // listing.
+        assert_eq!(frontier.value(), 301);
+        assert!(observed.head_attempts() - heads <= 2 * 8 + 9);
+        assert_eq!(observed.list_with_offset_attempts(), 1);
+    }
+
+    #[tokio::test]
+    async fn walk_to_frontier_from_tail_lists_only_near_the_last_wal() {
+        // given: a gap at 50 outside any excluded range, which a writer whose
+        // replay boundary is below it never sees, and 300 WALs.
+        let observed = Arc::new(FlakyObjectStore::new(Arc::new(InMemory::new()), 0));
+        let store = store_with_fences(&observed, (1..=300).filter(|id| *id != 50)).await;
+
+        // when/then: the full walk stops at the gap, the walk from the tail
+        // starts its listing past it.
+        let ranges = WalExcludedRanges::none();
+        assert_eq!(
+            store
+                .walk_to_frontier(1.into(), &ranges)
+                .await
+                .unwrap()
+                .value(),
+            50
+        );
+        assert_eq!(
+            store
+                .walk_to_frontier_from_tail(1.into(), &ranges, 4)
+                .await
+                .unwrap()
+                .value(),
+            301
+        );
+    }
+
+    #[tokio::test]
+    async fn walk_to_frontier_from_tail_lists_from_the_start_when_a_range_has_no_fence() {
+        // given: a takeover that recorded the range 50 to 53 but stopped
+        // before its fence at 50, and WALs on both sides.
+        let observed = Arc::new(FlakyObjectStore::new(Arc::new(InMemory::new()), 0));
+        let store = store_with_fences(&observed, (1..=300).filter(|id| *id != 50)).await;
+        let ranges = WalExcludedRanges::known(&[WalExcludedRange { start: 50, end: 53 }]);
+
+        // when/then: the walk can't skip the range, so it walks from the start
+        // like the full walk.
+        assert_eq!(
+            store
+                .walk_to_frontier_from_tail(1.into(), &ranges, 4)
+                .await
+                .unwrap()
+                .value(),
+            store
+                .walk_to_frontier(1.into(), &ranges)
+                .await
+                .unwrap()
+                .value()
+        );
+    }
+
+    #[tokio::test]
+    async fn walk_to_frontier_from_tail_skips_a_fenced_range_near_the_tail() {
+        // given: a takeover's range 96 to 99 with its fence at 96 and missing
+        // IDs inside, the new writer's WALs from 100 to 105, and the frontier
+        // at 106. The last WAL is 105, so the listing would start at 97, inside
+        // the range.
+        let observed = Arc::new(FlakyObjectStore::new(Arc::new(InMemory::new()), 0));
+        let store = store_with_fences(&observed, (1..=96).chain(100..=105)).await;
+        let ranges = WalExcludedRanges::known(&[WalExcludedRange { start: 96, end: 99 }]);
+
+        // when/then: both walks skip the range at its fence.
+        assert_eq!(
+            store
+                .walk_to_frontier_from_tail(1.into(), &ranges, 4)
+                .await
+                .unwrap()
+                .value(),
+            106
+        );
+        assert_eq!(
+            store
+                .walk_to_frontier(1.into(), &ranges)
+                .await
+                .unwrap()
+                .value(),
+            106
+        );
+    }
+
+    #[tokio::test]
+    async fn walk_to_frontier_from_tail_without_wals_returns_the_start() {
+        let observed = Arc::new(FlakyObjectStore::new(Arc::new(InMemory::new()), 0));
+        let store = store_with_fences(&observed, []).await;
+        assert_eq!(
+            store
+                .walk_to_frontier_from_tail(7.into(), &WalExcludedRanges::none(), 4)
+                .await
+                .unwrap()
+                .value(),
+            7
         );
     }
 
