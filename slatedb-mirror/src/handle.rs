@@ -5,7 +5,7 @@ use std::future::Future;
 use std::sync::Arc;
 
 use futures::future::{join_all, try_join_all};
-use log::warn;
+use log::{info, warn};
 use object_store::path::Path;
 use object_store::ObjectStore;
 
@@ -94,6 +94,10 @@ impl MirrorHandle {
                 let inner = &inner;
                 async move {
                     if !ticket.ready().await {
+                        info!(
+                            "mirror eviction cancelled by a later download or write [path={}]",
+                            path
+                        );
                         return;
                     }
                     if let Err(err) = inner.remove_local(&path).await {
@@ -108,6 +112,17 @@ impl MirrorHandle {
     /// Returns true if `path` has a complete local copy.
     pub fn contains(&self, path: &Path) -> bool {
         self.inner.entries.contains(path)
+    }
+
+    /// Returns the path and size of every complete local copy. A copy that is
+    /// installed or removed during the call can be in the result or not.
+    pub fn local_objects(&self) -> Vec<(Path, u64)> {
+        self.inner
+            .entries
+            .values()
+            .into_iter()
+            .map(|object| (object.meta.location.clone(), object.meta.size))
+            .collect()
     }
 
     /// The wrapped store. Calls made here skip the policy.
