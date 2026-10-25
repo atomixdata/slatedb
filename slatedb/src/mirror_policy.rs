@@ -36,7 +36,7 @@ const MANIFEST_DIR: &str = "manifest";
 const MANIFEST_SUFFIX: &str = ".manifest";
 const DEFAULT_COMPACTIONS_POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// How often the policy logs the local SSTs that nothing references.
-const AUDIT_INTERVAL: Duration = Duration::from_secs(20);
+const AUDIT_INTERVAL: Duration = Duration::from_secs(60);
 /// How long the policy remembers an SST that is neither local nor retained.
 const HISTORY_RETENTION: Duration = Duration::from_secs(1800);
 
@@ -65,6 +65,8 @@ struct PolicyState {
     unreferenced: HashSet<Path>,
     /// Unreferenced SSTs the audit already logged.
     reported: HashSet<Path>,
+    /// The newest manifest's L0 and sorted runs, for the audit log.
+    shape: Vec<(String, Vec<Path>)>,
 }
 
 /// What the policy saw happen to one SST.
@@ -213,6 +215,7 @@ impl MirrorPolicy for SlateDbMirrorPolicy {
         };
         let manifest = decode_manifest(bytes)?;
         let warm = sst_paths(&root, &manifest);
+        let shape = lsm_shape(&root, &manifest);
         let checkpoint_ids: HashSet<u64> = manifest
             .core
             .checkpoints
@@ -304,6 +307,7 @@ impl MirrorPolicy for SlateDbMirrorPolicy {
                     mirror.evict(unused);
                 }
                 state.retain = retain;
+                state.shape = shape;
                 state.newest_manifest = Some(manifest_id);
                 state.checkpoints = checkpoints;
                 warm.into_iter().collect()
@@ -429,6 +433,16 @@ impl SlateDbMirrorPolicy {
             unreferenced_bytes,
             state.retain.len()
         );
+        let sizes: HashMap<&Path, u64> = local.iter().map(|(path, size)| (path, *size)).collect();
+        let shape: Vec<String> = state
+            .shape
+            .iter()
+            .map(|(label, paths)| {
+                let bytes: u64 = paths.iter().filter_map(|path| sizes.get(path)).sum();
+                format!("{label}:{}x{:.1}GB", paths.len(), bytes as f64 / 1e9)
+            })
+            .collect();
+        info!("mirror audit: lsm shape [{}]", shape.join(", "));
         state.reported.retain(|path| unreferenced.contains(path));
         state.unreferenced = unreferenced;
         let local: HashSet<&Path> = local.iter().map(|(path, _)| path).collect();
@@ -442,6 +456,37 @@ impl SlateDbMirrorPolicy {
                     .is_some_and(|age| age < HISTORY_RETENTION)
         });
     }
+}
+
+/// The manifest's L0 and sorted runs, each with its SSTs, labelled for the
+/// audit log. Segments other than the root tree get an `s<index>.` prefix.
+fn lsm_shape(root: &Path, manifest: &Manifest) -> Vec<(String, Vec<Path>)> {
+    let resolver = PathResolver::new_with_external_ssts(root.clone(), manifest.external_ssts());
+    let mut shape = Vec::new();
+    for (index, tree) in manifest.core.trees().enumerate() {
+        let tree_label = if index == 0 {
+            String::new()
+        } else {
+            format!("s{index}.")
+        };
+        if index == 0 || !tree.l0.is_empty() {
+            let l0 = tree
+                .l0
+                .iter()
+                .map(|view| resolver.sst_path(&view.sst.id))
+                .collect();
+            shape.push((format!("{tree_label}l0"), l0));
+        }
+        for run in tree.compacted.iter() {
+            let ssts = run
+                .sst_views()
+                .iter()
+                .map(|view| resolver.sst_path(&view.sst.id))
+                .collect();
+            shape.push((format!("{tree_label}sr{}", run.id), ssts));
+        }
+    }
+    shape
 }
 
 /// The prefix of the database's compacted SSTs, the only objects the mirror
