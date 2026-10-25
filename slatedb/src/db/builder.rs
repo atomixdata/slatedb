@@ -187,6 +187,7 @@ pub struct DbBuilder<P: Into<Path>> {
     system_clock: Option<Arc<dyn SystemClock>>,
     gc_runtime: Option<Handle>,
     write_runtime: Option<Handle>,
+    memtable_flush_runtime: Option<Handle>,
     compactor_builder: Option<CompactorBuilder<Path>>,
     gc_builder: Option<GarbageCollectorBuilder<Path>>,
     fp_registry: Arc<FailPointRegistry>,
@@ -220,6 +221,7 @@ impl<P: Into<Path>> DbBuilder<P> {
             system_clock: None,
             gc_runtime: None,
             write_runtime: None,
+            memtable_flush_runtime: None,
             compactor_builder: None,
             gc_builder: None,
             fp_registry: Arc::new(FailPointRegistry::new()),
@@ -352,6 +354,18 @@ impl<P: Into<Path>> DbBuilder<P> {
     /// [`enable_time`]: tokio::runtime::Builder::enable_time
     pub fn with_write_runtime(mut self, runtime: Handle) -> Self {
         self.write_runtime = Some(runtime);
+        self
+    }
+
+    /// Runs the memtable flusher on `runtime` instead of the one the database is
+    /// built on. The flusher builds each frozen memtable into L0 SSTs, uploads
+    /// them and records them in the manifest. On a runtime that is busy with
+    /// reads and writes, the flusher gets a small share of the CPU, so L0 uploads
+    /// slow down. Then the WAL that a restart replays gets longer.
+    ///
+    /// The caller must drive `runtime` until [`Db::close`] returns.
+    pub fn with_memtable_flush_runtime(mut self, runtime: Handle) -> Self {
+        self.memtable_flush_runtime = Some(runtime);
         self
     }
 
@@ -905,7 +919,9 @@ impl<P: Into<Path>> DbBuilder<P> {
         memtable_flusher.start(
             inner.clone(),
             manifest,
-            &tokio_handle,
+            self.memtable_flush_runtime
+                .as_ref()
+                .unwrap_or(&tokio_handle),
             &task_executor,
             inner.status_manager.as_ref(),
         )?;
@@ -2845,6 +2861,48 @@ mod tests {
 
         // Close flushes through the batch-writer and joins it.
         writer.block_on(db.close()).expect("failed to close db");
+    }
+
+    // Not a `#[tokio::test]`: the caller has to own both runtimes.
+    #[test]
+    fn test_memtable_flush_runtime_runs_the_flusher() {
+        let background = Runtime::new().expect("failed to build background runtime");
+        let flusher = Runtime::new().expect("failed to build flush runtime");
+
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let db = background
+            .block_on(
+                crate::Db::builder(
+                    Path::from("test_memtable_flush_runtime_runs_the_flusher"),
+                    object_store,
+                )
+                .with_memtable_flush_runtime(flusher.handle().clone())
+                .build(),
+            )
+            .expect("failed to build db");
+        // The uploader, the manifest writer and the tracker run on it.
+        assert!(flusher.metrics().num_alive_tasks() >= 3);
+
+        // A memtable flush completes only through the flusher.
+        background
+            .block_on(async {
+                db.put(b"k1", b"v1").await?;
+                db.flush_with_options(crate::config::FlushOptions {
+                    flush_type: crate::config::FlushType::MemTable,
+                })
+                .await
+            })
+            .expect("failed to flush");
+        assert_eq!(
+            background
+                .block_on(db.get(b"k1"))
+                .expect("failed to get")
+                .as_deref(),
+            Some(b"v1".as_ref())
+        );
+
+        background.block_on(db.close()).expect("failed to close db");
+        assert_eq!(flusher.metrics().num_alive_tasks(), 0);
     }
 
     #[tokio::test]
