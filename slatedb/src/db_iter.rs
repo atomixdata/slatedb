@@ -559,7 +559,7 @@ pub struct DbRecencyIterator {
     /// Entries ordered from most recent to least recent. The front entry is
     /// the source being drained.
     ///
-    /// The front entry stays in the queue until it is  exhausted, so a dropped
+    /// The front entry stays in the queue until it is exhausted, so a dropped
     /// `next_entry` call resumes it rather than skipping it.
     entries: VecDeque<RecencyEntry>,
     /// The context used to build the iterator of a source.

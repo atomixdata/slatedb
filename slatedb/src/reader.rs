@@ -445,9 +445,9 @@ impl Reader {
             None => Some(db_state.core().default_segment()),
         };
 
-        // Each source is only a descriptor now, and will only be turned into
-        // an iterator when the recency walk reaches it, so a walk that stops
-        // early never pays for the cost of constructing unused iterators.
+        // Sources are only listed here. Each one is built when the recency
+        // walk reaches it, so a walk that stops early never builds the sources
+        // behind it.
         let mut sources = VecDeque::new();
 
         // Memtables drain first (newest data, always in memory).

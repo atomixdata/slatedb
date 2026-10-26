@@ -2934,8 +2934,12 @@ mod tests {
     async fn test_scan_prefix_by_recency_resumes_a_source_after_a_dropped_next_entry() {
         let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let gated = Arc::new(GatedObjectStore::new(inner));
+        // No manifest polls during the test, so the only read that reaches
+        // the gate below is the scan's own.
+        let mut settings = test_db_options(0, 64 * 1024, None);
+        settings.manifest_poll_interval = Duration::from_secs(3600);
         let db = Db::builder("/tmp/test_recency_dropped_next_entry", gated.clone())
-            .with_settings(test_db_options(0, 64 * 1024, None))
+            .with_settings(settings)
             .with_db_cache_disabled()
             .build()
             .await
