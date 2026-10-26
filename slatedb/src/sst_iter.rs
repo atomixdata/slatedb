@@ -30,11 +30,11 @@ use crate::{
 
 enum FetchTask {
     InFlight(AbortOnDropHandle<Result<VecDeque<Arc<Block>>, SlateDBError>>),
-    /// A read polled by the iterator itself. It is the front of the queue, so
-    /// the iterator awaits it next and a spawn would overlap nothing. Dropping
-    /// the future cancels the read, as aborting the handle does. The mutex is
-    /// only for `Sync`; polling goes through `get_mut`, so no lock is held
-    /// across an await.
+    /// A read polled by the iterator itself. With one fetch task, the
+    /// iterator awaits each read as soon as it is queued, so a spawn would
+    /// overlap nothing. Dropping the future cancels the read, as aborting the
+    /// handle does. The mutex is only for `Sync`; polling goes through
+    /// `get_mut`, so no lock is held across an await.
     Inline(parking_lot::Mutex<BoxFuture<'static, Result<VecDeque<Arc<Block>>, SlateDBError>>>),
     Finished(VecDeque<Arc<Block>>),
 }
@@ -466,8 +466,8 @@ impl<'a> InternalSstIterator<'a> {
     /// decrementing `next_block_idx_to_fetch` as blocks are scheduled. Stops when reaching
     /// `block_idx_range.start`.
     ///
-    /// The front fetch is awaited next, so it runs inline instead of paying
-    /// for a spawn. Fetches behind it are spawned to run concurrently.
+    /// With one fetch task, each fetch runs inline instead of paying for a
+    /// spawn. With more, every fetch is spawned so that they run in parallel.
     fn spawn_fetches(&mut self) {
         let Some(index) = self.index.clone() else {
             return;
@@ -515,9 +515,11 @@ impl<'a> InternalSstIterator<'a> {
 
     /// Starts the read of `blocks`.
     ///
-    /// If the queue is empty, the read is awaited next, so it is polled
-    /// inline. Otherwise it is spawned so that it runs while earlier fetches
-    /// are consumed.
+    /// With one fetch task, the read is awaited as soon as it is queued, so it
+    /// is polled inline. With more, it is spawned, so that reads ahead of the
+    /// consumer run in parallel. Iterators that are initialized together, as
+    /// in range scans and compaction, then also decode their first blocks on
+    /// different threads.
     fn start_fetch(&self, index: Arc<SsTableIndexOwned>, blocks: Range<usize>) -> FetchTask {
         let table = self.view.table_as_ref().sst.clone();
         let table_store = self.table_store.clone();
@@ -538,7 +540,7 @@ impl<'a> InternalSstIterator<'a> {
                 )
                 .await
         };
-        if self.fetch_tasks.is_empty() {
+        if self.options.max_fetch_tasks == 1 {
             FetchTask::Inline(parking_lot::Mutex::new(Box::pin(read)))
         } else {
             FetchTask::InFlight(AbortOnDropHandle::new(spawn_with_optional_subscriber(read)))
@@ -3329,27 +3331,22 @@ mod tests {
     #[tokio::test]
     async fn test_next_iter_prefetch_task_cancelled() {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let format = SsTableFormat {
-            block_size: 128,
-            ..SsTableFormat::default()
-        };
         let table_store = Arc::new(TableStore::new(
             object_store,
-            format,
+            SsTableFormat::default(),
             Path::from(""),
             None,
             TableStoreKind::Main,
             BlockCachePolicy::default(),
         ));
-        let key_gen = OrderedBytesGenerator::new_with_byte_range(&[b'a'; 16], b'a', b'z');
-        let val_gen = OrderedBytesGenerator::new_with_byte_range(&[1u8; 16], 1u8, 26u8);
-        let (sst, _) = build_sst_with_n_blocks(2, table_store.clone(), key_gen, val_gen).await;
+        let sst = build_single_block_sst(&table_store, &[b"key1", b"key2"]).await;
         let dead_handle = dead_runtime_handle();
 
-        // Initialization fetches the first block inline and spawns the
-        // prefetch of the second onto - and has it cancelled by - the dead
-        // runtime while its context is entered.
-        let mut iter = {
+        // With two fetch tasks, initialization walks `advance_block` ->
+        // `next_iter(true)` -> `spawn_fetches`, so the first fetch is spawned
+        // onto - and cancelled by - the dead runtime while its context is
+        // entered.
+        let result = {
             let _guard = dead_handle.enter();
             SstIterator::new_owned_initialized(
                 ..,
@@ -3361,22 +3358,16 @@ mod tests {
                 },
             )
             .await
-            .unwrap()
-            .unwrap()
         };
 
-        let err = loop {
-            match iter.next().await {
-                Ok(Some(_)) => {}
-                Ok(None) => panic!("a cancelled prefetch task must be reported as an error"),
-                Err(err) => break err,
-            }
+        let Err(err) = result else {
+            panic!("a cancelled prefetch task must be reported as an error");
         };
         assert!(matches!(err, SlateDBError::BackgroundTaskCancelled(_)));
     }
 
     #[tokio::test]
-    async fn test_fetch_awaited_next_runs_inline() {
+    async fn test_one_fetch_task_runs_every_fetch_inline() {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let format = SsTableFormat {
             block_size: 128,
@@ -3395,7 +3386,7 @@ mod tests {
         let (sst, nkeys) = build_sst_with_n_blocks(3, table_store.clone(), key_gen, val_gen).await;
         let dead_handle = dead_runtime_handle();
 
-        // With one fetch at a time, every fetch is awaited as soon as it is
+        // With one fetch task, every fetch is awaited as soon as it is
         // queued, so none is spawned. A spawn onto the dead runtime would be
         // cancelled and fail the scan.
         for order in [IterationOrder::Ascending, IterationOrder::Descending] {
@@ -4027,13 +4018,12 @@ mod tests {
         }
     }
 
-    /// The first fetch is awaited next, so it is inline whatever the shape of
-    /// the read: a point range in either order, with read-ahead in bytes or
-    /// across tasks. A one-block SST needs only that fetch, so nothing is
-    /// spawned onto the dead runtime. `test_next_iter_prefetch_task_cancelled`
-    /// covers the spawned fetches behind it.
+    /// Inline is decided by the number of fetch tasks: with one task a point
+    /// read is inline in either order, with or without read-ahead in bytes.
+    /// With two tasks its fetch is spawned, so on a dead runtime only that
+    /// case fails.
     #[tokio::test]
-    async fn point_read_first_fetch_is_inline_for_any_read_shape() {
+    async fn point_read_is_inline_only_with_one_fetch_task() {
         let (store, sst, _, _) = point_read_fixture().await;
         let dead = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
@@ -4043,13 +4033,13 @@ mod tests {
         dead.shutdown_background();
         let point = Bytes::from_static(b"k")..=Bytes::from_static(b"k");
         let cases = [
-            (IterationOrder::Ascending, 1, 1),
-            (IterationOrder::Ascending, 1, 2),
-            (IterationOrder::Descending, 1, 1),
-            (IterationOrder::Ascending, 2, 1),
-            (IterationOrder::Descending, 2, 1),
+            (IterationOrder::Ascending, 1, 1, true),
+            (IterationOrder::Ascending, 1, 2, true),
+            (IterationOrder::Descending, 1, 1, true),
+            (IterationOrder::Ascending, 2, 1, false),
+            (IterationOrder::Descending, 2, 1, false),
         ];
-        for (order, max_fetch_tasks, target_bytes_to_fetch) in cases {
+        for (order, max_fetch_tasks, target_bytes_to_fetch, inline) in cases {
             let options = SstIteratorOptions {
                 order,
                 max_fetch_tasks,
@@ -4064,13 +4054,19 @@ mod tests {
                 let _entered = handle.enter();
                 iter.init().await
             };
-            assert!(
+            assert_eq!(
                 result.is_ok(),
+                inline,
                 "{order:?} tasks={max_fetch_tasks} bytes={target_bytes_to_fetch}: {result:?}"
             );
+            if !inline {
+                assert!(matches!(
+                    result,
+                    Err(SlateDBError::BackgroundTaskCancelled(_))
+                ));
+            }
         }
-        // A broad scan is clipped to the SST's own key range, so over a one-key
-        // SST it is the same single-block read and is inline too.
+        // A broad scan with one fetch task is inline too.
         let mut scan = SstIterator::new_owned(.., sst, store, SstIteratorOptions::default(), None)
             .unwrap()
             .unwrap();
