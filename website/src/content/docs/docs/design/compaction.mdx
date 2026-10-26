@@ -78,7 +78,8 @@ checkpoint expires, so reads that started before the commit can still finish.
 
 The counter `slatedb.compactor.incremental_released_bytes` estimates the bytes of the input SSTs
 that incremental commits release. It counts an SST once, after a successful commit removes its last
-view from all trees.
+view from all trees. A released SST is not deleted yet. It stays until garbage
+collection deletes it, so storage use goes down later than this counter goes up.
 
 If a worker stops, the next worker resumes the compaction from its progress. Key ranges that are
 already complete do not run again.
