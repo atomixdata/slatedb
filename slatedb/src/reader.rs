@@ -423,6 +423,11 @@ impl Reader {
             target_bytes_to_fetch: options.read_ahead_bytes,
             cache_blocks: options.cache_blocks,
             cache_metadata: true,
+            // Recency scans are designed for early-stop. Eager spawning would
+            // fetch blocks for sources the caller may never reach, defeating
+            // the early-stop savings. Today it only acts in `init`, which the
+            // walk calls lazily only on the sources it reaches, so this is a
+            // safeguard.
             eager_spawn: false,
             order: options.order,
             prefix: Some(prefix),
@@ -445,9 +450,9 @@ impl Reader {
             None => Some(db_state.core().default_segment()),
         };
 
-        // Sources are only listed here. Each one is built when the recency
-        // walk reaches it, so a walk that stops early never builds the sources
-        // behind it.
+        // Sources are only listed here. The iterator for each one is built
+        // when the recency walk reaches it, so a walk that stops early never
+        // builds the iterators behind it.
         let mut sources = VecDeque::new();
 
         // Memtables drain first (newest data, always in memory).

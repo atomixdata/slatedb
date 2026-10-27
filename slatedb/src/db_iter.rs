@@ -469,6 +469,90 @@ where
     }
 }
 
+/// See [`crate::Db::scan_prefix_by_recency`] for the full contract.
+pub struct DbRecencyIterator {
+    /// Sources not yet drained, from most recent to least recent.
+    sources: VecDeque<RecencySource>,
+    /// The initialized iterator of the source being drained.
+    current: Option<Box<dyn RowEntryIterator + 'static>>,
+    /// The context used to build the iterator of a source.
+    context: RecencySourceContext,
+    /// Sticky error. Once building a source, or any underlying `init` or
+    /// `next` call, fails, the error is stashed here and every subsequent
+    /// `next_entry` returns it instead of advancing, since after a failure
+    /// the iterator's underlying state is unsafe to keep using.
+    invalidated_error: Option<SlateDBError>,
+    read_span: tracing::Span,
+}
+
+impl DbRecencyIterator {
+    pub(crate) fn new(
+        sources: VecDeque<RecencySource>,
+        context: RecencySourceContext,
+        read_span: tracing::Span,
+    ) -> Self {
+        Self {
+            sources,
+            current: None,
+            context,
+            invalidated_error: None,
+            read_span,
+        }
+    }
+
+    /// Returns the next raw [`RowEntry`] in recency order, advancing to the
+    /// next source when the current one is exhausted. Tombstones and merge
+    /// operands are not filtered. See [`crate::Db::scan_prefix_by_recency`]
+    /// for the full contract.
+    pub async fn next_entry(&mut self) -> Result<Option<RowEntry>, crate::Error> {
+        let read_span = self.read_span.clone();
+        self.next_entry_inner().instrument(read_span).await
+    }
+
+    async fn next_entry_inner(&mut self) -> Result<Option<RowEntry>, crate::Error> {
+        if let Some(error) = &self.invalidated_error {
+            return Err(error.clone().into());
+        }
+
+        loop {
+            let Some(iter) = &mut self.current else {
+                let Some(source) = self.sources.front() else {
+                    return Ok(None);
+                };
+                match self.context.build_iterator(source).await {
+                    Ok(Some(mut iter)) => {
+                        if let Err(e) = iter.init().await {
+                            return Err(self.invalidate(e));
+                        }
+                        self.current = Some(iter);
+                    }
+                    Ok(None) => {}
+                    Err(e) => return Err(self.invalidate(e)),
+                }
+                // The front source leaves the queue only after its iterator is
+                // built and initialized, so a dropped `next_entry` call builds
+                // it again rather than skipping it.
+                self.sources.pop_front();
+                continue;
+            };
+
+            let next = iter.next().await;
+            // Keep cached iteration cooperative.
+            tokio::task::coop::consume_budget().await;
+            match next {
+                Ok(Some(entry)) => return Ok(Some(entry)),
+                Ok(None) => self.current = None,
+                Err(e) => return Err(self.invalidate(e)),
+            }
+        }
+    }
+
+    fn invalidate(&mut self, error: SlateDBError) -> crate::Error {
+        self.invalidated_error = Some(error.clone());
+        error.into()
+    }
+}
+
 /// A source of a recency scan. Its iterator is built only when the walk
 /// reaches it.
 #[allow(clippy::large_enum_variant)]
@@ -491,7 +575,7 @@ pub(crate) struct RecencySourceContext {
 impl RecencySourceContext {
     /// Builds the iterator for `source`, or `None` when the source cannot
     /// hold a key in the range. The iterator is not yet initialized.
-    async fn materialize(
+    async fn build_iterator(
         &self,
         source: &RecencySource,
     ) -> Result<Option<Box<dyn RowEntryIterator + 'static>>, SlateDBError> {
@@ -540,113 +624,6 @@ impl RecencySourceContext {
             Some(max_seq) => Box::new(FilterIterator::new_with_max_seq(iter, Some(max_seq))),
             None => iter,
         }))
-    }
-}
-
-/// One entry of the recency walk. A source is listed until the walk reaches
-/// it, then its iterator is built in place and initialized.
-#[allow(clippy::large_enum_variant)]
-enum RecencyEntry {
-    Listed(RecencySource),
-    Built {
-        iter: Box<dyn RowEntryIterator + 'static>,
-        initialized: bool,
-    },
-}
-
-/// See [`crate::Db::scan_prefix_by_recency`] for the full contract.
-pub struct DbRecencyIterator {
-    /// Entries ordered from most recent to least recent. The front entry is
-    /// the source being drained.
-    ///
-    /// The front entry stays in the queue until it is exhausted, so a dropped
-    /// `next_entry` call resumes it rather than skipping it.
-    entries: VecDeque<RecencyEntry>,
-    /// The context used to build the iterator of a source.
-    context: RecencySourceContext,
-    /// Sticky error. Once building a source, or any underlying `init` or
-    /// `next` call, fails, the error is stashed here and every subsequent
-    /// `next_entry` returns it instead of advancing, since after a failure
-    /// the iterator's underlying state is unsafe to keep using.
-    invalidated_error: Option<SlateDBError>,
-    read_span: tracing::Span,
-}
-
-impl DbRecencyIterator {
-    pub(crate) fn new(
-        sources: VecDeque<RecencySource>,
-        context: RecencySourceContext,
-        read_span: tracing::Span,
-    ) -> Self {
-        Self {
-            entries: sources.into_iter().map(RecencyEntry::Listed).collect(),
-            context,
-            invalidated_error: None,
-            read_span,
-        }
-    }
-
-    /// Returns the next raw [`RowEntry`] in recency order, advancing to the
-    /// next source when the current one is exhausted. Tombstones and merge
-    /// operands are not filtered. See [`crate::Db::scan_prefix_by_recency`]
-    /// for the full contract.
-    pub async fn next_entry(&mut self) -> Result<Option<RowEntry>, crate::Error> {
-        let read_span = self.read_span.clone();
-        self.next_entry_inner().instrument(read_span).await
-    }
-
-    async fn next_entry_inner(&mut self) -> Result<Option<RowEntry>, crate::Error> {
-        if let Some(error) = &self.invalidated_error {
-            return Err(error.clone().into());
-        }
-
-        loop {
-            let Some(front) = self.entries.front_mut() else {
-                return Ok(None);
-            };
-
-            let (iter, initialized) = match front {
-                RecencyEntry::Built { iter, initialized } => (iter, initialized),
-                RecencyEntry::Listed(source) => {
-                    match self.context.materialize(source).await {
-                        Ok(Some(iter)) => {
-                            *front = RecencyEntry::Built {
-                                iter,
-                                initialized: false,
-                            };
-                        }
-                        Ok(None) => {
-                            self.entries.pop_front();
-                        }
-                        Err(e) => return Err(self.invalidate(e)),
-                    }
-                    continue;
-                }
-            };
-
-            if !*initialized {
-                if let Err(e) = iter.init().await {
-                    return Err(self.invalidate(e));
-                }
-                *initialized = true;
-            }
-
-            let next = iter.next().await;
-            // Keep cached iteration cooperative.
-            tokio::task::coop::consume_budget().await;
-            match next {
-                Ok(Some(entry)) => return Ok(Some(entry)),
-                Ok(None) => {
-                    self.entries.pop_front();
-                }
-                Err(e) => return Err(self.invalidate(e)),
-            }
-        }
-    }
-
-    fn invalidate(&mut self, error: SlateDBError) -> crate::Error {
-        self.invalidated_error = Some(error.clone());
-        error.into()
     }
 }
 
