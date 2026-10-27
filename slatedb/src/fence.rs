@@ -562,6 +562,9 @@ mod tests {
             "expected Fenced, got {:?}",
             result.map(|_| ())
         );
+        // the paused fencer must not have fenced the new db's next WAL ID, so
+        // the new db can still make writes durable.
+        h.put(&db2, 5, false).await;
         db2.close().await.unwrap();
 
         // validate that the wal is contiguous and db has all data

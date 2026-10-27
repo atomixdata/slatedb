@@ -111,12 +111,18 @@ impl wal::WriterInit for SlateDbWalWriterInit {
             // Exclude the IDs that an older writer can still upload into: at
             // most `window` IDs, starting at the frontier. Record the range
             // before the fence, so a reader that sees the fence finds the
-            // range. With a window of 1, g is the only ID an older writer can
-            // still upload to, so the fence alone excludes it.
+            // range.
             if window > 1 {
                 writer_manifest
                     .exclude_wal_range(frontier, end_wal_id)
                     .await?;
+            }
+            // With a window of 1, g is the only ID an older writer can still
+            // upload to, so the fence alone excludes it. However, we still
+            // need to check the epoch: otherwise, a stale initializer that
+            // walked a newer writer's WAL could fence that writer's next ID.
+            else {
+                writer_manifest.refresh().await?;
             }
             let wrote_fence = match self.table_store.write_wal_fence(frontier.into()).await {
                 Ok(()) => true,

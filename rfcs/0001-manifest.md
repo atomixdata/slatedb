@@ -483,7 +483,7 @@ _NOTE: A snapshot is created in (4) to prevent the compactor from deleting `wal`
 The writer client must then fence all older clients. This is done by writing an empty SST at the frontier of the WAL.
 
 1. List the `wal` directory to find the frontier.
-2. If `wal_excluded_range_max_size` is above 1, record an excluded range that starts at the frontier in the manifest. See _Parallel Writes_ below.
+2. If `wal_excluded_range_max_size` is above 1, record an excluded range that starts at the frontier in the manifest. See _Parallel Writes_ below. Otherwise, reload the manifest, and halt if a newer writer exists. Either way, this checks the epoch after the frontier was found, so a stale writer cannot fence the next SST ID of a newer writer.
 3. Write an empty SST with the new `writer_epoch` to the frontier using CAS or object versioning.
 
 _NOTE: The writer may choose to release its snapshot created in (1) after writing the fencing SST in (3), or it may periodically refresh its snapshot._
