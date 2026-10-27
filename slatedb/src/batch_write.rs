@@ -55,9 +55,10 @@ pub(crate) type WriteBatchResult = Result<WriteHandle, SlateDBError>;
 pub(crate) type BatchWriterFlushResult = (FlushResultFuture, CheckpointCursor);
 
 /// Environment variable with the number of threads that insert a group of
-/// queued writes into the memtable: the writer and helper threads. 1 (the
-/// default) applies each write on its own. Above 1, the writer takes every
-/// queued write as one group.
+/// queued writes into the memtable: the writer and helper threads. It
+/// overrides [`DbBuilder::with_memtable_insert_tasks`](crate::DbBuilder::with_memtable_insert_tasks).
+/// 1 applies each write on its own. Above 1, the writer takes every queued
+/// write as one group.
 const MEMTABLE_INSERT_TASKS_ENV: &str = "SLATEDB_MEMTABLE_INSERT_TASKS";
 
 /// The most queued writes the writer takes as one group.
@@ -139,11 +140,15 @@ pub(crate) struct WriteBatchEventHandler {
 }
 
 impl WriteBatchEventHandler {
-    pub(crate) fn new(db_inner: Arc<DbInner>, wal_writer: Option<Box<dyn WalWriter>>) -> Self {
+    pub(crate) fn new(
+        db_inner: Arc<DbInner>,
+        wal_writer: Option<Box<dyn WalWriter>>,
+        memtable_insert_tasks: usize,
+    ) -> Self {
         let memtable_insert_tasks = std::env::var(MEMTABLE_INSERT_TASKS_ENV)
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(1)
+            .unwrap_or(memtable_insert_tasks)
             .max(1);
         Self {
             db_inner,
@@ -903,7 +908,7 @@ mod tests {
         .await
         .unwrap();
         let wal_writer = Box::new(FailingWalWriter::new(FailingWalOperation::Append));
-        let mut handler = WriteBatchEventHandler::new(db.inner.clone(), Some(wal_writer));
+        let mut handler = WriteBatchEventHandler::new(db.inner.clone(), Some(wal_writer), 1);
 
         let mut batch = WriteBatch::new();
         batch.put(b"key", b"value");
@@ -931,7 +936,7 @@ mod tests {
         .await
         .unwrap();
         let wal_writer = Box::new(FailingWalWriter::new(FailingWalOperation::Flush));
-        let mut handler = WriteBatchEventHandler::new(db.inner.clone(), Some(wal_writer));
+        let mut handler = WriteBatchEventHandler::new(db.inner.clone(), Some(wal_writer), 1);
         let (done, done_rx) = oneshot::channel();
         let msg = BatchWriterMessage::Flush(BatchWriterFlush {
             freeze_memtable: false,
@@ -956,7 +961,7 @@ mod tests {
             .await
             .unwrap();
         let wal_writer = Box::new(FakeWalWriter::new(0));
-        let mut handler = WriteBatchEventHandler::new(db.inner.clone(), Some(wal_writer));
+        let mut handler = WriteBatchEventHandler::new(db.inner.clone(), Some(wal_writer), 1);
 
         // Write with a user-defined seqnum
         let mut batch = WriteBatch::new();
@@ -993,7 +998,7 @@ mod tests {
         .unwrap();
         let wal_writer = Box::new(FakeWalWriter::new(0));
 
-        let mut handler = WriteBatchEventHandler::new(db.inner.clone(), Some(wal_writer));
+        let mut handler = WriteBatchEventHandler::new(db.inner.clone(), Some(wal_writer), 1);
 
         // First, do a normal write to advance the oracle
         let mut batch = WriteBatch::new();

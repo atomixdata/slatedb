@@ -187,6 +187,7 @@ pub struct DbBuilder<P: Into<Path>> {
     gc_runtime: Option<Handle>,
     write_runtime: Option<Handle>,
     memtable_flush_runtime: Option<Handle>,
+    memtable_insert_tasks: usize,
     compactor_builder: Option<CompactorBuilder<Path>>,
     gc_builder: Option<GarbageCollectorBuilder<Path>>,
     fp_registry: Arc<FailPointRegistry>,
@@ -221,6 +222,7 @@ impl<P: Into<Path>> DbBuilder<P> {
             gc_runtime: None,
             write_runtime: None,
             memtable_flush_runtime: None,
+            memtable_insert_tasks: 1,
             compactor_builder: None,
             gc_builder: None,
             fp_registry: Arc::new(FailPointRegistry::new()),
@@ -365,6 +367,15 @@ impl<P: Into<Path>> DbBuilder<P> {
     /// The caller must drive `runtime` until [`Db::close`] returns.
     pub fn with_memtable_flush_runtime(mut self, runtime: Handle) -> Self {
         self.memtable_flush_runtime = Some(runtime);
+        self
+    }
+
+    /// Inserts the queued writes into the memtable as one group, on the batch
+    /// writer and `tasks - 1` helper threads. With 1, the default, the writer
+    /// inserts each write on its own. The helpers park between groups. The
+    /// `SLATEDB_MEMTABLE_INSERT_TASKS` environment variable overrides it.
+    pub fn with_memtable_insert_tasks(mut self, tasks: usize) -> Self {
+        self.memtable_insert_tasks = tasks;
         self
     }
 
@@ -772,7 +783,11 @@ impl<P: Into<Path>> DbBuilder<P> {
         let tokio_handle = Handle::current();
         task_executor.add_handler(
             WRITE_BATCH_TASK_NAME.to_string(),
-            Box::new(WriteBatchEventHandler::new(inner.clone(), wal_writer)),
+            Box::new(WriteBatchEventHandler::new(
+                inner.clone(),
+                wal_writer,
+                self.memtable_insert_tasks,
+            )),
             write_rx,
             self.write_runtime.as_ref().unwrap_or(&tokio_handle),
         )?;
@@ -2904,6 +2919,50 @@ mod tests {
 
         background.block_on(db.close()).expect("failed to close db");
         assert_eq!(flusher.metrics().num_alive_tasks(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_memtable_insert_tasks_apply_concurrent_batches() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let db = Arc::new(
+            crate::Db::builder(
+                Path::from("test_memtable_insert_tasks_apply_concurrent_batches"),
+                object_store,
+            )
+            .with_memtable_insert_tasks(4)
+            .build()
+            .await
+            .expect("failed to build db"),
+        );
+        // Queued batches of 4 entries from 32 writers make groups larger than
+        // one insert chunk, so the helper threads take part.
+        let writers = (0..32).map(|writer| {
+            let db = Arc::clone(&db);
+            tokio::spawn(async move {
+                for round in 0..64u32 {
+                    let mut batch = crate::WriteBatch::new();
+                    for key in 0..4 {
+                        batch.put(format!("w{writer}-k{key}"), round.to_be_bytes());
+                    }
+                    db.write(batch).await?;
+                }
+                Ok::<_, crate::Error>(())
+            })
+        });
+        for writer in futures::future::join_all(writers).await {
+            writer.expect("writer panicked").expect("failed to write");
+        }
+
+        for writer in 0..32 {
+            for key in 0..4 {
+                let value = db
+                    .get(format!("w{writer}-k{key}"))
+                    .await
+                    .expect("failed to get");
+                assert_eq!(value.as_deref(), Some(63u32.to_be_bytes().as_ref()));
+            }
+        }
+        db.close().await.expect("failed to close db");
     }
 
     #[tokio::test]
