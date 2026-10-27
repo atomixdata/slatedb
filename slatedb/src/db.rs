@@ -1200,13 +1200,13 @@ impl Db {
     ///
     /// Pull entries from the freshest source under the prefix and stop.
     /// Because sources are walked newest-first, and each source's iterator is
-    /// built only when the walk reaches it, an early-return like this only
-    /// touches the source that holds the freshest data. Note that *within* a
-    /// source the order is set by `options.order` (ascending by default), so
-    /// the first yielded entry is the smallest key in the freshest source, not
-    /// necessarily the most recently written key. Across sources the same key
-    /// may appear more than once, so callers that want only the freshest value
-    /// per key should dedupe.
+    /// built only when the walk reaches it, an early return like this builds
+    /// no iterators for the sources after the first source that holds a
+    /// match. Note that *within* a source the order is set by `options.order`
+    /// (ascending by default), so the first yielded entry is the smallest key
+    /// in the freshest source, not necessarily the most recently written key.
+    /// Across sources the same key may appear more than once, so callers that
+    /// want only the freshest value per key should dedupe.
     ///
     /// ```
     /// use slatedb::{Db, Error};
