@@ -52,6 +52,27 @@ pub(crate) fn bounded_sst_view(id: u64, first: &'static [u8], last: &'static [u8
     ))
 }
 
+/// Extracts the bytes of a key up to and including its first `@`.
+///
+/// Tests use it as a key group extractor. The keys `a@1` and `a@2` are in one
+/// group, with the first key `a@`. A key without `@` is the prefix of its group. This is
+/// like an application that stores the versions of a record as `record@version`.
+pub(crate) struct VersionSuffixExtractor;
+
+impl crate::prefix_extractor::PrefixExtractor for VersionSuffixExtractor {
+    fn name(&self) -> &str {
+        "test.version_suffix"
+    }
+
+    fn prefix_len(&self, target: &crate::prefix_extractor::PrefixTarget) -> Option<usize> {
+        let bytes = match target {
+            crate::prefix_extractor::PrefixTarget::Point(key) => key,
+            crate::prefix_extractor::PrefixTarget::Prefix(prefix) => prefix,
+        };
+        bytes.iter().position(|&byte| byte == b'@').map(|at| at + 1)
+    }
+}
+
 /// Asserts that the iterator returns the exact set of expected values in correct order.
 pub(crate) async fn assert_iterator<T: RowEntryIterator>(iterator: &mut T, entries: Vec<RowEntry>) {
     iterator

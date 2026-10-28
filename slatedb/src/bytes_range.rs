@@ -242,7 +242,7 @@ impl BytesRange {
 
     /// Compute the smallest byte string that is lexicographically greater than any key
     /// starting with `prefix`. Returns `None` when `prefix` is all `0xff`.
-    fn increment_prefix(prefix: &[u8]) -> Option<Bytes> {
+    pub(crate) fn increment_prefix(prefix: &[u8]) -> Option<Bytes> {
         let mut upper_bound = prefix.to_vec();
 
         for i in (0..upper_bound.len()).rev() {
