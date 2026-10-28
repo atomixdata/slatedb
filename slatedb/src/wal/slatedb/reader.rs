@@ -239,6 +239,12 @@ impl SlateDbWalReader {
 
 #[async_trait]
 impl WalReader for SlateDbWalReader {
+    /// Returns an iterator over `wal_file_id_range`. The iterator reads WAL
+    /// IDs in order, waits at a missing ID, and skips excluded ranges.
+    ///
+    /// If the range starts later than the first WAL ID after the replay
+    /// boundary of the manifest, the iterator can return writes that are not
+    /// durable, for example writes that a later writer takeover excludes.
     async fn iterator(
         &self,
         wal_file_id_range: WalFileRange,
