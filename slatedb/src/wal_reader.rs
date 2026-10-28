@@ -12,6 +12,25 @@
 //! order. Iterating each file with [`WalFile::iterator`] yields [`RowEntry`]
 //! values in the order they are stored in that WAL SST.
 //!
+//! A fence is a zero-byte WAL file that a new writer writes when it takes
+//! over. [`WalFile::iterator`] returns no entries for it.
+//!
+//! # More than one WAL upload at a time
+//!
+//! If the database allows more than one WAL upload at a time, WAL files can
+//! land out of order. [`WalReader::list`] can then return a file after a
+//! missing ID. That file is not acknowledged yet. If the missing ID lands, the
+//! file becomes part of the database history. If a writer takeover happens
+//! first, the takeover can exclude it: it records a range of WAL IDs in the
+//! manifest and writes a fence at the start of the range. This API does not
+//! follow the database history: [`WalReader::list`], [`WalFile::next_id`], and
+//! [`WalFile::next_file`] do not wait at a missing ID or skip an excluded
+//! range.
+//!
+//! For such a database, use the iterator of
+//! [`SlateDbWalReader`](crate::wal::SlateDbWalReader) instead. It reads WAL IDs
+//! in order, waits at a missing ID, and skips excluded ranges.
+//!
 //! `WalFileIterator` intentionally exposes `next`, not `next`. This keeps
 //! the API at [`RowEntry`] level and preserves tombstones and merge rows exactly
 //! as written to the WAL.
@@ -135,7 +154,7 @@ impl WalFile {
     }
 
     /// Returns an iterator over `RowEntry`s in this WAL file. Raises an error if the
-    /// WAL file could not be read.
+    /// WAL file could not be read. A fence has no entries.
     ///
     /// ## Errors
     ///
@@ -169,6 +188,8 @@ impl WalFile {
     }
 
     /// Returns the WAL ID immediately following this file's ID.
+    ///
+    /// It does not wait at a missing ID. See the module docs.
     pub fn next_id(&self) -> u64 {
         self.id + 1
     }
@@ -176,6 +197,7 @@ impl WalFile {
     /// Returns a [`WalFile`] handle for the next WAL file after this one.
     ///
     /// This does not check whether the next WAL file actually exists in object storage.
+    /// It does not wait at a missing ID. See the module docs.
     pub fn next_file(&self) -> Self {
         Self {
             id: self.next_id(),
@@ -207,6 +229,8 @@ impl WalReader {
 
     /// Lists WAL files in ascending order by their ID within the specified range.
     /// If `range` is unbounded, all WAL files are returned.
+    ///
+    /// The list can include files after a missing ID. See the module docs.
     pub async fn list<R: RangeBounds<u64>>(&self, range: R) -> Result<Vec<WalFile>, crate::Error> {
         let start = match range.start_bound() {
             Bound::Included(id) => Bound::Included(WalFileId::from(*id)),

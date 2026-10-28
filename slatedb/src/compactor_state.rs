@@ -1060,6 +1060,8 @@ impl CompactorState {
             segment_extractor_name: remote_manifest.value.core.segment_extractor_name.clone(),
             next_wal_sst_id: remote_manifest.value.core.next_wal_sst_id,
             replay_after_wal_id: remote_manifest.value.core.replay_after_wal_id,
+            wal_excluded_range_max_size: remote_manifest.value.core.wal_excluded_range_max_size,
+            wal_excluded_ranges: remote_manifest.value.core.wal_excluded_ranges.clone(),
             last_l0_clock_tick: remote_manifest.value.core.last_l0_clock_tick,
             last_l0_seq: remote_manifest.value.core.last_l0_seq,
             checkpoints: remote_manifest.value.core.checkpoints.clone(),

@@ -946,6 +946,10 @@ impl<'a> StateModifier<'a> {
             segment_extractor_name: my_db_state.segment_extractor_name.clone(),
             next_wal_sst_id: my_db_state.next_wal_sst_id,
             replay_after_wal_id: my_db_state.replay_after_wal_id,
+            wal_excluded_range_max_size: my_db_state
+                .wal_excluded_range_max_size
+                .max(remote_manifest.value.core.wal_excluded_range_max_size),
+            wal_excluded_ranges: my_db_state.wal_excluded_ranges.clone(),
             last_l0_clock_tick: my_db_state.last_l0_clock_tick,
             last_l0_seq: my_db_state.last_l0_seq,
             recent_snapshot_min_seq: my_db_state.recent_snapshot_min_seq,
