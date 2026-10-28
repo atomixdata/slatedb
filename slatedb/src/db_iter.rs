@@ -580,11 +580,25 @@ impl RecencySourceContext {
         source: &RecencySource,
     ) -> Result<Option<Box<dyn RowEntryIterator + 'static>>, SlateDBError> {
         let iter: Box<dyn RowEntryIterator + 'static> = match source {
-            RecencySource::MemTable(table) => Box::new(table.range(
-                self.range.clone(),
-                self.sst_iter_options.order,
-                self.read_trace.clone(),
-            )),
+            RecencySource::MemTable(table) => {
+                // Skip a memtable with no key under the prefix before building
+                // its iterator.
+                if let Some(prefix) = &self.sst_iter_options.prefix {
+                    let contains_prefix = {
+                        let span = self.read_trace.new_memtable_span();
+                        let _guard = span.enter();
+                        table.contains_prefix(prefix)
+                    };
+                    if !contains_prefix {
+                        return Ok(None);
+                    }
+                }
+                Box::new(table.range(
+                    self.range.clone(),
+                    self.sst_iter_options.order,
+                    self.read_trace.clone(),
+                ))
+            }
             RecencySource::L0(view) => {
                 let iter = SstIterator::new_owned_with_stats(
                     self.range.clone(),
