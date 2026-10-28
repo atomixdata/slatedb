@@ -160,11 +160,11 @@ use crate::tablestore::{TableStore, TableStoreKind};
 use crate::utils::ObjectStoreType;
 use crate::utils::SafeSender;
 use crate::utils::WatchableOnceCell;
-use crate::wal;
 use crate::wal::slatedb::admin::SlateDbWalAdmin;
 use crate::wal::slatedb::store::WalTableStore;
 use crate::wal::wal_disabled::DisabledWalObserver;
 use crate::wal::{WalAdmin, WalGc, WalObserver};
+use crate::{wal, PrefixExtractor};
 use slatedb_common::clock::DefaultSystemClock;
 use slatedb_common::clock::SystemClock;
 use slatedb_common::metrics::MetricsRecorder;
@@ -197,7 +197,7 @@ pub struct DbBuilder<P: Into<Path>> {
     block_transformer: Option<Arc<dyn BlockTransformer>>,
     filter_policies: Vec<Arc<dyn FilterPolicy>>,
     metrics_recorder: Arc<dyn MetricsRecorder>,
-    segment_extractor: Option<Arc<dyn crate::prefix_extractor::PrefixExtractor>>,
+    segment_extractor: Option<Arc<dyn PrefixExtractor>>,
     wal_writer_init: Option<Box<dyn wal::WriterInit>>,
     expected_epoch: Option<u64>,
 }
@@ -255,10 +255,7 @@ impl<P: Into<Path>> DbBuilder<P> {
     /// routing for all existing key schemas and keeps segment prefixes across
     /// schema versions an antichain (no prefix may be a proper prefix of
     /// another).
-    pub fn with_segment_extractor(
-        mut self,
-        extractor: Arc<dyn crate::prefix_extractor::PrefixExtractor>,
-    ) -> Self {
+    pub fn with_segment_extractor(mut self, extractor: Arc<dyn PrefixExtractor>) -> Self {
         self.segment_extractor = Some(extractor);
         self
     }
@@ -946,6 +943,7 @@ pub struct AdminBuilder<P: Into<Path>> {
     compaction_filter_supplier: Option<Arc<dyn CompactionFilterSupplier>>,
     merge_operator: Option<MergeOperatorType>,
     block_transformer: Option<Arc<dyn BlockTransformer>>,
+    key_group_extractor: Option<Arc<dyn PrefixExtractor>>,
 }
 
 impl<P: Into<Path>> AdminBuilder<P> {
@@ -963,6 +961,7 @@ impl<P: Into<Path>> AdminBuilder<P> {
             compaction_filter_supplier: None,
             merge_operator: None,
             block_transformer: None,
+            key_group_extractor: None,
         }
     }
 
@@ -1005,6 +1004,13 @@ impl<P: Into<Path>> AdminBuilder<P> {
         supplier: Arc<dyn CompactionFilterSupplier>,
     ) -> Self {
         self.compaction_filter_supplier = Some(supplier);
+        self
+    }
+
+    /// Sets the key group extractor for the compactor that this admin runs. See
+    /// [`CompactorBuilder::with_key_group_extractor`].
+    pub fn with_key_group_extractor(mut self, extractor: Arc<dyn PrefixExtractor>) -> Self {
+        self.key_group_extractor = Some(extractor);
         self
     }
 
@@ -1057,6 +1063,7 @@ impl<P: Into<Path>> AdminBuilder<P> {
             compaction_filter_supplier: self.compaction_filter_supplier,
             merge_operator: self.merge_operator,
             block_transformer: self.block_transformer,
+            key_group_extractor: self.key_group_extractor,
         }
     }
 }
@@ -1277,6 +1284,7 @@ pub struct CompactorBuilder<P: Into<Path>> {
     filter_policies: Vec<Arc<dyn FilterPolicy>>,
     sst_block_size: Option<SstBlockSize>,
     sst_block_alignment: bool,
+    key_group_extractor: Option<Arc<dyn PrefixExtractor>>,
     #[cfg(feature = "compaction_filters")]
     compaction_filter_supplier: Option<Arc<dyn CompactionFilterSupplier>>,
 }
@@ -1301,6 +1309,7 @@ impl<P: Into<Path>> CompactorBuilder<P> {
             filter_policies: default_filter_policies(),
             sst_block_size: None,
             sst_block_alignment: false,
+            key_group_extractor: None,
             #[cfg(feature = "compaction_filters")]
             compaction_filter_supplier: None,
         }
@@ -1324,6 +1333,7 @@ impl<P: Into<Path>> CompactorBuilder<P> {
             filter_policies: self.filter_policies,
             sst_block_size: self.sst_block_size,
             sst_block_alignment: self.sst_block_alignment,
+            key_group_extractor: self.key_group_extractor,
             #[cfg(feature = "compaction_filters")]
             compaction_filter_supplier: self.compaction_filter_supplier,
         }
@@ -1436,6 +1446,29 @@ impl<P: Into<Path>> CompactorBuilder<P> {
         self
     }
 
+    /// Sets the extractor that defines key groups for incremental commits.
+    ///
+    /// An incremental commit publishes the finished output of a running job. With an
+    /// extractor, a commit publishes all keys that share an extracted prefix, or none
+    /// of them. If the extractor returns no prefix for a key, the whole key is the
+    /// prefix. Set an extractor if an application stores the versions of one record as
+    /// keys with a shared prefix and reads only the first version that it finds.
+    /// Without an extractor, such a read can find an old version in an input run after
+    /// the newer versions moved to the destination run.
+    ///
+    /// SlateDB calls the extractor only with `PrefixTarget::Point` and keys that a
+    /// compaction wrote. For those keys, it must keep the `PrefixTarget::Point`
+    /// invariant of [`crate::PrefixExtractor`]. All compactors of a database must use
+    /// the same extractor, and it must not change while a job runs. SlateDB does not
+    /// check this.
+    ///
+    /// Has an effect only when [`CompactorOptions::enable_incremental_compaction`] is
+    /// `true`. Defaults to `None`, so each key is a group by itself.
+    pub fn with_key_group_extractor(mut self, extractor: Arc<dyn PrefixExtractor>) -> Self {
+        self.key_group_extractor = Some(extractor);
+        self
+    }
+
     /// Sets the SST block size the worker uses when it rewrites SSTs.
     ///
     /// Must match the writer's `DbBuilder::with_sst_block_size` configuration
@@ -1513,6 +1546,7 @@ impl<P: Into<Path>> CompactorBuilder<P> {
             self.fp_registry,
             self.closed_result,
             self.merge_operator,
+            self.key_group_extractor,
             #[cfg(feature = "compaction_filters")]
             self.compaction_filter_supplier,
         )
@@ -1551,6 +1585,7 @@ impl<P: Into<Path>> CompactorBuilder<P> {
             self.system_clock.clone(),
             recorder.clone(),
             self.expected_epoch,
+            self.key_group_extractor,
         )
         .await?;
         let worker = options.worker.clone().map(|worker_options| {
@@ -1833,7 +1868,7 @@ pub struct DbReaderBuilder<P: Into<Path>> {
     merge_operator: Option<MergeOperatorType>,
     block_transformer: Option<Arc<dyn BlockTransformer>>,
     filter_policies: Vec<Arc<dyn FilterPolicy>>,
-    segment_extractor: Option<Arc<dyn crate::prefix_extractor::PrefixExtractor>>,
+    segment_extractor: Option<Arc<dyn PrefixExtractor>>,
     options: DbReaderOptions,
     system_clock: Arc<dyn SystemClock>,
     rand: Arc<DbRand>,
@@ -1891,10 +1926,7 @@ impl<P: Into<Path>> DbReaderBuilder<P> {
     /// re-derives each WAL-replayed entry's segment prefix so that in-memory
     /// segments are reported via [`DbReader::subscribe`]. Must match the
     /// extractor the database was created with.
-    pub fn with_segment_extractor(
-        mut self,
-        extractor: Arc<dyn crate::prefix_extractor::PrefixExtractor>,
-    ) -> Self {
+    pub fn with_segment_extractor(mut self, extractor: Arc<dyn PrefixExtractor>) -> Self {
         self.segment_extractor = Some(extractor);
         self
     }
