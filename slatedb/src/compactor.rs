@@ -84,6 +84,7 @@ use crate::incremental_progress::IncrementalProgress;
 use crate::manifest::store::ManifestStore;
 use crate::manifest::{LsmTreeState, ManifestCore};
 use crate::merge_operator::MergeOperatorType;
+use crate::prefix_extractor::PrefixExtractor;
 use crate::tablestore::TableStore;
 use crate::utils::{format_bytes_si, IdGenerator};
 use slatedb_common::clock::SystemClock;
@@ -323,6 +324,7 @@ pub struct Compactor {
     system_clock: Arc<dyn SystemClock>,
     fp_registry: Arc<FailPointRegistry>,
     merge_operator: Option<MergeOperatorType>,
+    key_group_extractor: Option<Arc<dyn PrefixExtractor>>,
     #[cfg(feature = "compaction_filters")]
     compaction_filter_supplier: Option<Arc<dyn CompactionFilterSupplier>>,
 }
@@ -343,6 +345,7 @@ impl Compactor {
         fp_registry: Arc<FailPointRegistry>,
         closed_result: Arc<dyn ClosedResultWriter>,
         merge_operator: Option<MergeOperatorType>,
+        key_group_extractor: Option<Arc<dyn PrefixExtractor>>,
         #[cfg(feature = "compaction_filters")] compaction_filter_supplier: Option<
             Arc<dyn CompactionFilterSupplier>,
         >,
@@ -367,6 +370,7 @@ impl Compactor {
             system_clock,
             fp_registry,
             merge_operator,
+            key_group_extractor,
             #[cfg(feature = "compaction_filters")]
             compaction_filter_supplier,
         }
@@ -400,6 +404,7 @@ impl Compactor {
             self.system_clock.clone(),
             self.recorder.clone(),
             self.expected_epoch,
+            self.key_group_extractor.clone(),
         )
         .await?;
         self.task_executor
@@ -542,6 +547,9 @@ pub(crate) struct CompactorEventHandler {
     /// The value lives only in memory, so a restarted coordinator can make an
     /// incremental commit on its first poll.
     last_incremental_commit: Option<chrono::DateTime<chrono::Utc>>,
+    /// Defines the key groups that an incremental commit publishes whole. See
+    /// [`IncrementalProgress::from_compaction`].
+    key_group_extractor: Option<Arc<dyn PrefixExtractor>>,
 }
 
 #[async_trait]
@@ -602,6 +610,7 @@ impl CompactorEventHandler {
         system_clock: Arc<dyn SystemClock>,
         recorder: MetricsRecorderHelper,
         expected_epoch: Option<u64>,
+        key_group_extractor: Option<Arc<dyn PrefixExtractor>>,
     ) -> Result<Self, SlateDBError> {
         let state_writer = CompactorStateWriter::new(
             manifest_store,
@@ -625,6 +634,7 @@ impl CompactorEventHandler {
             prev_claimed: HashSet::new(),
             worker_heartbeat_gauges: HashMap::new(),
             last_incremental_commit: None,
+            key_group_extractor,
         })
     }
 
@@ -1060,7 +1070,11 @@ impl CompactorEventHandler {
     fn apply_incremental_commits(&mut self, jobs: &[Compaction]) -> bool {
         let mut changed = false;
         for job in jobs {
-            let progress = IncrementalProgress::from_compaction(job, &self.rand);
+            let progress = IncrementalProgress::from_compaction(
+                job,
+                self.key_group_extractor.as_deref(),
+                &self.rand,
+            );
             match self
                 .state_writer
                 .state
@@ -5063,6 +5077,7 @@ mod tests {
                 Arc::new(DefaultSystemClock::new()),
                 MetricsRecorderHelper::noop(),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -5135,6 +5150,7 @@ mod tests {
                 compactor_stats.clone(),
                 system_clock.clone(),
                 recorder.clone(),
+                None,
                 None,
             )
             .await
@@ -5997,6 +6013,7 @@ mod tests {
             compactor_stats,
             system_clock,
             recorder,
+            None,
             None,
         )
         .await
