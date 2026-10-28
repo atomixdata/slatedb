@@ -519,14 +519,8 @@ impl DbRecencyIterator {
                 let Some(source) = self.sources.front() else {
                     return Ok(None);
                 };
-                match self.context.build_iterator(source).await {
-                    Ok(Some(mut iter)) => {
-                        if let Err(e) = iter.init().await {
-                            return Err(self.invalidate(e));
-                        }
-                        self.current = Some(iter);
-                    }
-                    Ok(None) => {}
+                match self.context.build_and_init_iterator(source).await {
+                    Ok(iter) => self.current = iter,
                     Err(e) => return Err(self.invalidate(e)),
                 }
                 // The front source leaves the queue only after its iterator is
@@ -573,9 +567,9 @@ pub(crate) struct RecencySourceContext {
 }
 
 impl RecencySourceContext {
-    /// Builds the iterator for `source`, or `None` when the source cannot
-    /// hold a key in the range. The iterator is not yet initialized.
-    async fn build_iterator(
+    /// Builds and initializes the iterator for `source`, or returns `None`
+    /// when the source cannot hold a key in the range.
+    async fn build_and_init_iterator(
         &self,
         source: &RecencySource,
     ) -> Result<Option<Box<dyn RowEntryIterator + 'static>>, SlateDBError> {
@@ -593,51 +587,89 @@ impl RecencySourceContext {
                         return Ok(None);
                     }
                 }
-                Box::new(table.range(
+                let mut iter = table.range(
                     self.range.clone(),
                     self.sst_iter_options.order,
                     self.read_trace.clone(),
-                ))
+                );
+                iter.init().await?;
+                Box::new(iter)
             }
             RecencySource::L0(view) => {
-                let iter = SstIterator::new_owned_with_stats(
-                    self.range.clone(),
-                    view.clone(),
-                    self.table_store.clone(),
-                    self.sst_iter_options.clone(),
-                    Some(SstTracingContext::new(
-                        SstTraceLevel::L0,
-                        self.read_trace.clone(),
-                    )),
-                    Some(self.db_stats.clone()),
-                )?;
-                match iter {
+                match self.open_sst(view.clone(), SstTraceLevel::L0).await? {
                     Some(iter) => Box::new(iter),
                     None => return Ok(None),
                 }
             }
             RecencySource::SortedRun(sorted_run) => {
-                let sst_tracing_context = Some(SstTracingContext::new(
-                    SstTraceLevel::SortedRun(sorted_run.id),
-                    self.read_trace.clone(),
-                ));
-                Box::new(
-                    SortedRunIterator::new_owned(
-                        self.range.clone(),
-                        sorted_run.clone(),
-                        self.table_store.clone(),
-                        self.sst_iter_options.clone(),
-                        sst_tracing_context,
-                        Some(self.db_stats.clone()),
-                    )
-                    .await?,
-                )
+                let mut views = sorted_run.clone().into_tables_covering_range(&self.range);
+                // The SSTs of a run hold disjoint key ranges, so a prefix
+                // usually falls inside one of them. The run's iterator would
+                // read only that SST, so open it directly and let its filter
+                // rule out the whole run.
+                if views.len() <= 1 {
+                    let Some(view) = views.pop_front() else {
+                        return Ok(None);
+                    };
+                    match self
+                        .open_sst(view, SstTraceLevel::SortedRun(sorted_run.id))
+                        .await?
+                    {
+                        Some(iter) => Box::new(iter),
+                        None => return Ok(None),
+                    }
+                } else {
+                    self.open_sorted_run(sorted_run).await?
+                }
             }
         };
         Ok(Some(match self.max_seq {
             Some(max_seq) => Box::new(FilterIterator::new_with_max_seq(iter, Some(max_seq))),
             None => iter,
         }))
+    }
+
+    /// Opens an initialized iterator over one SST.
+    ///
+    /// Initializing checks the SST's filters before any index or block read,
+    /// and returns `None` when they rule the prefix out, so a filtered-out SST
+    /// is never boxed or read.
+    async fn open_sst(
+        &self,
+        view: SsTableView,
+        level: SstTraceLevel,
+    ) -> Result<Option<SstIterator<'static>>, SlateDBError> {
+        SstIterator::new_owned_initialized_with_stats(
+            self.range.clone(),
+            view,
+            self.table_store.clone(),
+            self.sst_iter_options.clone(),
+            Some(SstTracingContext::new(level, self.read_trace.clone())),
+            Some(self.db_stats.clone()),
+        )
+        .await
+    }
+
+    /// Opens an initialized iterator over a sorted run.
+    async fn open_sorted_run(
+        &self,
+        sorted_run: &SortedRun,
+    ) -> Result<Box<dyn RowEntryIterator + 'static>, SlateDBError> {
+        let sst_tracing_context = Some(SstTracingContext::new(
+            SstTraceLevel::SortedRun(sorted_run.id),
+            self.read_trace.clone(),
+        ));
+        Ok(Box::new(
+            SortedRunIterator::new_owned_initialized_with_stats(
+                self.range.clone(),
+                sorted_run.clone(),
+                self.table_store.clone(),
+                self.sst_iter_options.clone(),
+                sst_tracing_context,
+                Some(self.db_stats.clone()),
+            )
+            .await?,
+        ))
     }
 }
 
