@@ -4,23 +4,25 @@
 //! Measures `scan_prefix_by_recency` when every block is already in the block
 //! cache, so the cost comes from work on the CPU, not from I/O.
 //!
-//! The database has the active memtable, 8 L0 SSTs, and 4 sorted runs. Every
-//! SST holds keys at both ends of the key space, so only the prefix bloom
-//! filter can rule an SST out. The recency walk visits the memtable, then the
-//! L0 SSTs from newest to oldest, then the sorted runs from newest to oldest.
+//! The database has the active memtable, 4 immutable memtables, 8 L0 SSTs,
+//! and 4 sorted runs. Every SST holds keys at both ends of the key space, so
+//! only the prefix bloom filter can rule an SST out. The recency walk visits
+//! the memtables from newest to oldest, then the L0 SSTs from newest to
+//! oldest, then the sorted runs from newest to oldest. A fail point pauses the
+//! upload of immutable memtables to L0, so they stay in memory.
 //!
 //! The `first_entry` cases read the first entry of a prefix whose keys are in:
 //!
-//! - `in_memtable`: the memtable only, so the walk stops at the first source.
-//! - `in_newest_l0`: the newest L0 SST only, so the walk stops at the second
+//! - `in_memtable`: the active memtable only, so the walk stops at the first
 //!   source.
+//! - `in_newest_l0`: the newest L0 SST only, so the walk passes every memtable
+//!   first.
 //! - `in_sorted_run`: the oldest sorted run only, so the walk reaches every
 //!   source.
 //! - `absent`: no source, so the walk reaches every source and finds nothing.
-//! - `everywhere`: every source, so no source can be skipped.
 //!
-//! The `all_entries/everywhere` case reads every entry of an `everywhere`
-//! prefix, so the walk builds every source.
+//! The `all_entries/everywhere` case reads every entry of a prefix whose keys
+//! are in every source, so the walk builds every source and can skip none.
 //!
 //! Run: cargo bench -p slatedb --bench recency_scan_bench
 
@@ -31,6 +33,7 @@ use std::time::Duration;
 
 use chrono::TimeDelta;
 use criterion::{criterion_group, criterion_main, Criterion};
+use fail_parallel::FailPointRegistry;
 use object_store::memory::InMemory;
 use object_store::ObjectStore;
 use pprof::criterion::{Output, PProfProfiler};
@@ -49,6 +52,13 @@ const KEYS_PER_PREFIX: usize = 4;
 const SORTED_RUN_SOURCES: usize = 4;
 const SORTED_RUNS: usize = 4;
 const L0_SSTS: usize = 8;
+const IMM_MEMTABLES: usize = 4;
+/// A memtable larger than this is frozen into an immutable memtable. Every
+/// group of keys is smaller, so only an `IMM_VALUE_BYTES` value freezes one.
+const L0_SST_SIZE_BYTES: usize = 256 * 1024;
+const IMM_VALUE_BYTES: usize = 300 * 1024;
+/// Pausing this fail point keeps immutable memtables from being uploaded.
+const L0_UPLOAD_FAIL_POINT: &str = "write-compacted-sst-io-error";
 
 /// Each group of prefixes has its keys in one place. A prefix is
 /// `pk` followed by four digits, and each group starts at a multiple of 1000.
@@ -64,6 +74,8 @@ enum Group {
     Memtable,
     Absent,
     Everywhere,
+    /// One key per immutable memtable, with a value large enough to freeze it.
+    ImmMemtable,
 }
 
 impl Group {
@@ -76,6 +88,7 @@ impl Group {
             Group::Memtable => 4000,
             Group::Absent => 5000,
             Group::Everywhere => 6000,
+            Group::ImmMemtable => 7000,
         }
     }
 
@@ -134,8 +147,8 @@ fn cache() -> Arc<SplitCache> {
     )
 }
 
-/// With `compactor` set, one compaction merges the first SSTs into a sorted
-/// run. Without it, later SSTs stay in L0.
+/// With `compactor` set, each compaction merges `SORTED_RUN_SOURCES` L0 SSTs
+/// into a new sorted run. Without it, later SSTs stay in L0.
 fn settings(compactor: bool) -> Settings {
     let compactor_options = compactor.then(|| {
         let mut scheduler_options = HashMap::new();
@@ -155,6 +168,7 @@ fn settings(compactor: bool) -> Settings {
     Settings {
         // Every SST is small, so build filters for all of them.
         min_filter_keys: 0,
+        l0_sst_size_bytes: L0_SST_SIZE_BYTES,
         l0_max_ssts: L0_SSTS + 8,
         l0_max_ssts_per_key: L0_SSTS + 8,
         compactor_options,
@@ -169,11 +183,16 @@ fn scan_options() -> ScanOptions {
     }
 }
 
-async fn open(store: Arc<dyn ObjectStore>, compactor: bool) -> Db {
+async fn open(
+    store: Arc<dyn ObjectStore>,
+    compactor: bool,
+    fp_registry: Arc<FailPointRegistry>,
+) -> Db {
     Db::builder(PATH, store)
         .with_settings(settings(compactor))
         .with_db_cache(cache(), 0)
         .with_filter_policies(filter_policies())
+        .with_fp_registry(fp_registry)
         .build()
         .await
         .expect("failed to build db")
@@ -241,12 +260,14 @@ async fn read_prefix(db: &Db, prefix_idx: usize, all: bool) -> usize {
     entries
 }
 
-/// Builds the sorted runs, then the L0 SSTs, then the memtable keys, and reads
-/// every case once so that all blocks are cached.
-async fn build_db() -> Db {
+/// Builds the sorted runs, then the L0 SSTs, then the immutable memtables,
+/// then the active memtable, and reads every case once so that all blocks are
+/// cached.
+async fn build_db() -> (Db, Arc<FailPointRegistry>) {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let fp_registry = Arc::new(FailPointRegistry::new());
 
-    let db = open(store.clone(), true).await;
+    let db = open(store.clone(), true, fp_registry.clone()).await;
     for run in 0..SORTED_RUNS {
         for _ in 0..SORTED_RUN_SOURCES {
             put_groups(&db, &[Group::Sentinel, Group::Filler, Group::Everywhere]).await;
@@ -259,13 +280,22 @@ async fn build_db() -> Db {
     }
     db.close().await.expect("close failed");
 
-    let db = open(store, false).await;
+    let db = open(store, false, fp_registry.clone()).await;
     for i in 0..L0_SSTS {
         put_groups(&db, &[Group::Sentinel, Group::Filler, Group::Everywhere]).await;
         if i == L0_SSTS - 1 {
             put_groups(&db, &[Group::NewestL0]).await;
         }
         flush(&db).await;
+    }
+    fail_parallel::cfg(fp_registry.clone(), L0_UPLOAD_FAIL_POINT, "pause")
+        .expect("failed to pause L0 upload");
+    let value = vec![b'x'; IMM_VALUE_BYTES];
+    for i in 0..IMM_MEMTABLES {
+        put_groups(&db, &[Group::Everywhere]).await;
+        // Freezes the memtable that holds the keys above.
+        let key = key(Group::ImmMemtable.first_prefix() + i, 0);
+        db.put(&key, &value).await.expect("put failed");
     }
     put_groups(&db, &[Group::Memtable, Group::Everywhere]).await;
 
@@ -277,29 +307,28 @@ async fn build_db() -> Db {
             assert_eq!(read_prefix(&db, prefix_idx, all).await, expected);
         }
     }
-    db
+    (db, fp_registry)
 }
 
 /// Each case is a name, the group of prefixes it reads, whether it reads every
 /// entry, and the number of entries it reads.
-const CASES: [(&str, Group, bool, usize); 6] = [
+const CASES: [(&str, Group, bool, usize); 5] = [
     ("first_entry/in_memtable", Group::Memtable, false, 1),
     ("first_entry/in_newest_l0", Group::NewestL0, false, 1),
     ("first_entry/in_sorted_run", Group::SortedRun, false, 1),
     ("first_entry/absent", Group::Absent, false, 0),
-    ("first_entry/everywhere", Group::Everywhere, false, 1),
-    // Each key has one version in the memtable, each L0 SST, and each run.
+    // Each key has one version in each memtable, each L0 SST, and each run.
     (
         "all_entries/everywhere",
         Group::Everywhere,
         true,
-        KEYS_PER_PREFIX * (1 + L0_SSTS + SORTED_RUNS),
+        KEYS_PER_PREFIX * (1 + IMM_MEMTABLES + L0_SSTS + SORTED_RUNS),
     ),
 ];
 
 fn bench_recency_scan(c: &mut Criterion) {
     let runtime = Runtime::new().expect("failed to create runtime");
-    let db = runtime.block_on(build_db());
+    let (db, fp_registry) = runtime.block_on(build_db());
     // Rotates through each group's prefixes, so that iterations read
     // different keys.
     let next = AtomicUsize::new(0);
@@ -316,6 +345,9 @@ fn bench_recency_scan(c: &mut Criterion) {
     }
     group.finish();
 
+    // Let the immutable memtables upload, so that close can flush them.
+    fail_parallel::cfg(fp_registry, L0_UPLOAD_FAIL_POINT, "off")
+        .expect("failed to resume L0 upload");
     runtime.block_on(async { db.close().await.expect("close failed") });
 }
 

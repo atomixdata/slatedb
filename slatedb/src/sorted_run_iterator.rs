@@ -202,6 +202,28 @@ impl<'a> SortedRunIterator<'a> {
         .await
     }
 
+    /// Builds and initializes an iterator over `tables`, the SSTs of one
+    /// sorted run that cover `range`, in run order.
+    pub(crate) async fn new_initialized_from_covering_tables(
+        tables: VecDeque<SsTableView>,
+        range: BytesRange,
+        table_store: Arc<TableStore>,
+        sst_iter_options: SstIteratorOptions,
+        sst_tracing_context: Option<SstTracingContext>,
+        db_stats: Option<DbStats>,
+    ) -> Result<Self, SlateDBError> {
+        let mut iter = SortedRunIterator::new(
+            SortedRunView::Owned(tables, range),
+            table_store,
+            sst_iter_options,
+            sst_tracing_context,
+            db_stats,
+        )
+        .await?;
+        iter.init().await?;
+        Ok(iter)
+    }
+
     pub(crate) async fn new_owned_initialized_with_stats<T: RangeBounds<Bytes>>(
         range: T,
         sorted_run: SortedRun,
