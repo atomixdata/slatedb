@@ -2931,7 +2931,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_scan_prefix_by_recency_skips_l0_ssts_whose_filter_rules_out_the_prefix() {
+    async fn test_scan_prefix_by_recency_counts_each_l0_filter_once() {
         use crate::db_stats::{
             FILTER_KIND_LABEL, FILTER_KIND_PREFIX, SST_FILTER_FALSE_POSITIVE_COUNT,
             SST_FILTER_NEGATIVE_COUNT, SST_FILTER_POSITIVE_COUNT,
@@ -3213,14 +3213,19 @@ mod tests {
     }
 
     /// Opens a db whose compactor turns each L0 SST into its own sorted run
-    /// and never merges sorted runs.
+    /// and never merges sorted runs. With `max_sst_size` set, the compactor
+    /// splits each run into SSTs of about that size.
     async fn open_db_with_one_run_per_l0_sst(
         path: &str,
         filter_policies: Vec<Arc<dyn crate::filter_policy::FilterPolicy>>,
         metrics_recorder: Arc<DefaultMetricsRecorder>,
+        max_sst_size: Option<usize>,
     ) -> Db {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let mut compactor_options = fast_compactor_options();
+        if let (Some(max_sst_size), Some(worker)) = (max_sst_size, &mut compactor_options.worker) {
+            worker.max_sst_size = max_sst_size;
+        }
         compactor_options.scheduler_options = std::collections::HashMap::from([
             ("min_compaction_sources".to_string(), "1".to_string()),
             ("max_compaction_sources".to_string(), "1".to_string()),
@@ -3262,7 +3267,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_scan_prefix_by_recency_skips_sorted_run_whose_filter_rules_out_the_prefix() {
+    async fn test_scan_prefix_by_recency_counts_each_sorted_run_filter_once() {
         use crate::db_stats::{
             FILTER_KIND_LABEL, FILTER_KIND_PREFIX, SST_FILTER_FALSE_POSITIVE_COUNT,
             SST_FILTER_NEGATIVE_COUNT, SST_FILTER_POSITIVE_COUNT,
@@ -3279,6 +3284,7 @@ mod tests {
             "/tmp/test_recency_skips_filtered_run",
             vec![filter_policy],
             metrics_recorder.clone(),
+            None,
         )
         .await;
 
@@ -3321,6 +3327,7 @@ mod tests {
             "/tmp/test_recency_descends_run",
             vec![],
             Arc::new(DefaultMetricsRecorder::new()),
+            None,
         )
         .await;
         db.put(b"px:a", b"va").await.unwrap();
@@ -3340,6 +3347,53 @@ mod tests {
         assert_eq!(e2.key.as_ref(), b"px:a");
         assert_value(&e2, b"va");
         assert!(iter.next_entry().await.unwrap().is_none());
+
+        db.close().await.unwrap();
+    }
+
+    #[rstest::rstest]
+    #[case::ascending(IterationOrder::Ascending)]
+    #[case::descending(IterationOrder::Descending)]
+    #[tokio::test]
+    async fn test_scan_prefix_by_recency_reads_a_prefix_across_ssts_of_a_sorted_run(
+        #[case] order: IterationOrder,
+    ) {
+        let db = open_db_with_one_run_per_l0_sst(
+            &format!("/tmp/test_recency_multi_sst_run_{order:?}"),
+            vec![],
+            Arc::new(DefaultMetricsRecorder::new()),
+            Some(4 * 1024),
+        )
+        .await;
+        // About 25 KiB under `px:`, so the run splits it across several SSTs.
+        let keys: Vec<Vec<u8>> = (0..200)
+            .map(|i| format!("px:{i:03}").into_bytes())
+            .collect();
+        db.put(b"aa:a", b"v").await.unwrap();
+        for key in &keys {
+            db.put(key, [b'v'; 100]).await.unwrap();
+        }
+        db.put(b"zz:a", b"v").await.unwrap();
+        flush_and_compact(&db, 1).await;
+        let covering_ssts = db.inner.state.read().state().core().tree.compacted[0]
+            .tables_covering_range(BytesRange::from_prefix(b"px:"))
+            .len();
+        assert!(covering_ssts > 1, "covering SSTs: {covering_ssts}");
+
+        let options = ScanOptions::default().with_order(order);
+        let mut iter = db
+            .scan_prefix_by_recency_with_options(b"px:", &options)
+            .await
+            .unwrap();
+        let mut read = Vec::new();
+        while let Some(entry) = iter.next_entry().await.unwrap() {
+            read.push(entry.key.to_vec());
+        }
+        let mut expected = keys;
+        if matches!(order, IterationOrder::Descending) {
+            expected.reverse();
+        }
+        assert_eq!(read, expected);
 
         db.close().await.unwrap();
     }
