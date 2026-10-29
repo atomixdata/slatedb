@@ -118,6 +118,17 @@ impl MirrorHandle {
         self.inner.entries.lock().contains_key(path)
     }
 
+    /// Returns the path and size of every complete local copy. A copy that is
+    /// installed or removed during the call can be in the result or not.
+    pub fn local_objects(&self) -> Vec<(Path, u64)> {
+        self.inner
+            .entries
+            .lock()
+            .values()
+            .map(|object| (object.meta.location.clone(), object.meta.size))
+            .collect()
+    }
+
     /// The wrapped store. Calls made here skip the policy.
     pub fn remote(&self) -> &Arc<dyn ObjectStore> {
         &self.inner.remote

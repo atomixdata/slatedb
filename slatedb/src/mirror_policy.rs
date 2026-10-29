@@ -8,8 +8,10 @@
 //! The manifest tells the policy which SSTs to keep. When SlateDB reads or
 //! writes a manifest, the policy downloads the missing SSTs of that manifest
 //! before the call returns. When an SST is no longer in the newest manifest or
-//! in one of its checkpoints, the policy removes the local copy. The mirror
-//! writes each new compacted SST to both object storage and local disk.
+//! in one of its checkpoints, the policy removes the local copy. The first
+//! manifest of a process also removes the local copies that an earlier process
+//! left, except the output of running compactions. The mirror writes each new
+//! compacted SST to both object storage and local disk.
 //!
 //! An optional segment predicate limits the mirror to some segments.
 
@@ -19,7 +21,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use log::warn;
+use log::{info, warn};
 use object_store::path::{Path, DELIMITER};
 use object_store::{
     Extensions, GetOptions, ObjectStoreExt, PutMode, PutMultipartOptions, PutOptions,
@@ -269,15 +271,25 @@ impl SlateDbMirrorPolicy {
             &versioned_manifest.manifest,
         ));
 
-        let newer = self
-            .state
-            .lock()
-            .is_manifest_newer_than_current(manifest_id);
+        let (newer, first) = {
+            let state = self.state.lock();
+            (
+                state.is_manifest_newer_than_current(manifest_id),
+                state.newest.is_none(),
+            )
+        };
 
         // A newer manifest downloads its selected SSTs and also keeps the
         // selected SSTs of its checkpoints. Read the checkpoints and run the
-        // predicate.
+        // predicate. The first manifest also reads the running compactions,
+        // whose output the sweep below keeps.
         let update = if newer {
+            let sweep_keep = if first {
+                self.running_compaction_outputs(mirror, root, &versioned_manifest)
+                    .await
+            } else {
+                None
+            };
             let checkpoints = self
                 .checkpoint_paths(mirror, root, &versioned_manifest, &manifest_paths)
                 .await?;
@@ -289,7 +301,7 @@ impl SlateDbMirrorPolicy {
             for paths in checkpoints.values() {
                 retained.extend(self.selected_ssts(&versioned_manifest, paths).cloned());
             }
-            Some((to_download, retained, checkpoints))
+            Some((to_download, retained, checkpoints, sweep_keep))
         } else {
             None
         };
@@ -299,18 +311,15 @@ impl SlateDbMirrorPolicy {
             match update {
                 // Check again, because another `observe` can process a newer
                 // manifest while the lock is released.
-                Some((to_download, retained, checkpoints))
+                Some((to_download, retained, checkpoints, sweep_keep))
                     if state.is_manifest_newer_than_current(manifest_id) =>
                 {
                     // Evictions are issued under the lock, so they reach the
                     // mirror in manifest order.
-                    //
-                    // TODO: On the first manifest, also evict the local copies
-                    // that an earlier process left, except the output of active
-                    // compactions. This needs a `MirrorHandle` method that
-                    // lists local copies. Until then, only the remote scan
-                    // removes them.
                     mirror.evict(state.retained.difference(&retained).cloned());
+                    if let Some(keep) = sweep_keep.filter(|_| state.newest.is_none()) {
+                        Self::evict_unreferenced(mirror, root, manifest_id, &retained, &keep);
+                    }
                     state.retained = retained;
                     state.newest = Some(Arc::clone(&versioned_manifest));
                     state.checkpoints = checkpoints;
@@ -527,6 +536,58 @@ impl SlateDbMirrorPolicy {
             })
             .map(|sst| resolver.sst_path(&sst.id))
             .collect()
+    }
+
+    /// Reads the output of the running compactions, which a worker that
+    /// resumes them reads back. Returns `None` when the compaction state can't
+    /// be read, so that the first manifest skips the sweep instead of
+    /// evicting that output.
+    async fn running_compaction_outputs(
+        &self,
+        mirror: &MirrorHandle,
+        root: &Path,
+        manifest: &VersionedManifest,
+    ) -> Option<HashSet<Path>> {
+        let store = CompactionsStore::new(root, Arc::clone(mirror.remote()));
+        match store.try_read_latest_compactions().await {
+            Ok(Some(compactions)) => Some(self.compaction_outputs(root, manifest, &compactions)),
+            Ok(None) => Some(HashSet::new()),
+            Err(err) => {
+                warn!("failed to read compactions, skipping the startup sweep [error={err}]");
+                None
+            }
+        }
+    }
+
+    /// Evicts the local compacted SSTs of `root` that are in neither
+    /// `retained` nor `keep`: copies that an earlier process downloaded or
+    /// wrote and that nothing references now.
+    fn evict_unreferenced(
+        mirror: &MirrorHandle,
+        root: &Path,
+        manifest_id: u64,
+        retained: &HashSet<Path>,
+        keep: &HashSet<Path>,
+    ) {
+        let prefix = format!("{}/", PathResolver::from_root(root.clone()).compacted_dir);
+        let mut unused = Vec::new();
+        let mut unused_bytes = 0;
+        for (path, size) in mirror.local_objects() {
+            if path.as_ref().starts_with(&prefix)
+                && !retained.contains(&path)
+                && !keep.contains(&path)
+            {
+                unused_bytes += size;
+                unused.push(path);
+            }
+        }
+        info!(
+            "evicting local SSTs that the first manifest does not reference [manifest_id={}, count={}, bytes={}]",
+            manifest_id,
+            unused.len(),
+            unused_bytes
+        );
+        mirror.evict(unused);
     }
 }
 
@@ -992,6 +1053,74 @@ mod tests {
         fixture.observe(1, &manifest(&[1, 2], &[])).await.unwrap();
         assert!(!fixture.contains(1));
         assert!(fixture.contains(2));
+    }
+
+    #[tokio::test]
+    async fn test_observe_evicts_unreferenced_local_ssts_on_the_first_manifest() {
+        // An earlier process downloaded SSTs 1 to 5.
+        let Fixture {
+            remote,
+            mirror,
+            _dir: dir,
+            ..
+        } = Fixture::new(5, SlateDbMirrorPolicy::builder()).await;
+        mirror.handle().fetch((1..=5).map(sst)).await.unwrap();
+        drop(mirror);
+        // SST 4 is the output of a running compaction, recorded per range. SST
+        // 5 is the output of a completed one, which the manifest would
+        // reference if it were used.
+        let compaction = |n| {
+            Compaction::new(
+                Ulid::from_parts(n, 0),
+                CompactionSpec::for_segment(Bytes::new(), vec![], 0),
+            )
+        };
+        let compactions = Compactions::new(0).with_compactions(vec![
+            compaction(1)
+                .with_status(CompactionStatus::Running)
+                .with_ctx(Some(CompactionContext::new(
+                    vec![Subcompaction::new(BytesRange::unbounded())
+                        .with_output_ssts(vec![handle(4)])],
+                    None,
+                ))),
+            compaction(2)
+                .with_status(CompactionStatus::Completed)
+                .with_output_ssts(vec![handle(5)]),
+        ]);
+        remote
+            .put(
+                &compactions_file(1),
+                FlatBufferCompactionsCodec {}.encode(&compactions).into(),
+            )
+            .await
+            .unwrap();
+
+        // The next process's first manifest references only SSTs 2 and 3.
+        let policy = SlateDbMirrorPolicy::builder()
+            .with_compactions_poll_interval(None)
+            .build();
+        let mirror = ObjectStoreMirror::builder(dir.path(), Arc::clone(&remote), policy.clone())
+            .with_remote_scan_interval(None)
+            .build()
+            .await
+            .unwrap();
+        let local = mirror.handle();
+        assert!((1..=5).all(|n| local.contains(&sst(n))));
+        policy
+            .observe(&manifest_file(2), &encode(&manifest(&[2, 3], &[])), &local)
+            .await
+            .unwrap();
+        assert!(wait_until(|| !local.contains(&sst(1)) && !local.contains(&sst(5))).await);
+        assert!((2..=4).all(|n| local.contains(&sst(n))));
+
+        // Later manifests evict only what the previous manifest retained.
+        local.fetch([sst(1)]).await.unwrap();
+        policy
+            .observe(&manifest_file(3), &encode(&manifest(&[3], &[])), &local)
+            .await
+            .unwrap();
+        assert!(wait_until(|| !local.contains(&sst(2))).await);
+        assert!(local.contains(&sst(1)) && local.contains(&sst(4)));
     }
 
     #[tokio::test]
