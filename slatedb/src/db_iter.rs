@@ -602,7 +602,7 @@ impl RecencySourceContext {
             }
             RecencySource::SortedRun(sorted_run) => {
                 let mut views = sorted_run.clone().into_tables_covering_range(&self.range);
-                let level = SstTraceLevel::SortedRun(sorted_run.id);
+                let sst_level = SstTraceLevel::SortedRun(sorted_run.id);
                 // The SSTs of a run hold disjoint key ranges, so a prefix
                 // usually falls inside one of them. The run's iterator would
                 // read only that SST, so open it directly and let its filter
@@ -611,12 +611,12 @@ impl RecencySourceContext {
                     let Some(view) = views.pop_front() else {
                         return Ok(None);
                     };
-                    match self.open_sst(view, level).await? {
+                    match self.open_sst(view, sst_level).await? {
                         Some(iter) => Box::new(iter),
                         None => return Ok(None),
                     }
                 } else {
-                    self.open_sorted_run(views, level).await?
+                    self.open_sorted_run(views, sst_level).await?
                 }
             }
         };
@@ -634,14 +634,14 @@ impl RecencySourceContext {
     async fn open_sst(
         &self,
         view: SsTableView,
-        level: SstTraceLevel,
+        sst_level: SstTraceLevel,
     ) -> Result<Option<SstIterator<'static>>, SlateDBError> {
         SstIterator::new_owned_initialized_with_stats(
             self.range.clone(),
             view,
             self.table_store.clone(),
             self.sst_iter_options.clone(),
-            Some(SstTracingContext::new(level, self.read_trace.clone())),
+            Some(SstTracingContext::new(sst_level, self.read_trace.clone())),
             Some(self.db_stats.clone()),
         )
         .await
@@ -652,19 +652,19 @@ impl RecencySourceContext {
     async fn open_sorted_run(
         &self,
         views: VecDeque<SsTableView>,
-        level: SstTraceLevel,
+        sst_level: SstTraceLevel,
     ) -> Result<Box<dyn RowEntryIterator + 'static>, SlateDBError> {
-        Ok(Box::new(
-            SortedRunIterator::new_initialized_from_covering_tables(
-                views,
-                self.range.clone(),
-                self.table_store.clone(),
-                self.sst_iter_options.clone(),
-                Some(SstTracingContext::new(level, self.read_trace.clone())),
-                Some(self.db_stats.clone()),
-            )
-            .await?,
-        ))
+        let mut iter = SortedRunIterator::new_owned_from_tables(
+            views,
+            self.range.clone(),
+            self.table_store.clone(),
+            self.sst_iter_options.clone(),
+            Some(SstTracingContext::new(sst_level, self.read_trace.clone())),
+            Some(self.db_stats.clone()),
+        )
+        .await?;
+        iter.init().await?;
+        Ok(Box::new(iter))
     }
 }
 
