@@ -4,13 +4,20 @@ use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
 
-use futures::future::{join_all, try_join_all};
+use futures::future::try_join_all;
+use futures::stream::{self, StreamExt};
 use log::warn;
 use object_store::path::Path;
 use object_store::ObjectStore;
 
 use crate::inner::Inner;
 use crate::ordering::{OpKind, Ticket};
+
+/// How many local copies an eviction removes at once. Removals in the mirror's
+/// directory serialize on its lock, and each waits in a thread of the runtime's
+/// blocking pool, so evicting hundreds at once fills that pool and delays the
+/// reads that need it.
+const EVICT_CONCURRENCY: usize = 4;
 
 /// Lets a [`MirrorPolicy`](crate::MirrorPolicy) download, evict, and inspect
 /// local copies.
@@ -90,18 +97,19 @@ impl MirrorHandle {
         }
         let inner = Arc::clone(&self.inner);
         self.inner.spawn(async move {
-            join_all(evictions.into_iter().map(|(path, ticket)| {
-                let inner = &inner;
-                async move {
-                    if !ticket.ready().await {
-                        return;
+            stream::iter(evictions)
+                .for_each_concurrent(EVICT_CONCURRENCY, |(path, ticket)| {
+                    let inner = &inner;
+                    async move {
+                        if !ticket.ready().await {
+                            return;
+                        }
+                        if let Err(err) = inner.remove_local(&path).await {
+                            warn!("mirror eviction failed [path={}, error={}]", path, err);
+                        }
                     }
-                    if let Err(err) = inner.remove_local(&path).await {
-                        warn!("mirror eviction failed [path={}, error={}]", path, err);
-                    }
-                }
-            }))
-            .await;
+                })
+                .await;
         });
     }
 
