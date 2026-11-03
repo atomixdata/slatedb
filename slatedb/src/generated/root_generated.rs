@@ -3292,6 +3292,7 @@ impl<'a> Compaction<'a> {
   pub const VT_WORKER: flatbuffers::VOffsetT = 14;
   pub const VT_CTX_TYPE: flatbuffers::VOffsetT = 16;
   pub const VT_CTX: flatbuffers::VOffsetT = 18;
+  pub const VT_KEY_GROUP_EXTRACTOR_NAME: flatbuffers::VOffsetT = 20;
 
   #[inline]
   pub unsafe fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
@@ -3303,6 +3304,7 @@ impl<'a> Compaction<'a> {
     args: &'args CompactionArgs<'args>
   ) -> flatbuffers::WIPOffset<Compaction<'bldr>> {
     let mut builder = CompactionBuilder::new(_fbb);
+    if let Some(x) = args.key_group_extractor_name { builder.add_key_group_extractor_name(x); }
     if let Some(x) = args.ctx { builder.add_ctx(x); }
     if let Some(x) = args.worker { builder.add_worker(x); }
     if let Some(x) = args.output_ssts { builder.add_output_ssts(x); }
@@ -3370,6 +3372,13 @@ impl<'a> Compaction<'a> {
     // Created from valid Table for this object
     // which contains a valid value in this slot
     unsafe { self._tab.get::<flatbuffers::ForwardsUOffset<flatbuffers::Table<'a>>>(Compaction::VT_CTX, None)}
+  }
+  #[inline]
+  pub fn key_group_extractor_name(&self) -> Option<&'a str> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<flatbuffers::ForwardsUOffset<&str>>(Compaction::VT_KEY_GROUP_EXTRACTOR_NAME, None)}
   }
   #[inline]
   #[allow(non_snake_case)]
@@ -3440,6 +3449,7 @@ impl flatbuffers::Verifiable for Compaction<'_> {
           _ => Ok(()),
         }
      })?
+     .visit_field::<flatbuffers::ForwardsUOffset<&str>>("key_group_extractor_name", Self::VT_KEY_GROUP_EXTRACTOR_NAME, false)?
      .finish();
     Ok(())
   }
@@ -3453,6 +3463,7 @@ pub struct CompactionArgs<'a> {
     pub worker: Option<flatbuffers::WIPOffset<WorkerSpec<'a>>>,
     pub ctx_type: CompactionContext,
     pub ctx: Option<flatbuffers::WIPOffset<flatbuffers::UnionWIPOffset>>,
+    pub key_group_extractor_name: Option<flatbuffers::WIPOffset<&'a str>>,
 }
 impl<'a> Default for CompactionArgs<'a> {
   #[inline]
@@ -3466,6 +3477,7 @@ impl<'a> Default for CompactionArgs<'a> {
       worker: None,
       ctx_type: CompactionContext::NONE,
       ctx: None,
+      key_group_extractor_name: None,
     }
   }
 }
@@ -3506,6 +3518,10 @@ impl<'a: 'b, 'b, A: flatbuffers::Allocator + 'a> CompactionBuilder<'a, 'b, A> {
   #[inline]
   pub fn add_ctx(&mut self, ctx: flatbuffers::WIPOffset<flatbuffers::UnionWIPOffset>) {
     self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(Compaction::VT_CTX, ctx);
+  }
+  #[inline]
+  pub fn add_key_group_extractor_name(&mut self, key_group_extractor_name: flatbuffers::WIPOffset<&'b  str>) {
+    self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(Compaction::VT_KEY_GROUP_EXTRACTOR_NAME, key_group_extractor_name);
   }
   #[inline]
   pub fn new(_fbb: &'b mut flatbuffers::FlatBufferBuilder<'a, A>) -> CompactionBuilder<'a, 'b, A> {
@@ -3566,6 +3582,7 @@ impl core::fmt::Debug for Compaction<'_> {
           ds.field("ctx", &x)
         },
       };
+      ds.field("key_group_extractor_name", &self.key_group_extractor_name());
       ds.finish()
   }
 }

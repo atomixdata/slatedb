@@ -1069,7 +1069,23 @@ impl CompactorEventHandler {
     /// Returns whether the manifest changed. The caller writes the manifest.
     fn apply_incremental_commits(&mut self, jobs: &[Compaction]) -> bool {
         let mut changed = false;
+        let extractor_name = self
+            .key_group_extractor
+            .as_deref()
+            .map(|extractor| extractor.name());
         for job in jobs {
+            // An earlier commit with another extractor can remove keys from the input
+            // runs that this extractor leaves out of the output. Then those keys are in
+            // no run. The final commit publishes all output, so wait for it.
+            if job.key_group_extractor_name() != extractor_name {
+                error!(
+                    "skipped incremental commit, job has another key group extractor [id={}, job_extractor={:?}, extractor={:?}]",
+                    job.id(),
+                    job.key_group_extractor_name(),
+                    extractor_name,
+                );
+                continue;
+            }
             let progress = IncrementalProgress::from_compaction(
                 job,
                 self.key_group_extractor.as_deref(),
@@ -1479,7 +1495,16 @@ impl CompactorEventHandler {
                 // We keep the context so the next worker resumes the job and
                 // does not redo its stored output because incremental progress
                 // has been made already.
+                let extractor_name = self
+                    .key_group_extractor
+                    .as_deref()
+                    .map(|extractor| extractor.name().to_string());
                 self.state_mut().update_compaction(&compaction.id(), |c| {
+                    // A job that comes back here with progress keeps the name of the
+                    // extractor that made its earlier commits.
+                    if !c.has_durable_progress() {
+                        c.set_key_group_extractor_name(extractor_name);
+                    }
                     c.set_status(CompactionStatus::Scheduled)
                 });
             }
@@ -1746,6 +1771,7 @@ mod tests {
     use crate::tablestore::{TableStore, TableStoreKind};
     use crate::test_utils::{
         assert_iterator, bounded_sst_view, FixedThreeBytePrefixExtractor, GatedObjectStore,
+        VersionSuffixExtractor,
     };
     use crate::types::KeyValue;
     use crate::types::RowEntry;
@@ -7183,6 +7209,106 @@ mod tests {
             .unwrap();
         assert_eq!(restored.status(), CompactionStatus::Scheduled);
         assert_eq!(restored.ctx(), job.ctx());
+    }
+
+    #[tokio::test]
+    async fn promotion_records_key_group_extractor_name() {
+        let mut fixture = CompactorEventHandlerTestFixture::new().await;
+        fixture.handler.key_group_extractor = Some(Arc::new(VersionSuffixExtractor));
+        fixture.write_l0().await;
+        fixture.handler.state_writer.refresh().await.unwrap();
+        let spec = fixture.build_l0_compaction().await;
+        let compaction_id = Ulid::new();
+        fixture
+            .handler
+            .state_mut()
+            .add_compaction(Compaction::new(compaction_id, spec))
+            .unwrap();
+
+        fixture
+            .handler
+            .maybe_validate_submitted_compactions()
+            .await
+            .unwrap();
+
+        // The name is in `.compactions` before a worker can claim the job.
+        let stored_compactions = fixture
+            .compactions_store
+            .read_latest_compactions()
+            .await
+            .unwrap()
+            .compactions;
+        let stored = stored_compactions.get(&compaction_id).unwrap();
+        assert_eq!(stored.status(), CompactionStatus::Scheduled);
+        assert_eq!(
+            stored.key_group_extractor_name(),
+            Some(VersionSuffixExtractor.name())
+        );
+    }
+
+    #[tokio::test]
+    async fn revalidation_keeps_key_group_extractor_name_of_job_with_progress() {
+        let mut fixture = CompactorEventHandlerTestFixture::new().await;
+        // The seeded job has output and no recorded extractor.
+        let job = seed_incremental_job(&mut fixture).await;
+        fixture.handler.key_group_extractor = Some(Arc::new(VersionSuffixExtractor));
+        fixture
+            .handler
+            .state_mut()
+            .update_compaction(&job.id(), |c| c.set_status(CompactionStatus::Submitted));
+
+        fixture
+            .handler
+            .maybe_validate_submitted_compactions()
+            .await
+            .unwrap();
+
+        let restored = fixture
+            .handler
+            .state()
+            .compactions()
+            .value
+            .get(&job.id())
+            .unwrap();
+        assert_eq!(restored.status(), CompactionStatus::Scheduled);
+        assert_eq!(restored.key_group_extractor_name(), None);
+    }
+
+    #[tokio::test]
+    async fn incremental_commit_skips_job_with_another_key_group_extractor() {
+        let mut fixture = CompactorEventHandlerTestFixture::new().await;
+        Arc::make_mut(&mut fixture.handler.options).enable_incremental_compaction = true;
+        // The seeded job has output and no recorded extractor.
+        let job = seed_incremental_job(&mut fixture).await;
+        let before = fixture.manifest_store.read_latest_manifest().await.unwrap();
+        fixture.handler.key_group_extractor = Some(Arc::new(VersionSuffixExtractor));
+
+        fixture.handler.commit_compacted_entries().await.unwrap();
+
+        assert_eq!(
+            fixture
+                .manifest_store
+                .read_latest_manifest()
+                .await
+                .unwrap()
+                .id(),
+            before.id()
+        );
+        assert!(fixture.handler.last_incremental_commit.is_none());
+
+        // With the recorded extractor, the same job commits.
+        fixture.handler.key_group_extractor = None;
+        fixture.handler.commit_compacted_entries().await.unwrap();
+        let after = fixture.manifest_store.read_latest_manifest().await.unwrap();
+        assert!(after.id() > before.id());
+        let restored = fixture
+            .handler
+            .state()
+            .compactions()
+            .value
+            .get(&job.id())
+            .unwrap();
+        assert_eq!(restored.status(), CompactionStatus::Running);
     }
 
     #[tokio::test]

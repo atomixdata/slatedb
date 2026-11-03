@@ -1458,9 +1458,11 @@ impl<P: Into<Path>> CompactorBuilder<P> {
     ///
     /// SlateDB calls the extractor only with `PrefixTarget::Point` and keys that a
     /// compaction wrote. For those keys, it must keep the `PrefixTarget::Point`
-    /// invariant of [`crate::PrefixExtractor`]. All compactors of a database must use
-    /// the same extractor, and it must not change while a job runs. SlateDB does not
-    /// check this.
+    /// invariant of [`crate::PrefixExtractor`]. Each job records the name of the
+    /// extractor before it has output. A compactor makes incremental commits for a
+    /// job only if its extractor has the recorded name. Otherwise, the job publishes
+    /// its output only in the final commit. SlateDB cannot detect an extractor that
+    /// changes its logic but keeps its name.
     ///
     /// Has an effect only when [`CompactorOptions::enable_incremental_compaction`] is
     /// `true`. Defaults to `None`, so each key is a group by itself.
