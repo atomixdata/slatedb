@@ -133,32 +133,48 @@ impl IncrementalProgress {
     /// Builds the durable progress of `job` so that it holds only whole key groups.
     ///
     /// A commit must not split a key group between the destination run and the input
-    /// runs. This function applies `extractor` only to stored keys, which are the first
-    /// and last keys of output SSTs, and not to planned range bounds. A planned bound is
-    /// often a shortened SST index key, not a key that the application wrote, so the
-    /// extractor can return a wrong prefix for it. Such a bound can also sort between
-    /// two keys of one group. A bound is inside a group when it starts with the group
-    /// prefix and is longer than that prefix.
+    /// runs. For example, take an extractor that returns a key up to and including its
+    /// first `@`, so that `c@1` and `c@2` are in the group `c@`. A subcompaction with
+    /// the planned range `[b@5, e@5)` stores these output keys:
     ///
-    /// Each subcompaction adds one durable interval or none. The interval holds only
-    /// whole key groups:
-    /// 1. It starts at the start of the group of the first output key. If the planned
-    ///    start bound is inside that group, the group can have keys in the previous
-    ///    subcompaction. Then the interval starts after the group.
-    /// 2. For a `Completed` subcompaction, it ends after the group of the last output
-    ///    key. If the planned end bound is inside that group, the group can have keys
-    ///    in the next subcompaction. Then the interval ends at the start of the group.
-    /// 3. For an unfinished subcompaction, it ends at the start of the group of its
-    ///    last written key. That group stays out, because later output SSTs can still
-    ///    add keys to it.
+    /// ```text
+    /// b@6 b@7 c@1 c@2 d@1 d@2 e@3
+    /// ```
+    ///
+    /// The start bound `b@5` falls inside the group `b@`, so the previous subcompaction
+    /// can hold more keys of the group, such as `b@4`. If a commit publishes `b@6` and
+    /// `b@7`, it splits the group, so they stay out. For the same reason, `e@3` stays
+    /// out, because the next subcompaction can hold `e@6`. Both groups wait for the
+    /// final commit. While the stored output ends at `d@1`, a commit publishes only
+    /// `c@1` and `c@2`, because a later output SST can still add `d@2`. After the
+    /// subcompaction is `Completed`, a commit publishes `c@1`, `c@2`, `d@1`, and `d@2`.
+    ///
+    /// In general, a planned bound cuts a group when the bound starts with the group
+    /// prefix and is longer than that prefix, as `b@5` cuts `b@`. This test does not
+    /// apply `extractor` to the bound. `extractor` expects a complete key, but a bound
+    /// can be an incomplete key, such as a shortened SST index key. So this function
+    /// applies `extractor` only to stored keys, which are the first and last keys of
+    /// output SSTs.
+    ///
+    /// Each subcompaction adds one durable interval or none. The interval covers the
+    /// groups from the group of the first output key to the group of the last output
+    /// key. It leaves out a group at either end if that group can have keys outside of
+    /// the stored output:
+    /// 1. The group of the first output key, if the planned start bound cuts it, as
+    ///    with `b@`. The previous subcompaction can hold earlier keys of the group.
+    /// 2. The group of the last output key, if the planned end bound cuts it, as with
+    ///    `e@`. The next subcompaction can hold later keys of the group.
+    /// 3. The group of the last output key, if the subcompaction is not `Completed`, as
+    ///    with `d@` while the stored output ends at `d@1`. A later output SST can still
+    ///    add keys to the group.
     ///
     /// A subcompaction with no output publishes nothing, because it has no stored key
-    /// that shows where its groups are. The trim also leaves out keys that a filter
+    /// that shows where its groups are. The interval also leaves out keys that a filter
     /// dropped next to a bound, because the group of such a key can continue in the
     /// next subcompaction.
     ///
     /// This can be optimized. When the subcompactions on both sides of a planned bound
-    /// are durable at that bound, the group that crosses the bound and the dropped keys
+    /// are durable at that bound, the group that the bound cuts and the dropped keys
     /// next to it are durable too. Then one interval across the bound can publish them,
     /// and a `Completed` subcompaction without output can also be published. Now these
     /// keys wait for the final commit.
@@ -324,7 +340,7 @@ fn grouped_interval(
         Unbounded => None,
         Included(bound) => {
             let group = KeyGroup::of(first_key, extractor);
-            if group.cuts(bound) {
+            if group.strictly_contains(bound) {
                 // The earlier part of the group can be in the previous subcompaction.
                 // Start after the group.
                 Some(group.end()?)
@@ -347,7 +363,7 @@ fn grouped_interval(
                     .expect("SST writers record the last entry");
                 let group = KeyGroup::of(last_key, extractor);
                 match group.end() {
-                    Some(group_end) if !group.cuts(bound) => Some(group_end),
+                    Some(group_end) if !group.strictly_contains(bound) => Some(group_end),
                     // The later part of the group can be in the next subcompaction.
                     // End before the group.
                     _ => Some(group.start),
@@ -398,10 +414,12 @@ impl KeyGroup {
         BytesRange::increment_prefix(&self.start)
     }
 
-    /// Returns `true` if `bound` sorts strictly inside the group, so that the group can
-    /// have keys on both sides of `bound`. All keys that start with one prefix form one
-    /// contiguous interval, so a prefix test is enough, also for a shortened bound.
-    fn cuts(&self, bound: &[u8]) -> bool {
+    /// Returns `true` if the group strictly contains `bound`, which means that `bound`
+    /// is in the group but is not its first key. Then `bound` cuts the group, because
+    /// the group can have keys on both sides of `bound`. All keys that start with one
+    /// prefix form one contiguous interval, so a prefix test is enough, also for a
+    /// shortened bound.
+    fn strictly_contains(&self, bound: &[u8]) -> bool {
         bound.len() > self.start.len() && bound.starts_with(&self.start)
     }
 }
