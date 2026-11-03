@@ -541,6 +541,15 @@ impl KVTable {
         self.range(range, IterationOrder::Ascending, ReadTrace::none())
     }
 
+    /// Whether any key in the table starts with `prefix`.
+    pub(crate) fn contains_prefix(&self, prefix: &Bytes) -> bool {
+        // `u64::MAX` sorts first among the versions of a key.
+        let start = SequencedKey::new(prefix.clone(), u64::MAX);
+        self.map
+            .lower_bound(Bound::Included(&start))
+            .is_some_and(|entry| entry.key().user_key.starts_with(prefix))
+    }
+
     pub(crate) fn range<T: RangeBounds<Bytes>>(
         &self,
         range: T,
@@ -1165,6 +1174,34 @@ mod tests {
             ],
         )
         .await;
+    }
+
+    #[rstest]
+    #[case::key_with_prefix(b"bb".as_slice(), true)]
+    #[case::key_equal_to_prefix(b"bbbb".as_slice(), true)]
+    #[case::tombstone_only(b"dd".as_slice(), true)]
+    #[case::between_keys(b"bc".as_slice(), false)]
+    #[case::before_first_key(b"a".as_slice(), false)]
+    #[case::after_last_key(b"zz".as_slice(), false)]
+    fn test_memtable_contains_prefix(#[case] prefix: &[u8], #[case] expected: bool) {
+        let table = WritableKVTable::new();
+        table.put(RowEntry::new_value(b"bbbb", b"old", 1));
+        table.put(RowEntry::new_value(b"bbbb", b"new", 2));
+        table.put(RowEntry::new_value(b"cccc", b"v", 3));
+        table.put(RowEntry::new_tombstone(b"dddd", 4));
+
+        assert_eq!(
+            table
+                .table()
+                .contains_prefix(&Bytes::copy_from_slice(prefix)),
+            expected
+        );
+    }
+
+    #[test]
+    fn test_empty_memtable_contains_no_prefix() {
+        let table = WritableKVTable::new();
+        assert!(!table.table().contains_prefix(&Bytes::from_static(b"a")));
     }
 
     fn seek_test_table() -> WritableKVTable {
