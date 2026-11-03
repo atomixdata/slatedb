@@ -276,7 +276,8 @@ impl<T: Clone + Send + Sync> FenceableTransactionalObject<T, MonotonicId> {
     /// - `object_update_timeout`: Upper bound for a single update attempt.
     /// - `system_clock`: Clock used by the timeout mechanism.
     /// - `get_epoch`: Extracts the epoch from the object value.
-    /// - `set_epoch`: Updates the epoch on the object value.
+    /// - `set_epoch`: Updates the epoch on the object value. It can also
+    ///   update other fields, which are then written with the epoch.
     ///
     /// ## Returns
     /// A `FenceableTransactionalObject` whose `local_epoch` has been claimed
@@ -292,7 +293,7 @@ impl<T: Clone + Send + Sync> FenceableTransactionalObject<T, MonotonicId> {
         object_update_timeout: Duration,
         system_clock: Arc<dyn SystemClock>,
         get_epoch: fn(&T) -> u64,
-        set_epoch: fn(&mut T, u64),
+        set_epoch: impl Fn(&mut T, u64) + Send + Sync,
     ) -> Result<Self, TransactionalObjectError> {
         utils::timeout(
             system_clock.clone(),
@@ -344,7 +345,8 @@ impl<T: Clone + Send + Sync> FenceableTransactionalObject<T, MonotonicId> {
     /// - `epoch`: The exact epoch to claim.
     /// - `exact_epoch`: Requires the stored epoch to be one less than `epoch`.
     /// - `get_epoch`: Extracts the epoch from the object value.
-    /// - `set_epoch`: Updates the epoch on the object value.
+    /// - `set_epoch`: Updates the epoch on the object value. It can also
+    ///   update other fields, which are then written with the epoch.
     ///
     /// ## Returns
     /// A `FenceableTransactionalObject` with `local_epoch == epoch` after the
@@ -365,7 +367,7 @@ impl<T: Clone + Send + Sync> FenceableTransactionalObject<T, MonotonicId> {
         epoch: u64,
         exact_epoch: bool,
         get_epoch: fn(&T) -> u64,
-        set_epoch: fn(&mut T, u64),
+        set_epoch: impl Fn(&mut T, u64) + Send + Sync,
     ) -> Result<Self, TransactionalObjectError> {
         utils::timeout(
             system_clock.clone(),

@@ -387,6 +387,18 @@ fn is_sorted_by_prefix(segments: &[Segment]) -> bool {
     segments.windows(2).all(|w| w[0].prefix < w[1].prefix)
 }
 
+/// An inclusive range of WAL IDs that a writer takeover excluded from accepted
+/// history.
+///
+/// The range applies only if the WAL object at `start` is a zero-byte fence.
+/// If an older writer's upload took `start` first, the files from `start` on
+/// stay in accepted history, and the range is ignored.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Debug)]
+pub(crate) struct WalExcludedRange {
+    pub(crate) start: u64,
+    pub(crate) end: u64,
+}
+
 /// Internal immutable in-memory view of a `.manifest` file.
 #[derive(Clone, PartialEq, Serialize, Debug)]
 pub(crate) struct ManifestCore {
@@ -427,6 +439,17 @@ pub(crate) struct ManifestCore {
     /// flushed WAL ID.
     pub replay_after_wal_id: u64,
 
+    /// Size of the WAL ID range that the next writer takeover must exclude.
+    /// It must be at least the upload limit of every writer whose uploads are
+    /// not excluded yet. A writer raises it when it claims its epoch.
+    pub wal_excluded_range_max_size: u64,
+
+    /// WAL ID ranges that writer takeovers excluded, sorted by `start`. A
+    /// takeover records its range before it writes the fence at the range
+    /// start, so a reader that sees the fence and then reads the manifest
+    /// finds the range.
+    pub wal_excluded_ranges: Vec<WalExcludedRange>,
+
     /// the `last_l0_clock_tick` includes all data in L0 and below --
     /// WAL entries will have their latest ticks recovered on replay
     /// into the in-memory state.
@@ -462,6 +485,8 @@ impl ManifestCore {
             segment_extractor_name: None,
             next_wal_sst_id: 1,
             replay_after_wal_id: 0,
+            wal_excluded_range_max_size: 1,
+            wal_excluded_ranges: vec![],
             last_l0_clock_tick: i64::MIN,
             last_l0_seq: 0,
             checkpoints: vec![],

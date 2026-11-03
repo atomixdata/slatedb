@@ -38,6 +38,7 @@ impl FenceableManifest {
         manifest_update_timeout: Duration,
         system_clock: Arc<dyn SystemClock>,
         expected_epoch: Option<u64>,
+        max_inflight_wal_uploads: u64,
     ) -> Result<Self, SlateDBError> {
         Self::init(
             stored_manifest,
@@ -45,7 +46,13 @@ impl FenceableManifest {
             system_clock,
             expected_epoch,
             |m: &Manifest| m.writer_epoch,
-            |m: &mut Manifest, e: u64| m.writer_epoch = e,
+            move |m: &mut Manifest, e: u64| {
+                m.writer_epoch = e;
+                m.core.wal_excluded_range_max_size = m
+                    .core
+                    .wal_excluded_range_max_size
+                    .max(max_inflight_wal_uploads);
+            },
         )
         .await
     }
@@ -74,7 +81,7 @@ impl FenceableManifest {
         system_clock: Arc<dyn SystemClock>,
         expected_epoch: Option<u64>,
         get_epoch: fn(&Manifest) -> u64,
-        set_epoch: fn(&mut Manifest, u64),
+        set_epoch: impl Fn(&mut Manifest, u64) + Send + Sync,
     ) -> Result<Self, SlateDBError> {
         let clock = system_clock.clone();
         let inner = match expected_epoch {
@@ -690,14 +697,14 @@ mod tests {
             .await
             .unwrap();
         let mut winner =
-            FenceableManifest::init_writer(current, Duration::from_secs(5), clock.clone(), None)
+            FenceableManifest::init_writer(current, Duration::from_secs(5), clock.clone(), None, 1)
                 .await
                 .unwrap();
         let before = store.read_latest_manifest().await.unwrap();
         object_store.clear();
 
         let result =
-            FenceableManifest::init_writer(stale, Duration::from_secs(5), clock, Some(0)).await;
+            FenceableManifest::init_writer(stale, Duration::from_secs(5), clock, Some(0), 1).await;
 
         assert!(matches!(result, Err(SlateDBError::Fenced)));
         assert_eq!(object_store.write_kinds().len(), 1);
@@ -723,9 +730,10 @@ mod tests {
         let before = store.read_latest_manifest().await.unwrap();
         object_store.clear();
 
-        let writer = FenceableManifest::init_writer(stale, Duration::from_secs(5), clock, Some(0))
-            .await
-            .unwrap();
+        let writer =
+            FenceableManifest::init_writer(stale, Duration::from_secs(5), clock, Some(0), 1)
+                .await
+                .unwrap();
 
         assert_eq!(object_store.write_kinds().len(), 2);
         let after = store.read_latest_manifest().await.unwrap();
@@ -889,11 +897,48 @@ mod tests {
             let sm = StoredManifest::load(ms.clone(), Arc::new(DefaultSystemClock::new()))
                 .await
                 .unwrap();
-            FenceableManifest::init_writer(sm, timeout, Arc::new(DefaultSystemClock::new()), None)
-                .await
-                .unwrap();
+            FenceableManifest::init_writer(
+                sm,
+                timeout,
+                Arc::new(DefaultSystemClock::new()),
+                None,
+                1,
+            )
+            .await
+            .unwrap();
             let manifest = ms.read_latest_manifest().await.unwrap();
             assert_eq!(manifest.manifest.writer_epoch, i);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_writer_claim_raises_wal_excluded_range_max_size_and_never_lowers_it() {
+        let ms = new_memory_manifest_store();
+        StoredManifest::create_new_db(
+            ms.clone(),
+            ManifestCore::new(),
+            Arc::new(DefaultSystemClock::new()),
+        )
+        .await
+        .unwrap();
+        let timeout = Duration::from_secs(300);
+        // A writer with limit 4 raises the window. A later writer with limit 2 keeps it at 4.
+        for (limit, expected_epoch, expected_window) in [(4, 1, 4), (2, 2, 4)] {
+            let sm = StoredManifest::load(ms.clone(), Arc::new(DefaultSystemClock::new()))
+                .await
+                .unwrap();
+            FenceableManifest::init_writer(
+                sm,
+                timeout,
+                Arc::new(DefaultSystemClock::new()),
+                None,
+                limit,
+            )
+            .await
+            .unwrap();
+            let manifest = ms.read_latest_manifest().await.unwrap().manifest;
+            assert_eq!(manifest.writer_epoch, expected_epoch);
+            assert_eq!(manifest.core.wal_excluded_range_max_size, expected_window);
         }
     }
 
@@ -909,15 +954,20 @@ mod tests {
         .await
         .unwrap();
         let timeout = Duration::from_secs(300);
-        let mut writer1 =
-            FenceableManifest::init_writer(sm, timeout, Arc::new(DefaultSystemClock::new()), None)
-                .await
-                .unwrap();
+        let mut writer1 = FenceableManifest::init_writer(
+            sm,
+            timeout,
+            Arc::new(DefaultSystemClock::new()),
+            None,
+            1,
+        )
+        .await
+        .unwrap();
         let sm2 = StoredManifest::load(ms.clone(), Arc::new(DefaultSystemClock::new()))
             .await
             .unwrap();
 
-        FenceableManifest::init_writer(sm2, timeout, Arc::new(DefaultSystemClock::new()), None)
+        FenceableManifest::init_writer(sm2, timeout, Arc::new(DefaultSystemClock::new()), None, 1)
             .await
             .unwrap();
 
@@ -1058,17 +1108,27 @@ mod tests {
         .await
         .unwrap();
         let timeout = Duration::from_secs(300);
-        let mut fm1 =
-            FenceableManifest::init_writer(sm, timeout, Arc::new(DefaultSystemClock::new()), None)
-                .await
-                .unwrap();
+        let mut fm1 = FenceableManifest::init_writer(
+            sm,
+            timeout,
+            Arc::new(DefaultSystemClock::new()),
+            None,
+            1,
+        )
+        .await
+        .unwrap();
         let sm2 = StoredManifest::load(ms.clone(), Arc::new(DefaultSystemClock::new()))
             .await
             .unwrap();
-        let mut fm2 =
-            FenceableManifest::init_writer(sm2, timeout, Arc::new(DefaultSystemClock::new()), None)
-                .await
-                .unwrap();
+        let mut fm2 = FenceableManifest::init_writer(
+            sm2,
+            timeout,
+            Arc::new(DefaultSystemClock::new()),
+            None,
+            1,
+        )
+        .await
+        .unwrap();
 
         let result = fm1
             .maybe_apply_update(|fm| {
@@ -1658,6 +1718,7 @@ mod tests {
             timeout,
             Arc::new(DefaultSystemClock::new()),
             None,
+            1,
         )
         .await
         .unwrap();
@@ -1669,6 +1730,7 @@ mod tests {
             timeout,
             Arc::new(DefaultSystemClock::new()),
             None,
+            1,
         )
         .await
         .unwrap();

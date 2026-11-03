@@ -467,15 +467,8 @@ async fn validate_no_data_wal(
 ) -> Result<(), SlateDBError> {
     let mut parents_with_wal = vec![];
     for source in sources {
-        let replay_after_wal_id = source.manifest.core.replay_after_wal_id;
-        let wal_id_last_seen = source
-            .manifest
-            .core
-            .next_wal_sst_id
-            .checked_sub(1)
-            .ok_or(SlateDBError::InvalidDBState)?;
         if !wal_admin
-            .is_empty(&source.path, replay_after_wal_id, wal_id_last_seen)
+            .is_empty(&source.path, &source.versioned_manifest())
             .await?
         {
             parents_with_wal.push(source.path.clone());
@@ -598,7 +591,7 @@ mod tests {
     use crate::iter::IterationOrder;
     use crate::manifest::store::{ManifestStore, StoredManifest};
     use crate::manifest::Manifest;
-    use crate::manifest::{ManifestCore, VersionedManifest};
+    use crate::manifest::{ManifestCore, VersionedManifest, WalExcludedRange};
     use crate::paths::PathResolver;
     use crate::proptest_util::{rng, sample};
     use crate::test_utils;
@@ -612,7 +605,7 @@ mod tests {
     use object_store::memory::InMemory;
     use object_store::path::Path;
     use object_store::Error as ObjectStoreError;
-    use object_store::ObjectStore;
+    use object_store::{ObjectStore, ObjectStoreExt};
     use slatedb_common::clock::DefaultSystemClock;
     use slatedb_common::DbRand;
     use slatedb_common::SystemClock;
@@ -656,8 +649,7 @@ mod tests {
         async fn is_empty(
             &self,
             _path: &Path,
-            _replay_after_wal_id: u64,
-            _wal_id_last_seen: u64,
+            _manifest: &VersionedManifest,
         ) -> Result<bool, WalError> {
             Ok(true)
         }
@@ -731,6 +723,98 @@ mod tests {
             None,
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn should_exclude_the_orphan_when_cloning_after_a_takeover() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let settings = Settings {
+            compactor_options: None,
+            garbage_collector_options: None,
+            ..Default::default()
+        };
+
+        // given: the parent's takeover excluded 3 to 5 with an orphan at 4.
+        // The writer then writes key 2 at WAL 6, and a checkpoint records the
+        // WAL through 6 without an L0 flush, so the range is in the copied WAL.
+        let parent = test_utils::open_after_takeover_with_an_orphan(
+            &Path::from("parent"),
+            object_store.clone(),
+            settings.clone(),
+        )
+        .await;
+        parent.put(b"2", b"2").await.unwrap();
+        parent
+            .flush_with_options(FlushOptions {
+                flush_type: FlushType::Wal,
+            })
+            .await
+            .unwrap();
+        let checkpoint = parent
+            .create_checkpoint(CheckpointScope::Durable, &CheckpointOptions::default())
+            .await
+            .unwrap();
+
+        // when: a clone is created from the checkpoint.
+        create_clone(
+            "clone",
+            "parent",
+            object_store.clone(),
+            object_store.clone(),
+            Some(checkpoint.id),
+            Arc::new(FailPointRegistry::new()),
+            Arc::new(DefaultSystemClock::new()),
+            Arc::new(DbRand::new(7)),
+        )
+        .await
+        .unwrap();
+
+        // then: the clone copied the orphan with the range start, and keeps
+        // the parent's range.
+        let clone_wal = PathResolver::from_root("clone");
+        for wal_id in 3..=6 {
+            assert!(object_store
+                .head(&clone_wal.wal_sst_path(&WalFileId::from(wal_id)))
+                .await
+                .is_ok());
+        }
+        let clone_manifest = ManifestStore::new(&Path::from("clone"), object_store.clone())
+            .read_latest_manifest()
+            .await
+            .unwrap();
+        assert_eq!(
+            clone_manifest.manifest.core.wal_excluded_ranges,
+            vec![WalExcludedRange { start: 3, end: 5 }]
+        );
+
+        // then: the clone recovers both keys and not the orphan, and it can
+        // write past the range.
+        let clone = Db::builder("clone", object_store.clone())
+            .with_settings(settings.clone())
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(
+            clone.get(b"1").await.unwrap(),
+            Some(Bytes::from_static(b"1"))
+        );
+        assert_eq!(
+            clone.get(b"2").await.unwrap(),
+            Some(Bytes::from_static(b"2"))
+        );
+        assert_eq!(clone.get(b"orphan").await.unwrap(), None);
+        clone.put(b"3", b"3").await.unwrap();
+        clone.close().await.unwrap();
+        let reopened = Db::builder("clone", object_store.clone())
+            .with_settings(settings)
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(
+            reopened.get(b"3").await.unwrap(),
+            Some(Bytes::from_static(b"3"))
+        );
+        assert_eq!(reopened.get(b"orphan").await.unwrap(), None);
     }
 
     #[rstest::rstest]

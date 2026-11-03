@@ -3,6 +3,7 @@ use crate::garbage_collector::stats::GcStats;
 use crate::paths::PathResolver;
 use crate::tablestore::TableStoreKind;
 use crate::wal::slatedb::gc::{SlateDbWalGc, WalGcMode};
+use crate::wal::slatedb::iterator::excluded_range_end;
 use crate::wal::slatedb::store::{WalFileId, WalTableStore};
 use crate::wal::{WalAdmin, WalError, WalGc};
 use crate::VersionedManifest;
@@ -97,19 +98,12 @@ impl WalAdmin for SlateDbWalAdmin {
         Ok(paths.iter().map(Path::to_string).collect())
     }
 
-    async fn is_empty(
-        &self,
-        path: &Path,
-        replay_after_wal_id: u64,
-        wal_id_last_seen: u64,
-    ) -> Result<bool, WalError> {
-        // Avoid object-store requests when the manifest's WAL range contains no file IDs.
-        if !Self::has_wal_file_ids(replay_after_wal_id, wal_id_last_seen) {
-            return Ok(true);
-        }
-
+    async fn is_empty(&self, path: &Path, manifest: &VersionedManifest) -> Result<bool, WalError> {
+        let (replay_after_wal_id, wal_id_last_seen) = Self::replay_range(manifest)?;
+        let excluded_ranges = &manifest.core().wal_excluded_ranges;
         let path_resolver = PathResolver::from_root(path.clone());
-        for wal_id in (replay_after_wal_id + 1)..=wal_id_last_seen {
+        let mut wal_id = replay_after_wal_id + 1;
+        while wal_id <= wal_id_last_seen {
             let path = path_resolver.wal_sst_path(&WalFileId::from(wal_id));
             let metadata = self
                 .object_store
@@ -121,6 +115,13 @@ impl WalAdmin for SlateDbWalAdmin {
             if metadata.size > 0 {
                 return Ok(false);
             }
+            // A fence that starts an excluded range hides the rest of the
+            // range. Orphans there hold no accepted records, and IDs there can
+            // be missing.
+            wal_id = match excluded_range_end(excluded_ranges, wal_id) {
+                Some(end) => end.saturating_add(1),
+                None => wal_id + 1,
+            };
         }
         Ok(true)
     }
@@ -132,6 +133,7 @@ impl WalAdmin for SlateDbWalAdmin {
         to_path: &Path,
     ) -> Result<(u64, u64), WalError> {
         let (replay_after_wal_id, wal_id_last_seen) = Self::replay_range(&from_manifest)?;
+        let excluded_ranges = &from_manifest.core().wal_excluded_ranges;
         let from_path_resolver = PathResolver::from_root(from_path.clone());
         let to_path_resolver = PathResolver::from_root(to_path.clone());
 
@@ -144,11 +146,17 @@ impl WalAdmin for SlateDbWalAdmin {
                 let id = WalFileId::from(wal_id);
                 let source = from_path_resolver.wal_sst_path(&id);
                 let destination = to_path_resolver.wal_sst_path(&id);
-                self.object_store
-                    .as_ref()
-                    .copy(&source, &destination)
-                    .await
-                    .map_err(|err| WalError::Unavailable(Arc::new(err)))?;
+                match self.object_store.as_ref().copy(&source, &destination).await {
+                    Ok(()) => {}
+                    // A takeover that crashed before its fills can leave IDs
+                    // after its range start missing. The clone keeps the
+                    // source's ranges, so it excludes these IDs too.
+                    Err(object_store::Error::NotFound { .. })
+                        if excluded_ranges
+                            .iter()
+                            .any(|range| range.start < wal_id && wal_id <= range.end) => {}
+                    Err(err) => return Err(WalError::Unavailable(Arc::new(err))),
+                }
             }
         }
 
@@ -159,6 +167,7 @@ impl WalAdmin for SlateDbWalAdmin {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::manifest::{Manifest, ManifestCore, WalExcludedRange};
     use bytes::Bytes;
     use object_store::memory::InMemory;
 
@@ -195,6 +204,74 @@ mod tests {
         ));
         assert!(object_store.head(&non_wal_object).await.is_ok());
         assert!(object_store.head(&sibling_object).await.is_ok());
+    }
+
+    /// Writes a WAL after a takeover that crashed before its fills. The
+    /// manifest records the range 2 to 4. ID 2 is a fence, ID 3 is an orphan,
+    /// and ID 4 is missing. ID 5 is a fence, or a data file if `data_at_5`.
+    async fn wal_with_an_unfilled_range(
+        object_store: &Arc<dyn ObjectStore>,
+        db_path: &Path,
+        data_at_5: bool,
+    ) -> VersionedManifest {
+        let resolver = PathResolver::from_root(db_path.clone());
+        let put = |wal_id: u64, bytes: &'static [u8]| {
+            let path = resolver.wal_sst_path(&WalFileId::from(wal_id));
+            async move {
+                object_store
+                    .put(&path, Bytes::from_static(bytes).into())
+                    .await
+                    .unwrap();
+            }
+        };
+        put(2, b"").await;
+        put(3, b"orphan").await;
+        put(5, if data_at_5 { b"data" } else { b"" }).await;
+
+        let mut core = ManifestCore::new();
+        core.replay_after_wal_id = 1;
+        core.next_wal_sst_id = 6;
+        core.wal_excluded_ranges = vec![WalExcludedRange { start: 2, end: 4 }];
+        VersionedManifest::from_manifest(1, Manifest::initial(core))
+    }
+
+    #[tokio::test]
+    async fn is_empty_skips_an_excluded_range() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let wal_admin =
+            SlateDbWalAdmin::new(object_store.clone(), Arc::new(FailPointRegistry::new()));
+        let db_path = Path::from("db");
+
+        let manifest = wal_with_an_unfilled_range(&object_store, &db_path, false).await;
+        assert!(wal_admin.is_empty(&db_path, &manifest).await.unwrap());
+
+        let db_path = Path::from("db_with_data");
+        let manifest = wal_with_an_unfilled_range(&object_store, &db_path, true).await;
+        assert!(!wal_admin.is_empty(&db_path, &manifest).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn clone_wal_copies_around_a_missing_id_in_an_excluded_range() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let wal_admin =
+            SlateDbWalAdmin::new(object_store.clone(), Arc::new(FailPointRegistry::new()));
+        let from_path = Path::from("source");
+        let to_path = Path::from("clone");
+        let manifest = wal_with_an_unfilled_range(&object_store, &from_path, false).await;
+
+        let replay_range = wal_admin
+            .clone_wal(&from_path, manifest, &to_path)
+            .await
+            .unwrap();
+
+        assert_eq!(replay_range, (1, 5));
+        let resolver = PathResolver::from_root(to_path);
+        for (wal_id, exists) in [(2, true), (3, true), (4, false), (5, true)] {
+            let head = object_store
+                .head(&resolver.wal_sst_path(&WalFileId::from(wal_id)))
+                .await;
+            assert_eq!(head.is_ok(), exists, "WAL {wal_id}");
+        }
     }
 
     #[test]

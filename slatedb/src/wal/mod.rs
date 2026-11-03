@@ -1,5 +1,6 @@
 use crate::error::SlateDBError;
 use crate::manifest::store::FenceableManifest;
+use crate::manifest::WalExcludedRange;
 use crate::{CloseReason, ErrorKind, RowEntry, VersionedManifest};
 use async_trait::async_trait;
 use futures::future::BoxFuture;
@@ -120,6 +121,37 @@ impl WriterManifest {
     pub async fn refresh(&mut self) -> Result<(), WalError> {
         self.manifest.refresh().await?;
         Ok(())
+    }
+
+    /// Records in the manifest that WAL IDs `start..=end` are excluded from
+    /// accepted history. Recorded ranges that end at or after `start` are
+    /// replaced.
+    ///
+    /// Call during takeover with `start` set to the walk's frontier, before
+    /// writing the fence at `start`. Readers exclude this range only once that
+    /// fence exists.
+    ///
+    /// Returns `Fenced` if a newer writer claimed the epoch.
+    pub(crate) async fn exclude_wal_range(&mut self, start: u64, end: u64) -> Result<(), WalError> {
+        loop {
+            let mut dirty = self.manifest.prepare_dirty()?;
+            let ranges = &mut dirty.value.core.wal_excluded_ranges;
+            // Remove ranges that reach `start`. None of them applies, so they
+            // are stale: either an older writer's upload took the range start
+            // before the fence, or the takeover that recorded the range
+            // crashed before writing its fence.
+            ranges.retain(|range| range.end < start);
+            ranges.push(WalExcludedRange { start, end });
+            match self.manifest.update(dirty).await {
+                Ok(()) => return Ok(()),
+                // Another manifest write came first. The refresh also returns
+                // `Fenced` if a newer writer claimed the epoch.
+                Err(SlateDBError::TransactionalObjectVersionExists) => {
+                    self.manifest.refresh().await?;
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
     }
 }
 
@@ -354,23 +386,18 @@ pub trait WalAdmin: Send + Sync + 'static {
     /// list is used to display the output of deleting the WAL (e.g. in logs or tool output)
     async fn delete_wal(&self, path: &Path, dry_run: bool) -> Result<Vec<String>, WalError>;
 
-    /// Given a path and WAL ID range, returns true if the WAL at that path is empty within the
-    /// specified range. A WAL is empty if it holds no records.
+    /// Given a path and manifest, returns true if the WAL that the manifest references holds no
+    /// records. The referenced WAL runs after the manifest's replay boundary through the WAL
+    /// file before its next WAL file ID.
     ///
     /// ## Arguments
     /// - `path`: The database path containing the WAL.
-    /// - `replay_after_wal_id`: The exclusive lower bound of the WAL range to inspect.
-    /// - `wal_id_last_seen`: The inclusive upper bound of the WAL range to inspect.
+    /// - `manifest`: The manifest that identifies the WAL to inspect.
     ///
     /// ## Returns
     /// `Ok(true)` if the referenced WAL contains no records, `Ok(false)` if it contains records,
     /// or a [`WalError`] if the WAL could not be inspected.
-    async fn is_empty(
-        &self,
-        path: &Path,
-        replay_after_wal_id: u64,
-        wal_id_last_seen: u64,
-    ) -> Result<bool, WalError>;
+    async fn is_empty(&self, path: &Path, manifest: &VersionedManifest) -> Result<bool, WalError>;
 
     /// Given a source path and manifest, copy the referenced WAL to a destination path and return
     /// a replay range. This call must be idempotent (TODO: clarify)
@@ -436,8 +463,114 @@ impl From<WalError> for SlateDBError {
 
 #[cfg(test)]
 mod tests {
-    use super::WalError;
+    use super::{WalError, WriterManifest};
+    use crate::manifest::store::{FenceableManifest, ManifestStore, StoredManifest};
+    use crate::manifest::{ManifestCore, WalExcludedRange};
+    use object_store::memory::InMemory;
+    use object_store::path::Path;
+    use slatedb_common::clock::DefaultSystemClock;
     use std::sync::Arc;
+    use std::time::Duration;
+
+    async fn claim_writer(manifest_store: &Arc<ManifestStore>) -> WriterManifest {
+        let stored_manifest = StoredManifest::load(
+            Arc::clone(manifest_store),
+            Arc::new(DefaultSystemClock::new()),
+        )
+        .await
+        .unwrap();
+        FenceableManifest::init_writer(
+            stored_manifest,
+            Duration::from_secs(300),
+            Arc::new(DefaultSystemClock::new()),
+            None,
+            3,
+        )
+        .await
+        .unwrap()
+        .into()
+    }
+
+    async fn new_manifest_store() -> Arc<ManifestStore> {
+        let manifest_store = Arc::new(ManifestStore::new(
+            &Path::from("/tmp/exclude_wal_range"),
+            Arc::new(InMemory::new()),
+        ));
+        StoredManifest::create_new_db(
+            Arc::clone(&manifest_store),
+            ManifestCore::new(),
+            Arc::new(DefaultSystemClock::new()),
+        )
+        .await
+        .unwrap();
+        manifest_store
+    }
+
+    async fn stored_ranges(manifest_store: &ManifestStore) -> Vec<(u64, u64)> {
+        manifest_store
+            .read_latest_manifest()
+            .await
+            .unwrap()
+            .manifest
+            .core
+            .wal_excluded_ranges
+            .iter()
+            .map(|range| (range.start, range.end))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn exclude_wal_range_keeps_earlier_ranges_and_replaces_stale_ones() {
+        let manifest_store = new_manifest_store().await;
+        let mut writer = claim_writer(&manifest_store).await;
+
+        writer.exclude_wal_range(3, 5).await.unwrap();
+        writer.exclude_wal_range(8, 10).await.unwrap();
+        assert_eq!(stored_ranges(&manifest_store).await, vec![(3, 5), (8, 10)]);
+
+        // The range 8 to 10 reaches the new start 9, so it is stale.
+        writer.exclude_wal_range(9, 11).await.unwrap();
+        assert_eq!(stored_ranges(&manifest_store).await, vec![(3, 5), (9, 11)]);
+    }
+
+    #[tokio::test]
+    async fn exclude_wal_range_retries_a_conflict_and_fails_when_fenced() {
+        // given: a writer, and another process that writes the manifest after
+        // the writer last read it.
+        let manifest_store = new_manifest_store().await;
+        let mut writer = claim_writer(&manifest_store).await;
+        let mut other = StoredManifest::load(
+            Arc::clone(&manifest_store),
+            Arc::new(DefaultSystemClock::new()),
+        )
+        .await
+        .unwrap();
+        let mut dirty = other.prepare_dirty().unwrap();
+        dirty.value.core.next_wal_sst_id = 7;
+        other.update(dirty).await.unwrap();
+
+        // when/then: the range write retries and keeps the other write.
+        writer.exclude_wal_range(3, 5).await.unwrap();
+        let manifest = manifest_store
+            .read_latest_manifest()
+            .await
+            .unwrap()
+            .manifest;
+        assert_eq!(manifest.core.next_wal_sst_id, 7);
+        assert_eq!(
+            manifest.core.wal_excluded_ranges,
+            vec![WalExcludedRange { start: 3, end: 5 }]
+        );
+
+        // when/then: after a newer writer claims the epoch, the range write
+        // fails and records nothing.
+        claim_writer(&manifest_store).await;
+        assert!(matches!(
+            writer.exclude_wal_range(8, 10).await,
+            Err(WalError::Fenced)
+        ));
+        assert_eq!(stored_ranges(&manifest_store).await, vec![(3, 5)]);
+    }
 
     #[test]
     fn wal_error_display() {

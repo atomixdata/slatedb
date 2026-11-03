@@ -213,6 +213,10 @@ use crate::error::SlateDBError;
 
 use crate::garbage_collector::{DEFAULT_INTERVAL, DEFAULT_MIN_AGE};
 
+fn default_max_inflight_wal_uploads() -> usize {
+    1
+}
+
 fn default_true() -> bool {
     true
 }
@@ -715,6 +719,26 @@ pub struct Settings {
     #[serde(serialize_with = "serialize_option_duration")]
     pub flush_interval: Option<Duration>,
 
+    /// The maximum number of WAL files that can be uploaded but not yet
+    /// durable. Must be at least 1.
+    ///
+    /// A finished upload keeps its slot until every earlier file is durable,
+    /// so this value limits the span of WAL file IDs in flight, not only the
+    /// number of concurrent uploads. Defaults to 1, which means serial WAL
+    /// uploads.
+    ///
+    /// To get most of the latency gain, set this value to at least the upload
+    /// time divided by `flush_interval`. A smaller value makes uploads start
+    /// in groups. The writer then makes about one upload request per
+    /// `flush_interval` while writes arrive.
+    ///
+    /// Before you set this value above 1, upgrade every binary that opens the
+    /// database. A writer with a value above 1 records it in the manifest and
+    /// writes manifest format version 3, which older versions reject. Lowering
+    /// the value later is safe, but the manifest keeps the largest value.
+    #[serde(default = "default_max_inflight_wal_uploads")]
+    pub max_inflight_wal_uploads: usize,
+
     /// If set to false, SlateDB will disable the WAL and write directly into the memtable
     #[cfg(feature = "wal_disable")]
     pub wal_enabled: bool,
@@ -883,7 +907,8 @@ pub struct Settings {
 impl std::fmt::Debug for Settings {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut data = f.debug_struct("DbOptions");
-        data.field("flush_interval", &self.flush_interval);
+        data.field("flush_interval", &self.flush_interval)
+            .field("max_inflight_wal_uploads", &self.max_inflight_wal_uploads);
         #[cfg(feature = "wal_disable")]
         {
             data.field("wal_enabled", &self.wal_enabled);
@@ -928,6 +953,12 @@ impl Settings {
     /// Returns an [`crate::Error`] with [`crate::ErrorKind::Invalid`] describing
     /// the first invalid setting or combination encountered.
     pub fn validate(&self) -> Result<(), crate::Error> {
+        if self.max_inflight_wal_uploads == 0 {
+            return Err(SlateDBError::InvalidConfiguration(
+                "max_inflight_wal_uploads must be at least 1".into(),
+            )
+            .into());
+        }
         if self.l0_flush_parallelism == 0 {
             return Err(SlateDBError::InvalidConfiguration(
                 "l0_flush_parallelism must be at least 1".into(),
@@ -1123,6 +1154,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             flush_interval: Some(Duration::from_millis(100)),
+            max_inflight_wal_uploads: default_max_inflight_wal_uploads(),
             #[cfg(feature = "wal_disable")]
             wal_enabled: true,
             manifest_poll_interval: Duration::from_secs(1),
@@ -2325,6 +2357,30 @@ object_store_cache_options:
     #[test]
     fn test_validate_accepts_default_settings() {
         assert!(Settings::default().validate().is_ok());
+    }
+
+    #[test]
+    fn test_max_inflight_wal_uploads_configuration() {
+        let mut settings = Settings::default();
+        assert_eq!(settings.max_inflight_wal_uploads, 1);
+        settings.max_inflight_wal_uploads = 0;
+        let error = settings.validate().expect_err("expected invalid settings");
+        assert!(matches!(error.kind(), crate::ErrorKind::Invalid));
+        assert!(error
+            .to_string()
+            .contains("max_inflight_wal_uploads must be at least 1"));
+
+        settings.max_inflight_wal_uploads = 4;
+        assert!(settings.validate().is_ok());
+        let mut serialized = serde_json::to_value(&settings).unwrap();
+        let restored: Settings = serde_json::from_value(serialized.clone()).unwrap();
+        assert_eq!(restored.max_inflight_wal_uploads, 4);
+        serialized
+            .as_object_mut()
+            .unwrap()
+            .remove("max_inflight_wal_uploads");
+        let restored: Settings = serde_json::from_value(serialized).unwrap();
+        assert_eq!(restored.max_inflight_wal_uploads, 1);
     }
 
     #[test]

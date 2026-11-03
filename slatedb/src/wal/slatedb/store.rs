@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use fail_parallel::{fail_point, FailPointRegistry};
-use futures::{future::join_all, StreamExt};
+use futures::StreamExt;
 use log::{debug, warn};
 use object_store::path::Path;
 use object_store::{GetOptions, GetRange, ObjectStore, ObjectStoreExt, PutMode, PutOptions};
@@ -21,6 +21,7 @@ use crate::format::sst::{EncodedSsTable, SsTableFormat};
 use crate::object_store_tag::{ObjectStoreCallTag, TableStoreKind};
 use crate::paths::PathResolver;
 use crate::sst_io::{read_with_validation_retry, ReadOnlyObject};
+use crate::wal::slatedb::iterator::{excluded_range_end, WalExcludedRanges};
 use crate::wal::slatedb::sst_builder::EncodedWalSsTableBuilder;
 
 const WAL_SST_CACHED_FOOTER_SIZE: u64 = 128 * 1024;
@@ -480,109 +481,59 @@ impl WalTableStore {
         Ok(blocks.into_iter().map(Arc::new).collect())
     }
 
-    /// Find the highest WAL SST id present in the object store at or above
-    /// `start_after + 1`, returning `start_after` if none exist.
+    /// Walks accepted WAL history from `start` and returns the frontier, i.e.
+    /// the first missing WAL ID.
     ///
-    /// `start_after` should be a known lower bound (e.g. `replay_after_wal_id`
-    /// from the manifest, or the highest already-replayed WAL id). Passing 0
-    /// scans the entire WAL id space.
+    /// `start` is the first WAL ID to check, usually `replay_after_wal_id + 1`.
+    /// It must be at least 1 and above the replay boundary, because GC can
+    /// delete files at or below the boundary during the walk.
     ///
-    /// Two phases:
-    ///   1. Parallel exponential probe at offsets `2^0, 2^1, ..., 2^k` from
-    ///      `start_after`. One RTT per round of 8 exponents. Brackets the
-    ///      frontier between two adjacent powers of two.
-    ///   2. Sequential binary search inside the bracketed range to find the
-    ///      exact frontier.
-    ///
-    /// Relies on the fencing protocol's contiguity invariant: "id exists" is
-    /// monotone-decreasing in id, so binary search is sound. Total HEAD count
-    /// is `O(log N)` for a gap of size N, vs `O(N)` for a windowed scan.
-    pub(crate) async fn last_seen_wal_id(
+    /// A zero-byte fence that starts an excluded range accounts for the whole
+    /// range, so the walk skips the IDs inside it.
+    pub(crate) async fn walk_to_frontier(
         &self,
-        start_after: WalFileId,
+        start: WalFileId,
+        excluded_ranges: &WalExcludedRanges,
     ) -> Result<WalFileId, SlateDBError> {
         fail_point!(Arc::clone(&self.fp_registry), "probe-wal-ssts", |_| {
             Err(SlateDBError::from(std::io::Error::other("oops")))
         });
-
-        const ROUND_SIZE: u32 = 8;
-        const MAX_EXP: u32 = 48;
-
-        let mut lo_offset = None;
-        let mut hi_offset = None;
-        let mut next_exp = 0;
-
-        while hi_offset.is_none() {
-            if next_exp >= MAX_EXP {
-                return Err(SlateDBError::InvalidDBState);
-            }
-            let end_exp = (next_exp + ROUND_SIZE).min(MAX_EXP);
-            let exps: Vec<u32> = (next_exp..end_exp).collect();
-            let probes = exps.iter().map(|&exp| {
-                let offset = 1u64 << exp;
-                let path = self.path(WalFileId::from(start_after.value() + offset));
-                let object_store = Arc::clone(&self.object_store);
-                async move { wal_object_exists(&object_store, &path).await }
-            });
-            let results = join_all(probes).await;
-
-            for (exp, result) in exps.iter().zip(results) {
-                let offset = 1u64 << exp;
-                if result? {
-                    lo_offset = Some(offset);
-                } else {
-                    hi_offset = Some(offset);
-                    break;
-                }
-            }
-            next_exp = end_exp;
-        }
-
-        let hi = hi_offset.expect("loop exits only after finding an upper bound");
-        let Some(lo) = lo_offset else {
-            return Ok(start_after);
-        };
-
-        let mut left = lo + 1;
-        let mut right = hi;
-        while left < right {
-            let mid = left + (right - left) / 2;
-            if wal_object_exists(
-                &self.object_store,
-                &self.path(WalFileId::from(start_after.value() + mid)),
-            )
-            .await?
-            {
-                left = mid + 1;
-            } else {
-                right = mid;
+        let offset = self.path(WalFileId::from(start.value() - 1));
+        let mut objects = Vec::new();
+        let mut listing = self
+            .object_store
+            .list_with_offset(Some(&self.path_resolver.wal_path()), &offset);
+        while let Some(object) = listing.next().await.transpose()? {
+            if let Ok(Some(id)) = self.path_resolver.parse_wal_file_id(&object.location) {
+                objects.push((id.value(), object.size));
             }
         }
-        Ok(WalFileId::from(start_after.value() + left - 1))
-    }
+        // The walk below requires IDs to be in ascending order.
+        // `LocalFileSystem` lists in directory order, so sort here.
+        objects.sort_unstable();
 
-    pub(crate) async fn next_wal_sst_id(
-        &self,
-        wal_id_last_compacted: WalFileId,
-    ) -> Result<WalFileId, SlateDBError> {
-        Ok(WalFileId::from(
-            self.last_seen_wal_id(wal_id_last_compacted).await?.value() + 1,
-        ))
+        // Load the ranges after the listing. A takeover records its range
+        // before its fence, so every listed fence has its range in this load.
+        let ranges = excluded_ranges.load().await?;
+        let mut next = start.value();
+        for (wal_id, size) in objects {
+            if wal_id < next {
+                // The ID is below `start` or inside an excluded range.
+                continue;
+            }
+            if wal_id > next {
+                break;
+            }
+            next = match excluded_range_end(&ranges, wal_id) {
+                Some(end) if size == 0 => end + 1,
+                _ => wal_id + 1,
+            };
+        }
+        Ok(WalFileId::from(next))
     }
 
     fn path(&self, wal_id: WalFileId) -> Path {
         self.path_resolver.wal_sst_path(&wal_id)
-    }
-}
-
-async fn wal_object_exists(
-    object_store: &Arc<dyn ObjectStore>,
-    path: &Path,
-) -> Result<bool, SlateDBError> {
-    match object_store.head(path).await {
-        Ok(_) => Ok(true),
-        Err(object_store::Error::NotFound { .. }) => Ok(false),
-        Err(error) => Err(SlateDBError::from(error)),
     }
 }
 
@@ -597,11 +548,10 @@ mod tests {
     use crate::block_iterator::DataBlockIterator;
     use crate::error::RetryReason;
     use crate::iter::IterationOrder;
+    use crate::manifest::WalExcludedRange;
     use crate::test_utils::{FlakyObjectStore, RecordingObjectStore};
     use crate::types::RowEntry;
     use object_store::memory::InMemory;
-    use object_store::ObjectStoreExt;
-    use rstest::rstest;
 
     fn test_store() -> WalTableStore {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -756,6 +706,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn walk_to_frontier_skips_excluded_ranges_and_stops_at_the_first_gap() {
+        // given: data at 1, a fence at 2 that starts the excluded range 2 to 4,
+        // an orphan at 3, and a missing ID at 4. Data at 5, a gap at 6, and an
+        // orphan at 7 follow. A stale range 5 to 9 starts at a data file.
+        let store = test_store();
+        let write_data = |wal_id: u64| {
+            let store = &store;
+            async move {
+                let mut builder = store.table_builder();
+                builder
+                    .add(RowEntry::new_value(b"key", b"value", wal_id))
+                    .await
+                    .unwrap();
+                let encoded = builder.build().await.unwrap();
+                store.write_sst(wal_id.into(), &encoded).await.unwrap();
+            }
+        };
+        write_data(1).await;
+        store.write_wal_fence(2.into()).await.unwrap();
+        for wal_id in [3, 5, 7] {
+            write_data(wal_id).await;
+        }
+        let ranges = WalExcludedRanges::known(&[
+            WalExcludedRange { start: 2, end: 4 },
+            WalExcludedRange { start: 5, end: 9 },
+        ]);
+
+        // when/then: the walk skips the range at the fence, ignores the range
+        // at the data file, and stops at the gap.
+        assert_eq!(
+            store
+                .walk_to_frontier(1.into(), &ranges)
+                .await
+                .unwrap()
+                .value(),
+            6
+        );
+        // Without the ranges, the walk stops at the missing ID inside the
+        // range.
+        assert_eq!(
+            store
+                .walk_to_frontier(1.into(), &WalExcludedRanges::none())
+                .await
+                .unwrap()
+                .value(),
+            4
+        );
+        // A walk that starts at an existing ID continues past it.
+        assert_eq!(
+            store
+                .walk_to_frontier(7.into(), &ranges)
+                .await
+                .unwrap()
+                .value(),
+            8
+        );
+    }
+
+    #[tokio::test]
     async fn writes_and_reads_wal_sst_without_a_cache() {
         let store = test_store();
         let rows = [
@@ -810,8 +819,14 @@ mod tests {
         let store = test_store();
 
         store.write_wal_fence(1.into()).await.unwrap();
-        assert_eq!(store.last_seen_wal_id(0.into()).await.unwrap().value(), 1);
-        assert_eq!(store.next_wal_sst_id(0.into()).await.unwrap().value(), 2);
+        assert_eq!(
+            store
+                .walk_to_frontier(1.into(), &WalExcludedRanges::none())
+                .await
+                .unwrap()
+                .value(),
+            2
+        );
         assert!(matches!(
             store.write_wal_fence(1.into()).await,
             Err(SlateDBError::Fenced)
@@ -832,43 +847,6 @@ mod tests {
             Err(SlateDBError::Fenced)
         ));
     }
-    #[rstest]
-    #[tokio::test]
-    async fn finds_last_seen_wal_id(
-        #[values(0, 100)] start_after: u64,
-        #[values(0, 1, 5, 7, 8, 9, 16, 127, 128, 129, 200, 255, 256, 257)] n_above: u64,
-    ) {
-        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let store = WalTableStore::new(
-            object_store.clone(),
-            SsTableFormat::default(),
-            Path::from("probe-wal-store"),
-            TableStoreKind::Main,
-        );
-
-        for wal_id in 1..=start_after {
-            object_store
-                .put(&store.path(wal_id.into()), Bytes::new().into())
-                .await
-                .unwrap();
-        }
-        for wal_id in (start_after + 1)..=(start_after + n_above) {
-            object_store
-                .put(&store.path(wal_id.into()), Bytes::new().into())
-                .await
-                .unwrap();
-        }
-
-        assert_eq!(
-            store
-                .last_seen_wal_id(start_after.into())
-                .await
-                .unwrap()
-                .value(),
-            start_after + n_above
-        );
-    }
-
     #[tokio::test]
     async fn object_store_calls_carry_wal_tag() {
         let recording = Arc::new(RecordingObjectStore::new(Arc::new(InMemory::new())));
