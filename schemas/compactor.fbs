@@ -114,6 +114,11 @@ table Compaction {
 
     // Information required to resume a compaction job on a worker
     ctx: CompactionContext;
+
+    // Name of the key group extractor that the coordinator recorded before the
+    // job had output. null = no extractor. The coordinator makes incremental
+    // commits for the job only with an extractor of the same name.
+    key_group_extractor_name: string;
 }
 
 // Progress of the worker through one subcompaction range. The worker sets

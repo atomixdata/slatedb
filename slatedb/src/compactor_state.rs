@@ -468,6 +468,9 @@ pub struct Compaction {
     /// compaction is unclaimed (only valid when `status == Submitted`).
     worker: Option<WorkerSpec>,
     ctx: Option<CompactionContext>,
+    /// Name of the key group extractor for incremental commits. `None` means no
+    /// extractor. The coordinator records it before the job has durable progress.
+    key_group_extractor_name: Option<String>,
 }
 
 impl Compaction {
@@ -480,6 +483,7 @@ impl Compaction {
             worker: None,
             output_ssts: vec![],
             ctx: None,
+            key_group_extractor_name: None,
         }
     }
 
@@ -495,6 +499,11 @@ impl Compaction {
 
     pub(crate) fn with_ctx(mut self, ctx: Option<CompactionContext>) -> Self {
         self.ctx = ctx;
+        self
+    }
+
+    pub(crate) fn with_key_group_extractor_name(mut self, name: Option<String>) -> Self {
+        self.key_group_extractor_name = name;
         self
     }
 
@@ -679,6 +688,25 @@ impl Compaction {
             .as_ref()
             .map(CompactionContext::subcompactions)
             .unwrap_or(&EMPTY_SUBCOMPACTIONS)
+    }
+
+    /// Returns whether a subcompaction has output or is `Completed`. Only then can an
+    /// incremental commit publish part of this compaction.
+    pub(crate) fn has_durable_progress(&self) -> bool {
+        self.subcompactions()
+            .iter()
+            .any(|sub| sub.completed() || !sub.output_ssts().is_empty())
+    }
+
+    /// Returns the name of the key group extractor for incremental commits, or `None`
+    /// for no extractor.
+    pub(crate) fn key_group_extractor_name(&self) -> Option<&str> {
+        self.key_group_extractor_name.as_deref()
+    }
+
+    /// Sets the name of the key group extractor for incremental commits.
+    pub(crate) fn set_key_group_extractor_name(&mut self, name: Option<String>) {
+        self.key_group_extractor_name = name;
     }
 
     /// Sets the current status of this compaction.
