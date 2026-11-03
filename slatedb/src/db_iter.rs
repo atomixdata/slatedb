@@ -577,7 +577,12 @@ impl RecencySourceContext {
         let iter: Box<dyn RowEntryIterator + 'static> = match source {
             RecencySource::MemTable(table) => {
                 // Skip a memtable with no key under the prefix before building
-                // its iterator.
+                // its iterator. On a hit this searches the memtable twice: once
+                // here, and once when `range` positions the iterator. Building
+                // the iterator first and skipping it when empty would avoid the
+                // second search on a hit, but would cost more on each miss.
+                // Which is cheaper depends on how often a memtable holds the
+                // prefix.
                 let contains_prefix = {
                     let span = self.read_trace.new_memtable_span();
                     let _guard = span.enter();
@@ -602,7 +607,7 @@ impl RecencySourceContext {
             }
             RecencySource::SortedRun(sorted_run) => {
                 let mut views = sorted_run.clone().into_tables_covering_range(&self.range);
-                let sst_level = SstTraceLevel::SortedRun(sorted_run.id);
+                let trace_level = SstTraceLevel::SortedRun(sorted_run.id);
                 // The SSTs of a run hold disjoint key ranges, so a prefix
                 // usually falls inside one of them. The run's iterator would
                 // read only that SST, so open it directly and let its filter
@@ -611,12 +616,12 @@ impl RecencySourceContext {
                     let Some(view) = views.pop_front() else {
                         return Ok(None);
                     };
-                    match self.open_sst(view, sst_level).await? {
+                    match self.open_sst(view, trace_level).await? {
                         Some(iter) => Box::new(iter),
                         None => return Ok(None),
                     }
                 } else {
-                    self.open_sorted_run(views, sst_level).await?
+                    self.open_sorted_run(views, trace_level).await?
                 }
             }
         };
@@ -634,14 +639,14 @@ impl RecencySourceContext {
     async fn open_sst(
         &self,
         view: SsTableView,
-        sst_level: SstTraceLevel,
+        trace_level: SstTraceLevel,
     ) -> Result<Option<SstIterator<'static>>, SlateDBError> {
         SstIterator::new_owned_initialized_with_stats(
             self.range.clone(),
             view,
             self.table_store.clone(),
             self.sst_iter_options.clone(),
-            Some(SstTracingContext::new(sst_level, self.read_trace.clone())),
+            Some(SstTracingContext::new(trace_level, self.read_trace.clone())),
             Some(self.db_stats.clone()),
         )
         .await
@@ -652,14 +657,14 @@ impl RecencySourceContext {
     async fn open_sorted_run(
         &self,
         views: VecDeque<SsTableView>,
-        sst_level: SstTraceLevel,
+        trace_level: SstTraceLevel,
     ) -> Result<Box<dyn RowEntryIterator + 'static>, SlateDBError> {
         let mut iter = SortedRunIterator::new_owned_from_tables(
             views,
             self.range.clone(),
             self.table_store.clone(),
             self.sst_iter_options.clone(),
-            Some(SstTracingContext::new(sst_level, self.read_trace.clone())),
+            Some(SstTracingContext::new(trace_level, self.read_trace.clone())),
             Some(self.db_stats.clone()),
         )
         .await?;
