@@ -560,7 +560,6 @@ pub(crate) enum RecencySource {
 pub(crate) struct RecencySourceContext {
     pub(crate) table_store: Arc<TableStore>,
     pub(crate) db_stats: DbStats,
-    pub(crate) prefix: Bytes,
     pub(crate) range: BytesRange,
     pub(crate) sst_iter_options: SstIteratorOptions,
     pub(crate) max_seq: Option<u64>,
@@ -576,26 +575,17 @@ impl RecencySourceContext {
     ) -> Result<Option<Box<dyn RowEntryIterator + 'static>>, SlateDBError> {
         let iter: Box<dyn RowEntryIterator + 'static> = match source {
             RecencySource::MemTable(table) => {
-                // Skip a memtable with no key under the prefix before building
-                // its iterator. On a hit this searches the memtable twice: once
-                // here, and once when `range` positions the iterator. Building
-                // the iterator first and skipping it when empty would avoid the
-                // second search on a hit, but would cost more on each miss.
-                // Which is cheaper depends on how often a memtable holds the
-                // prefix.
-                let contains_prefix = {
-                    let span = self.read_trace.new_memtable_span();
-                    let _guard = span.enter();
-                    table.contains_prefix(&self.prefix)
-                };
-                if !contains_prefix {
-                    return Ok(None);
-                }
                 let mut iter = table.range(
                     self.range.clone(),
                     self.sst_iter_options.order,
                     self.read_trace.clone(),
                 );
+                // Skip when a search finds no key in the range. This allocates
+                // an iterator on each miss. Checking for the prefix first
+                // would avoid that, but would cost two searches on each hit.
+                if iter.is_exhausted() {
+                    return Ok(None);
+                }
                 iter.init().await?;
                 Box::new(iter)
             }
