@@ -2230,7 +2230,7 @@ mod tests {
                 CompactionSpec::new(sources.clone(), sources.last().unwrap().unwrap_sorted_run()),
             )
             .with_ctx(Some(CompactionContext::new(snapshot, Some(0))));
-            let progress = IncrementalProgress::from_compaction(&job, &DbRand::default());
+            let progress = IncrementalProgress::from_compaction(&job, None, &DbRand::default());
             progress
                 .apply_to_manifest_core(&mut core, job.spec(), &DbRand::default())
                 .unwrap();

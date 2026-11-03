@@ -65,6 +65,8 @@ pub struct Admin {
         Option<Arc<dyn crate::compaction_filter::CompactionFilterSupplier>>,
     pub(crate) merge_operator: Option<MergeOperatorType>,
     pub(crate) block_transformer: Option<Arc<dyn BlockTransformer>>,
+    /// The key group extractor for the compactor that this admin runs.
+    pub(crate) key_group_extractor: Option<Arc<dyn crate::prefix_extractor::PrefixExtractor>>,
     pub(crate) wal_admin: Arc<dyn WalAdmin>,
 }
 
@@ -462,6 +464,10 @@ impl Admin {
 
         if let Some(block_transformer) = &self.block_transformer {
             builder = builder.with_block_transformer(block_transformer.clone());
+        }
+
+        if let Some(extractor) = &self.key_group_extractor {
+            builder = builder.with_key_group_extractor(extractor.clone());
         }
 
         builder

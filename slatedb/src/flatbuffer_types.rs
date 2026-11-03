@@ -639,7 +639,10 @@ impl FlatBufferCompactionsCodec {
             .with_status(status)
             .with_worker(worker)
             .with_output_ssts(output_ssts)
-            .with_ctx(ctx))
+            .with_ctx(ctx)
+            .with_key_group_extractor_name(
+                compaction.key_group_extractor_name().map(str::to_string),
+            ))
     }
 
     fn compaction_context(
@@ -1115,6 +1118,9 @@ impl<'b> DbFlatBufferBuilder<'b> {
             None => (FbCompactionContext::NONE, None),
         };
         let output_ssts = self.add_compacted_ssts(compaction.output_ssts().iter());
+        let key_group_extractor_name = compaction
+            .key_group_extractor_name()
+            .map(|name| self.builder.create_string(name));
         FbCompaction::create(
             &mut self.builder,
             &FbCompactionArgs {
@@ -1126,6 +1132,7 @@ impl<'b> DbFlatBufferBuilder<'b> {
                 worker,
                 ctx_type,
                 ctx,
+                key_group_extractor_name,
             },
         )
     }
@@ -2195,6 +2202,34 @@ mod tests {
     }
 
     #[test]
+    fn test_should_roundtrip_key_group_extractor_name() {
+        let with_name = Compaction::new(
+            ulid::Ulid::new(),
+            CompactionSpec::new(vec![SourceId::SortedRun(5), SourceId::SortedRun(3)], 3),
+        )
+        .with_key_group_extractor_name(Some("test.version_suffix".to_string()));
+        let without_name = Compaction::new(
+            ulid::Ulid::new(),
+            CompactionSpec::new(vec![SourceId::SortedRun(2), SourceId::SortedRun(1)], 1),
+        );
+        let mut compactions = Compactions::new(1);
+        compactions.insert(with_name.clone());
+        compactions.insert(without_name.clone());
+
+        let codec = FlatBufferCompactionsCodec {};
+        let bytes = codec.encode(&compactions);
+        let decoded = codec.decode(&bytes).expect("failed to decode compactions");
+
+        let decoded_with_name = decoded.get(&with_name.id()).expect("missing compaction");
+        assert_eq!(
+            decoded_with_name.key_group_extractor_name(),
+            Some("test.version_suffix")
+        );
+        let decoded_without_name = decoded.get(&without_name.id()).expect("missing compaction");
+        assert_eq!(decoded_without_name.key_group_extractor_name(), None);
+    }
+
+    #[test]
     fn test_should_round_trip_compaction_statuses() {
         let statuses = [
             CompactionStatus::Submitted,
@@ -2616,6 +2651,7 @@ mod tests {
                 worker: None,
                 ctx_type: root_generated::CompactionContext::NONE,
                 ctx: None,
+                key_group_extractor_name: None,
             },
         );
         let compactions_vec = fbb.create_vector(&[compaction]);
@@ -2692,6 +2728,7 @@ mod tests {
                 worker: None,
                 ctx_type: root_generated::CompactionContext::NONE,
                 ctx: None,
+                key_group_extractor_name: None,
             },
         );
         let compactions_vec = fbb.create_vector(&[compaction]);
@@ -2760,6 +2797,7 @@ mod tests {
                 worker: None,
                 ctx_type: root_generated::CompactionContext::NONE,
                 ctx: None,
+                key_group_extractor_name: None,
             },
         );
         let compactions_vec = fbb.create_vector(&[compaction]);
