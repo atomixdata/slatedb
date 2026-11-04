@@ -430,7 +430,7 @@ impl Reader {
             // safeguard.
             eager_spawn: false,
             order: options.order,
-            prefix: Some(prefix.clone()),
+            prefix: Some(prefix),
             filter_context: options.filter_context.clone(),
             // Filled from the single selected segment below before SST I/O.
             segment: None,
@@ -481,7 +481,6 @@ impl Reader {
         let context = RecencySourceContext {
             table_store: self.table_store.clone(),
             db_stats: self.db_stats.clone(),
-            prefix,
             range,
             sst_iter_options,
             max_seq,
