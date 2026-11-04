@@ -583,6 +583,11 @@ impl RecencySourceContext {
                 // Skip when a search finds no key in the range. This allocates
                 // an iterator on each miss. Checking for the prefix first
                 // would avoid that, but would cost two searches on each hit.
+                //
+                // TODO: probe the memtable once without building an iterator.
+                // On a hit, return the first entry and build the iterator only
+                // when the scan needs the next entry. On a miss, build nothing.
+                // This needs a memtable API that keeps the probe position.
                 if iter.is_exhausted() {
                     return Ok(None);
                 }
