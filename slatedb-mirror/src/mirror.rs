@@ -615,7 +615,7 @@ impl ObjectStoreMirrorBuilder {
         inner.spawn(warm(
             Arc::clone(&inner.vfs),
             inner.root.clone(),
-            &inner.entries.lock(),
+            inner.entries.values(),
         ));
         if let Some(interval) = self.remote_scan_interval {
             inner.spawn(scan::run(Arc::clone(&inner), interval));
