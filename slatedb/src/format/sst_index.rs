@@ -85,9 +85,9 @@ struct PrefixArray {
 /// Apple M-series CPUs have 128-byte lines. x86 and other ARM CPUs, such as
 /// AWS Graviton, have 64-byte lines. Other targets use 64.
 #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
-const CACHE_LINE: usize = 128;
+pub(crate) const CACHE_LINE: usize = 128;
 #[cfg(not(all(target_arch = "aarch64", target_vendor = "apple")))]
-const CACHE_LINE: usize = 64;
+pub(crate) const CACHE_LINE: usize = 64;
 
 /// The number of values in one node of a [`StaticBTree`].
 const NODE_LEN: usize = CACHE_LINE / size_of::<u64>();
