@@ -45,6 +45,7 @@
 //! }
 //! ```
 
+use std::ops::Range;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -154,7 +155,7 @@ pub struct SstIndex {
 impl SstIndex {
     /// Returns the number of data blocks described by the index.
     pub fn len(&self) -> usize {
-        self.inner.borrow().block_meta().len()
+        self.inner.len()
     }
 
     /// Returns whether the index contains no data blocks.
@@ -164,21 +165,16 @@ impl SstIndex {
 
     /// Returns the block offset and first key at `index`.
     pub fn get(&self, index: usize) -> Option<(u64, &[u8])> {
-        let block_meta = self.inner.borrow().block_meta();
-        if index >= block_meta.len() {
+        if index >= self.inner.len() {
             return None;
         }
-        let meta = block_meta.get(index);
-        Some((meta.offset(), meta.first_key().bytes()))
+        Some((self.inner.offset(index), self.inner.first_key(index)))
     }
 
     /// Iterates over block offsets and first keys in index order.
     pub fn iter(&self) -> impl ExactSizeIterator<Item = (u64, &[u8])> + '_ {
-        let block_meta = self.inner.borrow().block_meta();
-        (0..block_meta.len()).map(move |index| {
-            let meta = block_meta.get(index);
-            (meta.offset(), meta.first_key().bytes())
-        })
+        (0..self.inner.len())
+            .map(move |index| (self.inner.offset(index), self.inner.first_key(index)))
     }
 
     /// Returns the first index for which `pred` is false.
@@ -202,6 +198,18 @@ impl RangePartitionedKeySpace for SstIndex {
         self.get(partition)
             .expect("partition index should be in range")
             .1
+    }
+
+    fn partition_point_le(&self, key: &[u8]) -> usize {
+        self.inner.partition_point_le(key)
+    }
+
+    fn partition_point_lt(&self, key: &[u8]) -> usize {
+        self.inner.partition_point_lt(key)
+    }
+
+    fn partitions_covering_key(&self, key: &[u8]) -> Range<usize> {
+        self.inner.partitions_covering_key(key)
     }
 }
 
@@ -298,7 +306,7 @@ impl SstFile {
                 None,
             )
             .await?;
-        let num_blocks = index.borrow().block_meta().len();
+        let num_blocks = index.len();
         if block >= num_blocks {
             return Err(crate::Error::invalid(format!(
                 "block index {block} out of range for SST with {num_blocks} block(s)"

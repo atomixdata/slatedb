@@ -163,7 +163,7 @@ async fn warm_data(
     let index = ensure_index(table_store, handle, index_cell, segment).await?;
     for r in &intersections {
         let block_range = partitions_covering_range(
-            &index.borrow(),
+            index.as_ref(),
             r.start_bound().map(|b| b.as_ref()),
             r.end_bound().map(|b| b.as_ref()),
         );
@@ -303,10 +303,10 @@ mod tests {
             .await
             .expect("read_index");
         let cache = table_store.cache().expect("cache configured").clone();
-        let num_blocks = index.borrow().block_meta().len();
+        let num_blocks = index.len();
         let mut mask = Vec::with_capacity(num_blocks);
         for i in 0..num_blocks {
-            let offset = index.borrow().block_meta().get(i).offset();
+            let offset = index.offset(i);
             let key: CachedKey = (sst_id, offset).into();
             mask.push(cache.get_block(&key).await.unwrap().is_some());
         }
@@ -323,9 +323,9 @@ mod tests {
             .await
             .expect("read_index");
         let block_idx =
-            partitions_covering_range(&index.borrow(), Bound::Included(key), Bound::Included(key))
+            partitions_covering_range(index.as_ref(), Bound::Included(key), Bound::Included(key))
                 .start;
-        let offset = index.borrow().block_meta().get(block_idx).offset();
+        let offset = index.offset(block_idx);
         let cache = table_store.cache().expect("cache configured").clone();
         let cache_key: CachedKey = (sst_id, offset).into();
         cache.get_block(&cache_key).await.unwrap().is_some()

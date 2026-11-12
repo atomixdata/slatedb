@@ -1018,18 +1018,17 @@ impl SsTableFormat {
         &self,
         blocks: Range<usize>,
         info: &SsTableInfo,
-        index: &SsTableIndex,
+        index: &SsTableIndexOwned,
     ) -> Range<u64> {
         let mut end_offset = if info.filter_len > 0 {
             info.filter_offset
         } else {
             info.index_offset
         };
-        if blocks.end < index.block_meta().len() {
-            let next_block_meta = index.block_meta().get(blocks.end);
-            end_offset = next_block_meta.offset();
+        if blocks.end < index.len() {
+            end_offset = index.offset(blocks.end);
         }
-        let start_offset = index.block_meta().get(blocks.start).offset();
+        let start_offset = index.offset(blocks.start);
         start_offset..end_offset
     }
 
@@ -1040,13 +1039,13 @@ impl SsTableFormat {
     pub(crate) fn block_byte_range(
         &self,
         info: &SsTableInfo,
-        index: &SsTableIndex,
+        index: &SsTableIndexOwned,
         block: usize,
     ) -> Range<u64> {
-        let block_meta = index.block_meta().get(block);
-        let offset = block_meta.offset();
-        if block_meta.encoded_len() > 0 {
-            offset..offset + u64::from(block_meta.encoded_len())
+        let offset = index.offset(block);
+        let encoded_len = index.encoded_len(block);
+        if encoded_len > 0 {
+            offset..offset + u64::from(encoded_len)
         } else {
             self.block_range(block..block + 1, info, index)
         }
@@ -1055,23 +1054,22 @@ impl SsTableFormat {
     pub(crate) async fn read_blocks(
         &self,
         info: &SsTableInfo,
-        index_owned: &SsTableIndexOwned,
+        index: &SsTableIndexOwned,
         blocks: Range<usize>,
         obj: &impl ReadOnlyBlob,
     ) -> Result<VecDeque<Block>, SlateDBError> {
-        let index = index_owned.borrow();
         assert!(blocks.start <= blocks.end);
-        assert!(blocks.end <= index.block_meta().len());
+        assert!(blocks.end <= index.len());
         if blocks.start == blocks.end {
             return Ok(VecDeque::new());
         }
-        let range = self.block_range(blocks.clone(), info, &index);
+        let range = self.block_range(blocks.clone(), info, index);
         let start_range = range.start;
         let bytes: Bytes = obj.read_range(range).await?;
         let compression_codec = info.compression_codec;
         let decode_futures: Vec<_> = blocks
             .map(|block| {
-                let range = self.block_byte_range(info, &index, block);
+                let range = self.block_byte_range(info, index, block);
                 let block_bytes = bytes.slice(
                     fetched_index(range.start, start_range)..fetched_index(range.end, start_range),
                 );
@@ -1118,12 +1116,11 @@ impl SsTableFormat {
     pub(crate) async fn read_block_raw(
         &self,
         info: &SsTableInfo,
-        index_owned: &SsTableIndexOwned,
+        index: &SsTableIndexOwned,
         block: usize,
         sst_bytes: &Bytes,
     ) -> Result<Block, SlateDBError> {
-        let index = index_owned.borrow();
-        let range = self.block_byte_range(info, &index, block);
+        let range = self.block_byte_range(info, index, block);
         let range = range.start as usize..range.end as usize;
         let bytes: Bytes = sst_bytes.slice(range);
         let compression_codec = info.compression_codec;
