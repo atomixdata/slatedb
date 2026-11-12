@@ -1671,9 +1671,10 @@ mod tests {
             .await
             .unwrap();
 
-        // The FlatBuffer form, and the memory of the decoded arrays.
+        // The FlatBuffer form, and the memory of the decoded arrays. The arrays
+        // use 140 bytes, and the tree has one node of one cache line.
         assert_eq!(88, index.data().len());
-        assert_eq!(268, index.size());
+        assert_eq!(140 + crate::format::sst_index::CACHE_LINE, index.size());
     }
 
     #[tokio::test]
