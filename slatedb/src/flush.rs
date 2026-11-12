@@ -472,7 +472,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let block_count = index.borrow().block_meta().len();
+        let block_count = index.len();
         let blocks = db
             .inner
             .table_store

@@ -767,9 +767,7 @@ impl TableStore {
     ) -> Range<usize> {
         assert!(target_bytes > 0);
 
-        let index = index.borrow();
-        let block_meta = index.block_meta();
-        let num_blocks = block_meta.len();
+        let num_blocks = index.len();
         assert!(first_block < num_blocks);
 
         let target_bytes = u64::try_from(target_bytes).unwrap_or(u64::MAX);
@@ -779,7 +777,7 @@ impl TableStore {
                 loop {
                     let byte_range =
                         self.sst_format
-                            .block_range(blocks.clone(), &handle.info, &index);
+                            .block_range(blocks.clone(), &handle.info, index);
                     if byte_range.end.saturating_sub(byte_range.start) >= target_bytes
                         || blocks.end == num_blocks
                     {
@@ -793,7 +791,7 @@ impl TableStore {
                 loop {
                     let byte_range =
                         self.sst_format
-                            .block_range(blocks.clone(), &handle.info, &index);
+                            .block_range(blocks.clone(), &handle.info, index);
                     if byte_range.end.saturating_sub(byte_range.start) >= target_bytes
                         || blocks.start == 0
                     {
@@ -854,7 +852,7 @@ impl TableStore {
         if cache_blocks && blocks.len() == 1 {
             if let Some(cache) = self.cache_for_reads() {
                 let block_num = blocks.start;
-                let offset = index.borrow().block_meta().get(block_num).offset();
+                let offset = index.offset(block_num);
                 let cache_key: CachedKey = (handle.id, offset).into();
                 let loader = self.block_loader(handle, index.clone(), block_num, segment.clone());
                 if let Ok(fetch) = cache.fetch_block(cache_key, loader).await {
@@ -873,9 +871,9 @@ impl TableStore {
         // Each slot holds a cached block, or None if the block must be fetched.
         let mut slots: Vec<Option<Arc<Block>>> = match self.cache_for_reads() {
             Some(cache) => {
-                let index_borrow = index.borrow();
+                let index = index.as_ref();
                 join_all(blocks.clone().map(|block_num| async move {
-                    let offset = index_borrow.block_meta().get(block_num).offset();
+                    let offset = index.offset(block_num);
                     cache
                         .get_block(&(handle.id, offset).into())
                         .await
@@ -896,19 +894,13 @@ impl TableStore {
         // gap is not read again. Only the uncached blocks are decoded.
         let missing: Vec<usize> = (0..slots.len()).filter(|&i| slots[i].is_none()).collect();
         if !missing.is_empty() {
-            let ranges: Vec<Range<u64>> = {
-                let index_borrow = index.borrow();
-                missing
-                    .iter()
-                    .map(|&i| {
-                        self.sst_format.block_byte_range(
-                            &handle.info,
-                            &index_borrow,
-                            blocks.start + i,
-                        )
-                    })
-                    .collect()
-            };
+            let ranges: Vec<Range<u64>> = missing
+                .iter()
+                .map(|&i| {
+                    self.sst_format
+                        .block_byte_range(&handle.info, &index, blocks.start + i)
+                })
+                .collect();
             let object_store = &self.object_store;
             let path = &self.path(&handle.id);
             let ranges = &ranges;
@@ -1108,16 +1100,14 @@ impl TableStore {
                 return;
             }
         };
-        let index_borrow = index.borrow();
-        let meta = index_borrow.block_meta();
         for range in ranges {
             let blocks = partitions_covering_range(
-                &index_borrow,
+                index.as_ref(),
                 range.start_bound().map(|b| b.as_ref()),
                 range.end_bound().map(|b| b.as_ref()),
             );
             for block_num in blocks {
-                let offset = meta.get(block_num).offset();
+                let offset = index.offset(block_num);
                 cache.remove(&(handle.id, offset).into()).await;
             }
         }
@@ -2004,7 +1994,7 @@ mod tests {
 
         // Check that all blocks are now in cache
         for i in 0..20 {
-            let offset = index.borrow().block_meta().get(i).offset();
+            let offset = index.offset(i);
             let cached = wrapper
                 .get_block(&(handle.id, offset).into())
                 .await
@@ -2018,11 +2008,11 @@ mod tests {
 
         // Partially clear the cache (remove blocks 5..10 and 15..20)
         for i in 5..10 {
-            let offset = index.borrow().block_meta().get(i).offset();
+            let offset = index.offset(i);
             wrapper.remove(&(handle.id, offset).into()).await;
         }
         for i in 15..20 {
-            let offset = index.borrow().block_meta().get(i).offset();
+            let offset = index.offset(i);
             wrapper.remove(&(handle.id, offset).into()).await;
         }
 
@@ -2043,7 +2033,7 @@ mod tests {
 
         // Check that all blocks are again in cache
         for i in 0..20 {
-            let offset = index.borrow().block_meta().get(i).offset();
+            let offset = index.offset(i);
             let cached = wrapper
                 .get_block(&(handle.id, offset).into())
                 .await
@@ -2076,7 +2066,7 @@ mod tests {
 
         // Check that all blocks are still in cache
         for i in 0..20 {
-            let offset = index.borrow().block_meta().get(i).offset();
+            let offset = index.offset(i);
             assert!(
                 wrapper
                     .get_block(&(handle.id, offset).into())
@@ -2317,7 +2307,7 @@ mod tests {
                             )
                             .await
                             .unwrap();
-                        assert!(!index.borrow().block_meta().is_empty());
+                        assert!(!index.is_empty());
                     }
                 }
                 id
@@ -2375,7 +2365,7 @@ mod tests {
 
         fn evict_block(&self, block: usize) {
             tokio_test::block_on(async {
-                let offset = self.index.borrow().block_meta().get(block).offset();
+                let offset = self.index.offset(block);
                 self.block_cache
                     .remove(&(self.handle.id, offset).into())
                     .await;
@@ -2432,7 +2422,7 @@ mod tests {
                 .read_index(&handle, false, Some(Bytes::new()), &ReadTrace::none(), None)
                 .await
                 .unwrap();
-            let num_blocks = index.borrow().block_meta().len();
+            let num_blocks = index.len();
             assert!(num_blocks > 1);
 
             ReadBlocksSpanTest {
@@ -2787,16 +2777,14 @@ mod tests {
             .read_index_raw(&sst_info, &sst_bytes)
             .await
             .unwrap();
-        let block_metas = index.borrow().block_meta();
-        for i in 0..block_metas.len() {
-            let block_meta = block_metas.get(i);
+        for i in 0..index.len() {
             let block = ts
                 .sst_format
                 .read_block_raw(&sst_info, &index, i, &sst_bytes)
                 .await
                 .unwrap();
             let cached_block = wrapper
-                .get_block(&(id, block_meta.offset()).into())
+                .get_block(&(id, index.offset(i)).into())
                 .await
                 .unwrap();
             assert!(cached_block.is_some());
@@ -2835,11 +2823,9 @@ mod tests {
             .read_index_raw(&sst_info, &sst_bytes)
             .await
             .unwrap();
-        let block_metas = index.borrow().block_meta();
-        for i in 0..block_metas.len() {
-            let block_meta = block_metas.get(i);
+        for i in 0..index.len() {
             let cached_block = cache
-                .get_block(&(id, block_meta.offset()).into())
+                .get_block(&(id, index.offset(i)).into())
                 .await
                 .unwrap();
             assert!(cached_block.is_none());
@@ -3078,8 +3064,8 @@ mod tests {
         assert!(ts.cache().is_some());
         assert!(cache.get_filter(&filter_key).await.unwrap().is_none());
         assert!(cache.get_stats(&stats_key).await.unwrap().is_some());
-        for block_meta in index.borrow().block_meta().iter() {
-            let data_key: CachedKey = (id, block_meta.offset()).into();
+        for block in 0..index.len() {
+            let data_key: CachedKey = (id, index.offset(block)).into();
             assert!(cache.get_block(&data_key).await.unwrap().is_some());
         }
 
@@ -3172,10 +3158,9 @@ mod tests {
             .unwrap()
             .sst_index()
             .unwrap();
-        let block_metas = index.borrow().block_meta();
-        assert_eq!(block_metas.len(), 4);
+        assert_eq!(index.len(), 4);
         for (i, expected) in [false, true, true, false].into_iter().enumerate() {
-            let data_key: CachedKey = (id, block_metas.get(i).offset()).into();
+            let data_key: CachedKey = (id, index.offset(i)).into();
             assert_eq!(
                 cache.get_block(&data_key).await.unwrap().is_some(),
                 expected
@@ -3587,7 +3572,7 @@ mod tests {
             .read_index(&handle, true, Some(Bytes::new()), &ReadTrace::none(), None)
             .await
             .unwrap();
-        assert_eq!(index.borrow().block_meta().len(), 20);
+        assert_eq!(index.len(), 20);
         for block in cached.into_iter().flatten() {
             reader
                 .read_blocks_using_index(
@@ -3621,11 +3606,10 @@ mod tests {
         // then: each GET spans exactly the expected blocks, and every block
         // reads back in order
         let expected_ranges: Vec<Option<GetRange>> = {
-            let index_borrow = index.borrow();
             let byte_range = |block| {
                 reader
                     .sst_format
-                    .block_byte_range(&handle.info, &index_borrow, block)
+                    .block_byte_range(&handle.info, &index, block)
             };
             expected_gets
                 .iter()

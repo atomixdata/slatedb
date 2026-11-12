@@ -159,6 +159,11 @@ harness = false
 required-features = ["bench-internal"]
 
 [[bench]]
+name = "sst_index_search"
+harness = false
+required-features = ["bench-internal"]
+
+[[bench]]
 name = "db_transaction"
 harness = false
 

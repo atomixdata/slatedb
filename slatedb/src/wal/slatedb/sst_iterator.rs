@@ -127,7 +127,7 @@ impl WalSstIterator {
 
     fn do_spawn_fetches(&mut self, force_progress: bool) -> SpawnFetchResult {
         let index = Arc::clone(&self.index);
-        let num_blocks = index.borrow().block_meta().len();
+        let num_blocks = index.len();
         let mut result = SpawnFetchResult::default();
 
         while self.next_block_idx_to_fetch < num_blocks {
@@ -182,7 +182,7 @@ impl WalSstIterator {
         &mut self,
         spawn_fetches: bool,
     ) -> Result<Option<DataBlockIterator<Arc<Block>>>, SlateDBError> {
-        let num_blocks = self.index.borrow().block_meta().len();
+        let num_blocks = self.index.len();
 
         loop {
             if spawn_fetches {
@@ -297,7 +297,7 @@ mod tests {
             builder.add(row).await.unwrap();
         }
         let encoded = builder.build().await.unwrap();
-        assert!(encoded.index.borrow().block_meta().len() > 1);
+        assert!(encoded.index.len() > 1);
         store.write_sst(wal_id.into(), &encoded).await.unwrap()
     }
 

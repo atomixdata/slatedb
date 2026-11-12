@@ -630,7 +630,7 @@ impl<'a> InternalSstIterator<'a> {
             // For descending order, stopping means we've gone to the beginning
             match self.options.order {
                 IterationOrder::Ascending => {
-                    let num_blocks = index.borrow().block_meta().len();
+                    let num_blocks = index.len();
                     self.next_block_idx_to_fetch = num_blocks;
                 }
                 IterationOrder::Descending => {
@@ -657,7 +657,7 @@ impl<'a> InternalSstIterator<'a> {
             })
             .await?;
             let block_idx_range = partitioned_keyspace::partitions_covering_range(
-                &index.borrow(),
+                index.as_ref(),
                 self.view.start_key(),
                 self.view.end_key(),
             );
@@ -829,12 +829,12 @@ impl RowEntryIterator for InternalSstIterator<'_> {
             let block_idx = match self.options.order {
                 IterationOrder::Ascending => {
                     partitioned_keyspace::first_partition_including_or_after_key(
-                        &index.borrow(),
+                        index.as_ref(),
                         next_key,
                     )
                 }
                 IterationOrder::Descending => {
-                    partitioned_keyspace::last_partition_including_key(&index.borrow(), next_key)
+                    partitioned_keyspace::last_partition_including_key(index.as_ref(), next_key)
                         .unwrap_or(self.block_idx_range.start)
                 }
             };
@@ -1525,7 +1525,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(index.borrow().block_meta().len(), 1);
+        assert_eq!(index.len(), 1);
 
         let sst_iter_options = SstIteratorOptions {
             cache_blocks: true,
@@ -2012,7 +2012,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(index.borrow().block_meta().len(), 8);
+        assert_eq!(index.len(), 8);
 
         let sst_iter_options = SstIteratorOptions {
             max_fetch_tasks: 3,
@@ -2936,9 +2936,9 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            index.borrow().block_meta().len() > 1,
+            index.len() > 1,
             "Expected multiple blocks but got {}",
-            index.borrow().block_meta().len()
+            index.len()
         );
 
         // when: seeking to a key in a later block (key_0030)
@@ -3140,7 +3140,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let num_blocks = index.borrow().block_meta().len();
+        let num_blocks = index.len();
         assert!(
             num_blocks >= 4,
             "Test requires at least 4 blocks, got {}",
@@ -3292,7 +3292,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let num_blocks = index.borrow().block_meta().len();
+        let num_blocks = index.len();
         assert!(
             num_blocks >= 2,
             "Test requires at least 2 blocks, got {}",
@@ -4340,7 +4340,7 @@ mod tests {
             .read_index(&sst.sst, true, None, &ReadTrace::new(None), None)
             .await
             .unwrap();
-        assert_eq!(index.borrow().block_meta().len(), 21);
+        assert_eq!(index.len(), 21);
         let mut iter = SstIterator::for_key_with_stats_initialized(
             &sst,
             b"k",

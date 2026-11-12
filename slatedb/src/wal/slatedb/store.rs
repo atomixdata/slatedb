@@ -410,9 +410,7 @@ impl WalTableStore {
     ) -> Range<usize> {
         assert!(target_bytes > 0);
 
-        let index = index.borrow();
-        let block_meta = index.block_meta();
-        let num_blocks = block_meta.len();
+        let num_blocks = index.len();
         assert!(first_block < num_blocks);
         let target_bytes = u64::try_from(target_bytes).unwrap_or(u64::MAX);
 
@@ -420,7 +418,7 @@ impl WalTableStore {
         loop {
             let byte_range = self
                 .sst_format
-                .block_range(blocks.clone(), &handle.info, &index);
+                .block_range(blocks.clone(), &handle.info, index);
             if byte_range.end.saturating_sub(byte_range.start) >= target_bytes
                 || blocks.end == num_blocks
             {
@@ -439,9 +437,7 @@ impl WalTableStore {
         if blocks.is_empty() {
             return 0;
         }
-        let byte_range = self
-            .sst_format
-            .block_range(blocks, &handle.info, &index.borrow());
+        let byte_range = self.sst_format.block_range(blocks, &handle.info, index);
         usize::try_from(byte_range.end.saturating_sub(byte_range.start)).unwrap_or(usize::MAX)
     }
 
@@ -664,7 +660,7 @@ mod tests {
         );
 
         let index = store.read_index(&handle).await.unwrap();
-        let last_block = index.borrow().block_meta().len() - 1;
+        let last_block = index.len() - 1;
         store
             .read_blocks_using_index(&handle, index, last_block..last_block + 1)
             .await
@@ -778,12 +774,9 @@ mod tests {
         assert_eq!(opened.id.value(), 1);
 
         let index = store.read_index(&opened).await.unwrap();
-        let block_count = index.borrow().block_meta().len();
+        let block_count = index.len();
         assert_eq!(block_count, 1);
-        assert_eq!(
-            index.borrow().block_meta().get(0).first_key().bytes(),
-            &10u64.to_be_bytes()
-        );
+        assert_eq!(index.first_key(0), &10u64.to_be_bytes());
 
         let block_range = store.block_range_for_target_bytes(&opened, &index, 0, usize::MAX);
         assert_eq!(block_range, 0..block_count);

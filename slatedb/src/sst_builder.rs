@@ -826,11 +826,10 @@ mod tests {
 
         let bytes = sst.remaining_as_bytes();
         let index = format.read_index_raw(&sst.info, &bytes).await.unwrap();
-        let block_metas = index.borrow().block_meta();
-        assert_eq!(block_metas.len(), sst.unconsumed_blocks.len());
-        for i in 0..block_metas.len() {
+        assert_eq!(index.len(), sst.unconsumed_blocks.len());
+        for i in 0..index.len() {
             let encoded_block = sst.unconsumed_blocks.get(i).unwrap();
-            assert_eq!(block_metas.get(i).offset(), encoded_block.offset);
+            assert_eq!(index.offset(i), encoded_block.offset);
             let read_block = format
                 .read_block_raw(&sst.info, &index, i, &bytes)
                 .await
@@ -842,15 +841,14 @@ mod tests {
     /// Rebuilds `index` with every `encoded_len` zeroed, as an SST written
     /// before that field existed reports it.
     fn index_without_encoded_len(index: &SsTableIndexOwned) -> SsTableIndexOwned {
-        let borrowed = index.borrow();
         let mut builder = flatbuffers::FlatBufferBuilder::new();
         let mut block_metas = Vec::new();
-        for block_meta in borrowed.block_meta().iter() {
-            let first_key = builder.create_vector(block_meta.first_key().bytes());
+        for block in 0..index.len() {
+            let first_key = builder.create_vector(index.first_key(block));
             block_metas.push(BlockMeta::create(
                 &mut builder,
                 &BlockMetaArgs {
-                    offset: block_meta.offset(),
+                    offset: index.offset(block),
                     first_key: Some(first_key),
                     encoded_len: 0,
                 },
@@ -886,8 +884,7 @@ mod tests {
 
         let bytes = sst.remaining_as_bytes();
         let index = format.read_index_raw(&sst.info, &bytes).await.unwrap();
-        let block_metas = index.borrow().block_meta();
-        assert_eq!(block_metas.len(), sst.unconsumed_blocks.len());
+        assert_eq!(index.len(), sst.unconsumed_blocks.len());
         for (i, block) in sst.unconsumed_blocks.iter().enumerate() {
             assert_eq!(block.offset % ALIGNMENT as u64, 0);
             assert_eq!(
@@ -897,13 +894,13 @@ mod tests {
             assert!(block.padded_bytes[block.encoded_len..]
                 .iter()
                 .all(|byte| *byte == 0));
-            assert_eq!(block_metas.get(i).offset(), block.offset);
+            assert_eq!(index.offset(i), block.offset);
             let recorded_len = if block.padded_len() == block.encoded_len {
                 0
             } else {
                 u32::try_from(block.encoded_len).unwrap()
             };
-            assert_eq!(block_metas.get(i).encoded_len(), recorded_len);
+            assert_eq!(index.encoded_len(i), recorded_len);
             let read_block = format
                 .read_block_raw(&sst.info, &index, i, &bytes)
                 .await
@@ -1101,7 +1098,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let num_blocks = index.borrow().block_meta().len();
+        let num_blocks = index.len();
         assert!(num_blocks > 1);
 
         // Read once with the index as written, then with `encoded_len`
@@ -1335,7 +1332,7 @@ mod tests {
             .await
             .unwrap();
         let sst_info_from_store = sst_handle_from_store.info;
-        assert_eq!(1, index.borrow().block_meta().len());
+        assert_eq!(1, index.len());
         assert_eq!(
             b"key1",
             sst_info_from_store.first_entry.unwrap().as_ref(),
@@ -1343,7 +1340,7 @@ mod tests {
         );
         assert_eq!(
             b"",
-            index.borrow().block_meta().get(0).first_key().bytes(),
+            index.first_key(0),
             "index key in block meta should be correct after reading from store"
         );
 
@@ -1423,7 +1420,7 @@ mod tests {
         assert!(filter.might_match(&FilterQuery::point(Bytes::from_static(b"key1"))));
         assert!(filter.might_match(&FilterQuery::point(Bytes::from_static(b"key2"))));
         assert_eq!(encoded_info, sst_handle.info);
-        assert_eq!(1, index.borrow().block_meta().len());
+        assert_eq!(1, index.len());
         assert_eq!(
             b"key1",
             sst_handle.info.first_entry.unwrap().as_ref(),
@@ -1527,7 +1524,7 @@ mod tests {
         assert!(filter.might_match(&FilterQuery::point(Bytes::from_static(b"key1"))));
         assert!(filter.might_match(&FilterQuery::point(Bytes::from_static(b"key2"))));
         assert_eq!(encoded_info, sst_handle.info);
-        assert_eq!(1, index.borrow().block_meta().len());
+        assert_eq!(1, index.len());
         assert_eq!(
             b"key1",
             sst_handle.info.first_entry.unwrap().as_ref(),
@@ -1674,7 +1671,9 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(88, index.size());
+        // The FlatBuffer form, and the memory of the decoded arrays.
+        assert_eq!(88, index.data().len());
+        assert_eq!(268, index.size());
     }
 
     #[tokio::test]
@@ -1939,7 +1938,7 @@ mod tests {
         assert!(filter.might_match(&FilterQuery::point(Bytes::from_static(b"key1"))));
         assert!(filter.might_match(&FilterQuery::point(Bytes::from_static(b"key2"))));
         assert_eq!(encoded_info, sst_handle.info);
-        assert_eq!(1, index.borrow().block_meta().len());
+        assert_eq!(1, index.len());
         assert_eq!(
             b"key1",
             sst_handle.info.first_entry.unwrap().as_ref(),
@@ -2001,7 +2000,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(1, index.borrow().block_meta().len());
+        assert_eq!(1, index.len());
         assert_eq!(
             b"key1",
             sst_handle.info.first_entry.unwrap().as_ref(),
