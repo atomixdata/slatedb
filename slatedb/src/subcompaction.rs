@@ -305,9 +305,7 @@ fn sample_anchors(
     max_anchors: usize,
     effective_range: &BytesRange,
 ) -> Vec<(Bytes, u64)> {
-    let borrowed = index.borrow();
-    let blocks = borrowed.block_meta();
-    let num_blocks = blocks.len();
+    let num_blocks = index.len();
     if num_blocks == 0 {
         return Vec::new();
     }
@@ -316,7 +314,7 @@ fn sample_anchors(
     // for the last block (the filter/index blocks immediately follow the data).
     let block_end = |i: usize| -> u64 {
         if i + 1 < num_blocks {
-            blocks.get(i + 1).offset()
+            index.offset(i + 1)
         } else {
             data_end_offset
         }
@@ -327,12 +325,11 @@ fn sample_anchors(
     let mut anchors = Vec::with_capacity(num_blocks.div_ceil(stride));
     let mut block = 0;
     while block < num_blocks {
-        let first = blocks.get(block);
-        let key = Bytes::copy_from_slice(first.first_key().bytes());
+        let key = Bytes::copy_from_slice(index.first_key(block));
         let group_end = (block + stride).min(num_blocks);
         // Blocks are contiguous, so the group's size is the gap from its first
         // block's offset to its last block's end offset.
-        let bytes = block_end(group_end - 1).saturating_sub(first.offset());
+        let bytes = block_end(group_end - 1).saturating_sub(index.offset(block));
         if effective_range.contains(&key) {
             anchors.push((key, bytes));
         }

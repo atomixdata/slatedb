@@ -501,12 +501,11 @@ mod tests {
         let encoded = builder.build().await.unwrap();
 
         // Then
-        let index = encoded.index.borrow();
-        let block_metas = index.block_meta();
-        assert_eq!(3, block_metas.len(), "Index should have three entries");
-        assert_eq!(block_metas.get(0).first_key().bytes(), &10u64.to_be_bytes());
-        assert_eq!(block_metas.get(1).first_key().bytes(), &11u64.to_be_bytes());
-        assert_eq!(block_metas.get(2).first_key().bytes(), &12u64.to_be_bytes());
+        let index = &encoded.index;
+        assert_eq!(3, index.len(), "Index should have three entries");
+        assert_eq!(index.first_key(0), &10u64.to_be_bytes());
+        assert_eq!(index.first_key(1), &11u64.to_be_bytes());
+        assert_eq!(index.first_key(2), &12u64.to_be_bytes());
     }
 
     #[tokio::test]
@@ -612,12 +611,7 @@ mod tests {
         let encoded = builder.build().await.unwrap();
 
         // Then
-        let index = encoded.index.borrow();
-        let block_metas = index.block_meta();
-        assert_eq!(
-            block_metas.get(0).first_key().bytes(),
-            &u64::MAX.to_be_bytes()
-        );
+        assert_eq!(encoded.index.first_key(0), &u64::MAX.to_be_bytes());
     }
 
     #[tokio::test]
