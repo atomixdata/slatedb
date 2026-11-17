@@ -641,7 +641,7 @@ impl RecencySourceContext {
             }
             RecencySource::L0(idx) => {
                 let view = &self.tree()?.l0[*idx];
-                match self.open_sst(view, SstTraceLevel::L0).await? {
+                match Box::pin(self.open_sst(view, SstTraceLevel::L0)).await? {
                     Some(iter) => RecencyIter::Sst(Box::new(iter)),
                     None => return Ok(None),
                 }
@@ -658,14 +658,16 @@ impl RecencySourceContext {
                     0 => return Ok(None),
                     1 => {
                         let view = &sorted_run.sst_views()[covering.start];
-                        match self.open_sst(view, trace_level).await? {
+                        match Box::pin(self.open_sst(view, trace_level)).await? {
                             Some(iter) => RecencyIter::Sst(Box::new(iter)),
                             None => return Ok(None),
                         }
                     }
                     _ => {
                         let views = sorted_run.sst_views()[covering].iter().cloned().collect();
-                        RecencyIter::SortedRun(self.open_sorted_run(views, trace_level).await?)
+                        RecencyIter::SortedRun(
+                            Box::pin(self.open_sorted_run(views, trace_level)).await?,
+                        )
                     }
                 }
             }
