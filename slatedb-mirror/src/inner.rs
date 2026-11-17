@@ -23,7 +23,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::download::Downloads;
 use crate::error::MIRROR_STORE_NAME;
-use crate::layout::{LocalName, LocalObject, PrefixMap};
+use crate::layout::{LocalEntry, LocalFile, LocalName, LocalObject, PrefixMap};
 use crate::ordering::{OpKind, PathOrdering};
 use crate::retry::Retry;
 use crate::{MirrorError, MirrorPolicy};
@@ -50,7 +50,7 @@ pub(crate) async fn remove_quietly(vfs: &dyn Vfs, path: &StdPath) {
 const LOCAL_ENTRY_SHARDS: usize = 64;
 
 /// One shard of [`LocalEntries`].
-type LocalEntryShard = RwLock<HashMap<Path, Arc<LocalObject>>>;
+type LocalEntryShard = RwLock<HashMap<Path, LocalEntry>>;
 
 /// Every complete local copy, by object path.
 ///
@@ -62,14 +62,14 @@ pub(crate) struct LocalEntries {
 }
 
 impl LocalEntries {
-    fn new(entries: HashMap<Path, Arc<LocalObject>>) -> Self {
+    fn new(entries: HashMap<Path, LocalEntry>) -> Self {
         let local_entries = Self {
             shards: (0..LOCAL_ENTRY_SHARDS)
                 .map(|_| RwLock::new(HashMap::new()))
                 .collect(),
         };
-        for (path, object) in entries {
-            local_entries.insert(path, object);
+        for (path, entry) in entries {
+            local_entries.insert(path, entry);
         }
         local_entries
     }
@@ -81,18 +81,28 @@ impl LocalEntries {
     }
 
     pub(crate) fn get(&self, path: &Path) -> Option<Arc<LocalObject>> {
-        self.shard(path).read().get(path).cloned()
+        self.shard(path)
+            .read()
+            .get(path)
+            .map(|entry| Arc::clone(&entry.object))
+    }
+
+    pub(crate) fn file(&self, path: &Path) -> Option<Arc<LocalFile>> {
+        self.shard(path)
+            .read()
+            .get(path)
+            .map(|entry| Arc::clone(&entry.file))
     }
 
     pub(crate) fn contains(&self, path: &Path) -> bool {
         self.shard(path).read().contains_key(path)
     }
 
-    pub(crate) fn insert(&self, path: Path, object: Arc<LocalObject>) {
-        self.shard(&path).write().insert(path, object);
+    pub(crate) fn insert(&self, path: Path, entry: LocalEntry) -> Option<LocalEntry> {
+        self.shard(&path).write().insert(path, entry)
     }
 
-    pub(crate) fn remove(&self, path: &Path) -> Option<Arc<LocalObject>> {
+    pub(crate) fn remove(&self, path: &Path) -> Option<LocalEntry> {
         self.shard(path).write().remove(path)
     }
 
@@ -100,7 +110,13 @@ impl LocalEntries {
     pub(crate) fn values(&self) -> Vec<Arc<LocalObject>> {
         self.shards
             .iter()
-            .flat_map(|shard| shard.read().values().cloned().collect::<Vec<_>>())
+            .flat_map(|shard| {
+                shard
+                    .read()
+                    .values()
+                    .map(|entry| Arc::clone(&entry.object))
+                    .collect::<Vec<_>>()
+            })
             .collect()
     }
 
@@ -147,6 +163,13 @@ impl Inner {
         download_concurrency: usize,
         lock: Box<dyn VfsLock>,
     ) -> Self {
+        let entries = entries
+            .into_iter()
+            .map(|(path, object)| {
+                let file = root.join(LocalName::new(&path).object_file_name);
+                (path, LocalEntry::new(object, file))
+            })
+            .collect();
         Self {
             root,
             remote,
@@ -171,6 +194,10 @@ impl Inner {
 
     pub(crate) fn local(&self, path: &Path) -> Option<Arc<LocalObject>> {
         self.entries.get(path)
+    }
+
+    pub(crate) fn local_file(&self, path: &Path) -> Option<Arc<LocalFile>> {
+        self.entries.file(path)
     }
 
     /// Returns a guard for a new temporary data file for `name`.
@@ -234,7 +261,10 @@ impl Inner {
         }
         temp.disarm();
         let object = Arc::new(object);
-        self.entries.insert(path.clone(), Arc::clone(&object));
+        let entry = LocalEntry::new(Arc::clone(&object), self.file(&name.object_file_name));
+        if let Some(replaced) = self.entries.insert(path.clone(), entry) {
+            replaced.file.mark_removed();
+        }
         Ok(object)
     }
 
@@ -272,9 +302,10 @@ impl Inner {
     /// Removes the local copy of `path`, if there is one. The caller must hold
     /// `path`'s turn in the ordering.
     pub(crate) async fn remove_local(&self, path: &Path) -> Result<(), MirrorError> {
-        if self.entries.remove(path).is_none() {
+        let Some(entry) = self.entries.remove(path) else {
             return Ok(());
-        }
+        };
+        entry.file.mark_removed();
         self.remove_files(path).await
     }
 
@@ -321,7 +352,9 @@ impl Inner {
             .register(path, OpKind::Delete)
             .expect("deletes are always queued");
         ticket.ready().await;
-        self.entries.remove(path);
+        if let Some(entry) = self.entries.remove(path) {
+            entry.file.mark_removed();
+        }
         self.remove_files(path).await
     }
 
@@ -428,7 +461,7 @@ mod tests {
     use object_store::{Attributes, ObjectMeta};
 
     use super::LocalEntries;
-    use crate::layout::LocalObject;
+    use crate::layout::{LocalEntry, LocalObject};
 
     fn object(path: &Path) -> Arc<LocalObject> {
         Arc::new(LocalObject {
@@ -443,6 +476,10 @@ mod tests {
         })
     }
 
+    fn entry(path: &Path) -> LocalEntry {
+        LocalEntry::new(object(path), std::path::PathBuf::from(path.as_ref()))
+    }
+
     #[test]
     fn should_find_and_remove_entries_in_every_shard() {
         let paths: Vec<_> = (0..256)
@@ -451,11 +488,11 @@ mod tests {
         let entries = LocalEntries::new(
             paths[..128]
                 .iter()
-                .map(|path| (path.clone(), object(path)))
+                .map(|path| (path.clone(), entry(path)))
                 .collect::<HashMap<_, _>>(),
         );
         for path in &paths[128..] {
-            entries.insert(path.clone(), object(path));
+            entries.insert(path.clone(), entry(path));
         }
         for path in &paths {
             assert!(entries.contains(path));

@@ -39,6 +39,7 @@ mod startup;
 
 pub use error::MirrorError;
 pub use handle::MirrorHandle;
+pub use layout::LocalFile;
 pub use mirror::{
     ObjectStoreMirror, ObjectStoreMirrorBuilder, DEFAULT_DOWNLOAD_CONCURRENCY,
     DEFAULT_REMOTE_SCAN_INTERVAL,
