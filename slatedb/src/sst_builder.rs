@@ -1674,7 +1674,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(88, index.size());
+        // 88 bytes of FlatBuffer and 76 bytes of flat search arrays.
+        assert_eq!(164, index.size());
     }
 
     #[tokio::test]

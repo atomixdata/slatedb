@@ -10,6 +10,41 @@ pub(crate) trait RangePartitionedKeySpace {
     fn partitions(&self) -> usize;
 
     fn partition_first_key(&self, partition: usize) -> &[u8];
+
+    /// The number of partitions whose first key is at or below `key`.
+    fn partition_point_le(&self, key: &[u8]) -> usize
+    where
+        Self: Sized,
+    {
+        partition_point(self, |first_key| first_key <= key)
+    }
+
+    /// The number of partitions whose first key is below `key`.
+    fn partition_point_lt(&self, key: &[u8]) -> usize
+    where
+        Self: Sized,
+    {
+        partition_point(self, |first_key| first_key < key)
+    }
+
+    /// [`partitions_covering_range`] for the point range `[key, key]`, with one binary search
+    /// instead of two.
+    ///
+    /// The partitions whose first key equals `key` sit directly before the partition point, so
+    /// stepping back over them (normally none) finds where the general path's start search
+    /// lands.
+    fn partitions_covering_key(&self, key: &[u8]) -> Range<usize>
+    where
+        Self: Sized,
+    {
+        let end = partition_point(self, |first_key| first_key <= key);
+        let mut first_equal = end;
+        while first_equal > 0 && self.partition_first_key(first_equal - 1) == key {
+            first_equal -= 1;
+        }
+        // The partition before the first one starting at `key` may still end with `key`.
+        first_equal.saturating_sub(1)..end
+    }
 }
 
 // equivalent to https://doc.rust-lang.org/std/primitive.slice.html#method.partition_point
@@ -54,7 +89,7 @@ pub(crate) fn first_partition_including_key<T: RangePartitionedKeySpace>(
     keyspace: &T,
     key: &[u8],
 ) -> Option<usize> {
-    let part_point = partition_point(keyspace, |first_key| first_key < key);
+    let part_point = keyspace.partition_point_lt(key);
     if part_point > 0 {
         // Some partition after the first has first_key >= key, so return the previous partition
         return Some(part_point - 1);
@@ -73,7 +108,7 @@ pub(crate) fn last_partition_including_key<T: RangePartitionedKeySpace>(
     keyspace: &T,
     key: &[u8],
 ) -> Option<usize> {
-    let part_point = partition_point(keyspace, |first_key| first_key <= key);
+    let part_point = keyspace.partition_point_le(key);
     if part_point == 0 {
         // If the partition point is 0, that means the first partition's first_key is strictly
         // greater than the key, so no partitions include the key.
@@ -95,19 +130,8 @@ pub(crate) fn partitions_covering_range<T: RangePartitionedKeySpace>(
     }
 }
 
-/// [`partitions_covering_range`] for the point range `[key, key]`, with one binary search
-/// instead of two.
-///
-/// The partitions whose first key equals `key` sit directly before the partition point, so
-/// stepping back over them (normally none) finds where the general path's start search lands.
 fn partitions_covering_key<T: RangePartitionedKeySpace>(keyspace: &T, key: &[u8]) -> Range<usize> {
-    let end = partition_point(keyspace, |first_key| first_key <= key);
-    let mut first_equal = end;
-    while first_equal > 0 && keyspace.partition_first_key(first_equal - 1) == key {
-        first_equal -= 1;
-    }
-    // The partition before the first one starting at `key` may still end with `key`.
-    first_equal.saturating_sub(1)..end
+    keyspace.partitions_covering_key(key)
 }
 
 fn partitions_covering_bounds<T: RangePartitionedKeySpace>(

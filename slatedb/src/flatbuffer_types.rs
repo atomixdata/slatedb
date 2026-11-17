@@ -80,15 +80,36 @@ fn verifier_options() -> VerifierOptions {
 }
 
 /// A wrapper around a `Bytes` buffer containing a FlatBuffer-encoded `SsTableIndex`.
-#[derive(PartialEq, Eq, Clone)]
+#[derive(Clone)]
 pub(crate) struct SsTableIndexOwned {
     data: Bytes,
+    /// Prototype of RFC 0038: flat arrays for the index search.
+    search: Arc<crate::format::index_search::IndexSearch>,
 }
+
+impl PartialEq for SsTableIndexOwned {
+    fn eq(&self, other: &Self) -> bool {
+        self.data == other.data
+    }
+}
+
+impl Eq for SsTableIndexOwned {}
+
+/// The form of the index that the index search reads.
+pub(crate) type IndexKeyspace<'a> = &'a crate::format::index_search::IndexSearch;
 
 impl SsTableIndexOwned {
     pub(crate) fn new(data: Bytes) -> Result<Self, InvalidFlatbuffer> {
-        flatbuffers::root_with_opts::<SsTableIndex>(&verifier_options(), &data)?;
-        Ok(Self { data })
+        let _index = flatbuffers::root_with_opts::<SsTableIndex>(&verifier_options(), &data)?;
+        Ok(Self {
+            search: Arc::new(crate::format::index_search::IndexSearch::new(&_index)),
+            data,
+        })
+    }
+
+    /// The form of the index that the index search reads.
+    pub(crate) fn keyspace(&self) -> IndexKeyspace<'_> {
+        &self.search
     }
 
     pub(crate) fn borrow(&self) -> SsTableIndex<'_> {
@@ -107,7 +128,7 @@ impl SsTableIndexOwned {
 
     /// Returns the size of the SSTable index in bytes.
     pub(crate) fn size(&self) -> usize {
-        self.data.len()
+        self.data.len() + self.search.size()
     }
 }
 
