@@ -751,7 +751,7 @@ impl RowEntryIterator for InternalSstIterator<'_> {
                     }
                 }
 
-                self.fill_descending_buffer().await?;
+                Box::pin(self.fill_descending_buffer()).await?;
 
                 return Ok(self
                     .descending_buffer
@@ -777,7 +777,7 @@ impl RowEntryIterator for InternalSstIterator<'_> {
                         self.stop();
                     }
                 }
-                None => self.advance_block().await?,
+                None => Box::pin(self.advance_block()).await?,
             }
         }
         Ok(None)

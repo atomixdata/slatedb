@@ -386,7 +386,7 @@ impl<'a> SortedRunIterator<'a> {
 
     async fn next_descending(&mut self) -> Result<Option<RowEntry>, SlateDBError> {
         if self.descending_state().current_key_entries.is_empty() {
-            self.buffer_next_descending_key().await?;
+            Box::pin(self.buffer_next_descending_key()).await?;
         }
         Ok(self.descending_state().current_key_entries.pop_front())
     }
@@ -396,7 +396,7 @@ impl<'a> SortedRunIterator<'a> {
             if let Some(kv) = iter.next().await? {
                 return Ok(Some(kv));
             } else {
-                self.advance_table().await?;
+                Box::pin(self.advance_table()).await?;
             }
         }
         Ok(None)
