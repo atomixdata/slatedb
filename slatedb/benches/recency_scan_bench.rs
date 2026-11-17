@@ -1,11 +1,23 @@
 // our microbenchmarks use pprof, but it doesn't work on windows
 #![cfg(not(windows))]
 
-//! Measures `scan_prefix_by_recency` when every block is already in the block
-//! cache, so the cost comes from work on the CPU, not from I/O.
+//! Measures `scan_prefix_by_recency` in four configurations:
+//!
+//! - `cached`: an in-memory object store, and every block is in the block
+//!   cache, so the cost comes from work on the CPU, not from I/O.
+//! - `uncached`: an in-memory object store and no block cache, so every data
+//!   block read is an object store GET.
+//! - `mirror_spawn_blocking`: an `ObjectStoreMirror` in front of the in-memory
+//!   object store, and no block cache. Every data block read is a `pread` of a
+//!   local file in a `spawn_blocking` task.
+//! - `mirror_read_pool`: as `mirror_spawn_blocking`, but every `pread` runs on
+//!   `READ_THREADS` dedicated threads.
+//!
+//! Filters and indexes stay in the meta cache in every configuration. The
+//! mirror files were just written, so every `pread` hits the page cache.
 //!
 //! The database has the active memtable, 4 immutable memtables, 8 L0 SSTs,
-//! and 4 sorted runs. Every SST holds keys at both ends of the key space, so
+//! and 6 sorted runs. Every SST holds keys at both ends of the key space, so
 //! only the prefix bloom filter can rule an SST out. The recency walk visits
 //! the memtables from newest to oldest, then the L0 SSTs from newest to
 //! oldest, then the sorted runs from newest to oldest. A fail point pauses the
@@ -20,9 +32,17 @@
 //! - `in_sorted_run`: the oldest sorted run only, so the walk reaches every
 //!   source.
 //! - `absent`: no source, so the walk reaches every source and finds nothing.
+//! - `scattered`: one L0 SST or one sorted run. Consecutive prefixes are in
+//!   different sources, so the scans of a run of iterations spread evenly
+//!   over every L0 SST and every sorted run.
 //!
 //! The `all_entries/everywhere` case reads every entry of a prefix whose keys
 //! are in every source, so the walk builds every source and can skip none.
+//!
+//! A case with an `/xN` suffix runs N of its scans at the same time in
+//! separate tasks, and each iteration waits for all of them. The N values in
+//! `CONCURRENCY` load `spawn_blocking` until its shared lock limits the
+//! throughput, which criterion reports in scans per second.
 //!
 //! Run: cargo bench -p slatedb --bench recency_scan_bench
 
@@ -32,7 +52,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::TimeDelta;
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use fail_parallel::FailPointRegistry;
 use object_store::memory::InMemory;
 use object_store::ObjectStore;
@@ -40,9 +60,14 @@ use pprof::criterion::{Output, PProfProfiler};
 use slatedb::config::{CompactorOptions, FlushOptions, FlushType, ScanOptions, Settings};
 use slatedb::db_cache::foyer::{FoyerCache, FoyerCacheOptions};
 use slatedb::db_cache::SplitCache;
-use slatedb::{BloomFilterPolicy, Db, FilterPolicy, PrefixExtractor, PrefixTarget};
+use slatedb::{
+    BloomFilterPolicy, Db, FilterPolicy, PrefixExtractor, PrefixTarget, SlateDbMirrorPolicy,
+};
 use slatedb_common::clock::{DefaultSystemClock, SystemClock};
+use slatedb_mirror::{ObjectStoreMirror, StdVfs};
+use tempfile::TempDir;
 use tokio::runtime::Runtime;
+use tokio::task::JoinSet;
 
 const PATH: &str = "/bench/recency";
 const PREFIX_LEN: usize = 6;
@@ -50,7 +75,7 @@ const PREFIXES_PER_GROUP: usize = 100;
 const KEYS_PER_PREFIX: usize = 4;
 /// SSTs flushed before each compaction that builds a sorted run.
 const SORTED_RUN_SOURCES: usize = 4;
-const SORTED_RUNS: usize = 4;
+const SORTED_RUNS: usize = 6;
 const L0_SSTS: usize = 8;
 const IMM_MEMTABLES: usize = 4;
 /// A memtable larger than this is frozen into an immutable memtable. Every
@@ -59,6 +84,54 @@ const L0_SST_SIZE_BYTES: usize = 256 * 1024;
 const IMM_VALUE_BYTES: usize = 300 * 1024;
 /// Pausing this fail point keeps immutable memtables from being uploaded.
 const L0_UPLOAD_FAIL_POINT: &str = "write-compacted-sst-io-error";
+/// The number of dedicated read threads in `Config::MirrorReadPool`.
+const READ_THREADS: usize = 8;
+/// The numbers of scans that the `/xN` cases run at the same time.
+const CONCURRENCY: [usize; 4] = [16, 64, 256, 512];
+
+/// Where the SSTs are read from, and whether data blocks are cached.
+#[derive(Clone, Copy)]
+enum Config {
+    Cached,
+    Uncached,
+    MirrorSpawnBlocking,
+    MirrorReadPool,
+}
+
+impl Config {
+    const ALL: [Config; 4] = [
+        Config::Cached,
+        Config::Uncached,
+        Config::MirrorSpawnBlocking,
+        Config::MirrorReadPool,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            Config::Cached => "cached",
+            Config::Uncached => "uncached",
+            Config::MirrorSpawnBlocking => "mirror_spawn_blocking",
+            Config::MirrorReadPool => "mirror_read_pool",
+        }
+    }
+
+    fn block_cache(self) -> bool {
+        matches!(self, Config::Cached)
+    }
+
+    /// The VFS of the mirror, or `None` for no mirror.
+    fn mirror_vfs(self) -> Option<StdVfs> {
+        match self {
+            Config::Cached | Config::Uncached => None,
+            Config::MirrorSpawnBlocking => Some(StdVfs::new()),
+            Config::MirrorReadPool => Some(
+                StdVfs::new()
+                    .with_read_threads(READ_THREADS)
+                    .expect("failed to start read threads"),
+            ),
+        }
+    }
+}
 
 /// Each group of prefixes has its keys in one place. A prefix is
 /// `pk` followed by four digits, and each group starts at a multiple of 1000.
@@ -76,6 +149,8 @@ enum Group {
     Everywhere,
     /// One key per immutable memtable, with a value large enough to freeze it.
     ImmMemtable,
+    /// Each prefix is in one L0 SST or one sorted run. See `scattered`.
+    Scattered,
 }
 
 impl Group {
@@ -89,6 +164,7 @@ impl Group {
             Group::Absent => 5000,
             Group::Everywhere => 6000,
             Group::ImmMemtable => 7000,
+            Group::Scattered => 8000,
         }
     }
 
@@ -100,6 +176,19 @@ impl Group {
                 .collect(),
         }
     }
+}
+
+/// The `Group::Scattered` prefixes in `source`. Sources `0..L0_SSTS` are the
+/// L0 SSTs in the order they are written, and the next `SORTED_RUNS` sources
+/// are the sorted runs in the order they are built.
+fn scattered(source: usize) -> Vec<usize> {
+    Group::Scattered
+        .prefixes()
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| i % (L0_SSTS + SORTED_RUNS) == source)
+        .map(|(_, prefix_idx)| prefix_idx)
+        .collect()
 }
 
 struct FixedPrefixExtractor;
@@ -132,7 +221,7 @@ fn filter_policies() -> Vec<Arc<dyn FilterPolicy>> {
     )]
 }
 
-fn cache() -> Arc<SplitCache> {
+fn cache(block_cache: bool) -> Arc<SplitCache> {
     let cache = |capacity| {
         Arc::new(FoyerCache::new_with_opts(FoyerCacheOptions {
             max_capacity: capacity,
@@ -141,7 +230,7 @@ fn cache() -> Arc<SplitCache> {
     };
     Arc::new(
         SplitCache::new()
-            .with_block_cache(Some(cache(256 * 1024 * 1024)))
+            .with_block_cache(block_cache.then(|| cache(256 * 1024 * 1024) as _))
             .with_meta_cache(Some(cache(64 * 1024 * 1024)))
             .build(),
     )
@@ -186,11 +275,12 @@ fn scan_options() -> ScanOptions {
 async fn open(
     store: Arc<dyn ObjectStore>,
     compactor: bool,
+    block_cache: bool,
     fp_registry: Arc<FailPointRegistry>,
 ) -> Db {
     Db::builder(PATH, store)
         .with_settings(settings(compactor))
-        .with_db_cache(cache(), 0)
+        .with_db_cache(cache(block_cache), 0)
         .with_filter_policies(filter_policies())
         .with_fp_registry(fp_registry)
         .build()
@@ -200,11 +290,15 @@ async fn open(
 
 async fn put_groups(db: &Db, groups: &[Group]) {
     for group in groups {
-        for prefix_idx in group.prefixes() {
-            for key_idx in 0..KEYS_PER_PREFIX {
-                let key = key(prefix_idx, key_idx);
-                db.put(&key, &key).await.expect("put failed");
-            }
+        put_prefixes(db, group.prefixes()).await;
+    }
+}
+
+async fn put_prefixes(db: &Db, prefixes: Vec<usize>) {
+    for prefix_idx in prefixes {
+        for key_idx in 0..KEYS_PER_PREFIX {
+            let key = key(prefix_idx, key_idx);
+            db.put(&key, &key).await.expect("put failed");
         }
     }
 }
@@ -260,19 +354,55 @@ async fn read_prefix(db: &Db, prefix_idx: usize, all: bool) -> usize {
     entries
 }
 
+/// A database built for one `Config`.
+struct BenchDb {
+    db: Db,
+    fp_registry: Arc<FailPointRegistry>,
+    /// The local directory of the mirror, if there is one.
+    _mirror_dir: Option<TempDir>,
+}
+
 /// Builds the sorted runs, then the L0 SSTs, then the immutable memtables,
 /// then the active memtable, and reads every case once so that all blocks are
 /// cached.
-async fn build_db() -> (Db, Arc<FailPointRegistry>) {
-    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+async fn build_db(config: Config) -> BenchDb {
+    let remote: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let (store, mirror_dir) = match config.mirror_vfs() {
+        None => {
+            slatedb::direct_mirror::set_direct_mirror(None);
+            (remote, None)
+        }
+        Some(vfs) => {
+            let dir = tempfile::tempdir().expect("failed to create mirror dir");
+            // No remote scan, like a writer that deletes its SSTs through the
+            // mirror.
+            let mirror = ObjectStoreMirror::builder(
+                dir.path(),
+                remote,
+                SlateDbMirrorPolicy::builder().build(),
+            )
+            .with_vfs(Arc::new(vfs.clone()))
+            .with_remote_scan_interval(None)
+            .build()
+            .await
+            .expect("failed to build mirror");
+            // Prototype: read mirrored blocks through concrete types.
+            slatedb::direct_mirror::set_direct_mirror(Some((mirror.handle(), vfs)));
+            (mirror as Arc<dyn ObjectStore>, Some(dir))
+        }
+    };
+    let block_cache = config.block_cache();
     let fp_registry = Arc::new(FailPointRegistry::new());
 
-    let db = open(store.clone(), true, fp_registry.clone()).await;
+    let db = open(store.clone(), true, block_cache, fp_registry.clone()).await;
     for run in 0..SORTED_RUNS {
-        for _ in 0..SORTED_RUN_SOURCES {
+        for source in 0..SORTED_RUN_SOURCES {
             put_groups(&db, &[Group::Sentinel, Group::Filler, Group::Everywhere]).await;
             if run == 0 {
                 put_groups(&db, &[Group::SortedRun]).await;
+            }
+            if source == 0 {
+                put_prefixes(&db, scattered(L0_SSTS + run)).await;
             }
             flush(&db).await;
         }
@@ -280,9 +410,10 @@ async fn build_db() -> (Db, Arc<FailPointRegistry>) {
     }
     db.close().await.expect("close failed");
 
-    let db = open(store, false, fp_registry.clone()).await;
+    let db = open(store, false, block_cache, fp_registry.clone()).await;
     for i in 0..L0_SSTS {
         put_groups(&db, &[Group::Sentinel, Group::Filler, Group::Everywhere]).await;
+        put_prefixes(&db, scattered(i)).await;
         if i == L0_SSTS - 1 {
             put_groups(&db, &[Group::NewestL0]).await;
         }
@@ -307,16 +438,35 @@ async fn build_db() -> (Db, Arc<FailPointRegistry>) {
             assert_eq!(read_prefix(&db, prefix_idx, all).await, expected);
         }
     }
-    (db, fp_registry)
+    if let Some(dir) = &mirror_dir {
+        // Every L0 SST and at least one SST per sorted run is local.
+        let local_ssts = std::fs::read_dir(dir.path())
+            .expect("failed to list mirror dir")
+            .filter(|entry| {
+                let name = entry.as_ref().expect("bad dir entry").file_name();
+                name.to_string_lossy().ends_with(".sst.obj")
+            })
+            .count();
+        assert!(
+            local_ssts >= L0_SSTS + SORTED_RUNS,
+            "mirror has {local_ssts} local SSTs"
+        );
+    }
+    BenchDb {
+        db,
+        fp_registry,
+        _mirror_dir: mirror_dir,
+    }
 }
 
 /// Each case is a name, the group of prefixes it reads, whether it reads every
 /// entry, and the number of entries it reads.
-const CASES: [(&str, Group, bool, usize); 5] = [
+const CASES: [(&str, Group, bool, usize); 6] = [
     ("first_entry/in_memtable", Group::Memtable, false, 1),
     ("first_entry/in_newest_l0", Group::NewestL0, false, 1),
     ("first_entry/in_sorted_run", Group::SortedRun, false, 1),
     ("first_entry/absent", Group::Absent, false, 0),
+    ("first_entry/scattered", Group::Scattered, false, 1),
     // Each key has one version in each memtable, each L0 SST, and each run.
     (
         "all_entries/everywhere",
@@ -326,29 +476,67 @@ const CASES: [(&str, Group, bool, usize); 5] = [
     ),
 ];
 
+/// The cases that also run as `/xN` cases. Each one reads data blocks.
+const CONCURRENT_CASES: [&str; 3] = [
+    "first_entry/in_sorted_run",
+    "first_entry/scattered",
+    "all_entries/everywhere",
+];
+
 fn bench_recency_scan(c: &mut Criterion) {
     let runtime = Runtime::new().expect("failed to create runtime");
-    let (db, fp_registry) = runtime.block_on(build_db());
-    // Rotates through each group's prefixes, so that iterations read
-    // different keys.
-    let next = AtomicUsize::new(0);
+    for config in Config::ALL {
+        let BenchDb {
+            db,
+            fp_registry,
+            _mirror_dir,
+        } = runtime.block_on(build_db(config));
+        // Rotates through each group's prefixes, so that iterations read
+        // different keys.
+        let next = Arc::new(AtomicUsize::new(0));
 
-    let mut group = c.benchmark_group("recency_scan");
-    for (name, prefix_group, all, expected) in CASES {
-        let first = prefix_group.first_prefix();
-        group.bench_function(name, |b| {
-            b.to_async(&runtime).iter(|| async {
-                let prefix_idx = first + next.fetch_add(1, Ordering::Relaxed) % PREFIXES_PER_GROUP;
-                assert_eq!(read_prefix(&db, prefix_idx, all).await, expected);
+        let mut group = c.benchmark_group(format!("recency_scan/{}", config.name()));
+        for (name, prefix_group, all, expected) in CASES {
+            let first = prefix_group.first_prefix();
+            group.throughput(Throughput::Elements(1));
+            group.bench_function(name, |b| {
+                b.to_async(&runtime).iter(|| async {
+                    let prefix_idx =
+                        first + next.fetch_add(1, Ordering::Relaxed) % PREFIXES_PER_GROUP;
+                    assert_eq!(read_prefix(&db, prefix_idx, all).await, expected);
+                });
             });
-        });
-    }
-    group.finish();
+            if !CONCURRENT_CASES.contains(&name) {
+                continue;
+            }
+            for concurrency in CONCURRENCY {
+                group.throughput(Throughput::Elements(concurrency as u64));
+                group.bench_function(format!("{name}/x{concurrency}"), |b| {
+                    b.to_async(&runtime).iter(|| async {
+                        let mut scans = JoinSet::new();
+                        for _ in 0..concurrency {
+                            let db = db.clone();
+                            let next = Arc::clone(&next);
+                            scans.spawn(async move {
+                                let prefix_idx = first
+                                    + next.fetch_add(1, Ordering::Relaxed) % PREFIXES_PER_GROUP;
+                                assert_eq!(read_prefix(&db, prefix_idx, all).await, expected);
+                            });
+                        }
+                        while let Some(result) = scans.join_next().await {
+                            result.expect("scan task failed");
+                        }
+                    });
+                });
+            }
+        }
+        group.finish();
 
-    // Let the immutable memtables upload, so that close can flush them.
-    fail_parallel::cfg(fp_registry, L0_UPLOAD_FAIL_POINT, "off")
-        .expect("failed to resume L0 upload");
-    runtime.block_on(async { db.close().await.expect("close failed") });
+        // Let the immutable memtables upload, so that close can flush them.
+        fail_parallel::cfg(fp_registry, L0_UPLOAD_FAIL_POINT, "off")
+            .expect("failed to resume L0 upload");
+        runtime.block_on(async { db.close().await.expect("close failed") });
+    }
 }
 
 criterion_group! {
