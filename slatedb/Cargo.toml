@@ -175,6 +175,11 @@ harness = false
 required-features = ["foyer"]
 
 [[bench]]
+name = "recency_scan_disk_bench"
+harness = false
+required-features = ["foyer", "wal_disable"]
+
+[[bench]]
 name = "sst_block_fetch_bench"
 harness = false
 required-features = ["foyer"]
