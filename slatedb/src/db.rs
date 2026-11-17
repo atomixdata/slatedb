@@ -2987,13 +2987,17 @@ mod tests {
             .unwrap();
         }
 
-        let mut iter = db.scan_prefix_by_recency(b"px:").await.unwrap();
-        let entry = iter.next_entry().await.unwrap().unwrap();
-        assert_eq!(entry.key.as_ref(), b"px:a");
-        assert!(iter.next_entry().await.unwrap().is_none());
+        // The first scan reads and pins the filters. The second scan checks
+        // the pinned filters before it opens an SST.
+        for _ in 0..2 {
+            let mut iter = db.scan_prefix_by_recency(b"px:").await.unwrap();
+            let entry = iter.next_entry().await.unwrap().unwrap();
+            assert_eq!(entry.key.as_ref(), b"px:a");
+            assert!(iter.next_entry().await.unwrap().is_none());
+        }
 
-        // Each SST's filter is checked once: the two newer SSTs are ruled out,
-        // and the oldest passes and holds the key.
+        // Each scan checks each SST's filter once: the two newer SSTs are
+        // ruled out, and the oldest passes and holds the key.
         let prefix_count = |name| {
             lookup_metric_with_labels(
                 &metrics_recorder,
@@ -3002,8 +3006,8 @@ mod tests {
             )
             .unwrap_or(0)
         };
-        assert_eq!(prefix_count(SST_FILTER_NEGATIVE_COUNT), 2);
-        assert_eq!(prefix_count(SST_FILTER_POSITIVE_COUNT), 1);
+        assert_eq!(prefix_count(SST_FILTER_NEGATIVE_COUNT), 4);
+        assert_eq!(prefix_count(SST_FILTER_POSITIVE_COUNT), 2);
         assert_eq!(prefix_count(SST_FILTER_FALSE_POSITIVE_COUNT), 0);
 
         db.close().await.unwrap();

@@ -682,16 +682,24 @@ impl TableStore {
         let sst_format = self.sst_format.clone();
         let tag =
             ObjectStoreCallTag::new_with_segment(self.kind, SstType::from(&handle.id), segment);
-        let direct_mirror = self.direct_mirror.clone();
+        // The pinned slot of the SST, only when a direct mirror is set.
+        let direct_mirror = self
+            .direct_mirror
+            .clone()
+            .map(|mirror| (mirror, handle.pinned.clone()));
         Box::new(move || {
             Box::pin(async move {
-                let path = path_resolver.sst_path(&id);
-                if let Some(blob) = direct_mirror.as_ref().and_then(|d| d.local_blob(&path)) {
+                // Prototype: find the local file through the SST's pinned
+                // slot, and build the object path only when it is needed.
+                if let Some(blob) = direct_mirror.as_ref().and_then(|(mirror, pinned)| {
+                    mirror.local_blob(pinned, || path_resolver.sst_path(&id))
+                }) {
                     if let Ok(block) = sst_format.read_block(&info, &index, block_num, &blob).await
                     {
                         return Ok(CachedEntry::with_block(&block));
                     }
                 }
+                let path = path_resolver.sst_path(&id);
                 let block = read_with_validation_retry(tag, async |tag| {
                     let obj = ReadOnlyObject {
                         object_store: object_store.clone(),
