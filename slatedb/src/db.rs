@@ -12822,20 +12822,21 @@ mod tests {
                 "the cold read is a miss; the next two reads hit the warm cache"
             );
 
-            // Second (warm) get: the object is fully cached, so all three reads hit.
+            // Second (warm) get: the first get pinned the index and the filters,
+            // so this get reads only the block, and the read hits.
             let got = kv_store.get(key).await.unwrap();
             assert_eq!(got, Some(Bytes::from_static(value)));
             let access_count2 = lookup_metric(&metrics_recorder, PART_ACCESS_COUNT).unwrap();
             let hit_count2 = lookup_metric(&metrics_recorder, PART_HIT_COUNT).unwrap();
             assert_eq!(
                 access_count2 - access_count1,
-                3,
-                "the second get reads the same three sub-ranges"
+                1,
+                "the second get reads only the block"
             );
             assert_eq!(
                 hit_count2 - hit_count1,
-                3,
-                "every read in the warm get is a cache hit"
+                1,
+                "the read in the warm get is a cache hit"
             );
         }
 
@@ -12920,10 +12921,11 @@ mod tests {
             // remote store. Restrict the assertion to range reads so background
             // manifest polling, which uses plain get calls, cannot affect it.
             // A point get reads the single-part SST in three sub-ranges (index,
-            // filter and block).
+            // filter and block). The first get pins the index and the filters,
+            // so the second get reads only the block.
             assert_eq!(requests_after_first, requests_before + 3);
             assert_eq!(got, Some(Bytes::from_static(b"test_value")));
-            assert_eq!(requests_after_second, requests_after_first + 3);
+            assert_eq!(requests_after_second, requests_after_first + 1);
             assert_eq!(
                 histograms_after_second - histograms_before,
                 (requests_after_second - requests_before) as u64
