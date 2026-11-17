@@ -88,6 +88,7 @@ tracing-subscriber = { workspace = true, features = ["fmt", "env-filter"] }
 # our microbenchmarks use pprof, but it doesn't work on windows
 [target.'cfg(not(windows))'.dev-dependencies]
 pprof = { workspace = true, features = ["criterion", "protobuf-codec"] }
+tikv-jemallocator = { workspace = true }
 
 [features]
 default = ["aws", "foyer"]

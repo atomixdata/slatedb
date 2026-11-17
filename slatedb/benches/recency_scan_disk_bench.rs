@@ -59,6 +59,10 @@ use slatedb_mirror::{ObjectStoreMirror, StdVfs};
 use tokio::runtime::Runtime;
 use tokio::task::JoinSet;
 
+// Atomix, which reads through the mirror in production, runs on jemalloc.
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 const PATH: &str = "/bench/recency_disk";
 /// A key is a 16-digit hex prefix followed by `:0`.
 const PREFIX_LEN: usize = 16;

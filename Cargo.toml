@@ -103,6 +103,7 @@ pprof = "0.14.0"
 proptest = "1.12.0"
 rstest = "0.26.1"
 tempfile = "3.20.0"
+tikv-jemallocator = "0.7.0"
 tokio-test = "0.4.4"
 
 [workspace.lints.rust]

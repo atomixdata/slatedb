@@ -15,6 +15,7 @@
 //!
 //! Filters and indexes stay in the meta cache in every configuration. The
 //! mirror files were just written, so every `pread` hits the page cache.
+//! The bench uses jemalloc, like Atomix.
 //!
 //! The database has the active memtable, 4 immutable memtables, 8 L0 SSTs,
 //! and 6 sorted runs. Every SST holds keys at both ends of the key space, so
@@ -68,6 +69,10 @@ use slatedb_mirror::{ObjectStoreMirror, StdVfs};
 use tempfile::TempDir;
 use tokio::runtime::Runtime;
 use tokio::task::JoinSet;
+
+// Atomix, which reads through the mirror in production, runs on jemalloc.
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 const PATH: &str = "/bench/recency";
 const PREFIX_LEN: usize = 6;
