@@ -40,20 +40,23 @@
 //! The `all_entries/everywhere` case reads every entry of a prefix whose keys
 //! are in every source, so the walk builds every source and can skip none.
 //!
-//! A case with an `/xN` suffix runs N of its scans at the same time in
-//! separate tasks, and each iteration waits for all of them. The N values in
+//! A case with an `/xN` suffix keeps N of its scans in flight: N tasks each
+//! start a new scan as soon as their last one ends, and criterion counts N
+//! scans as one iteration. Set `BENCH_BARRIER=1` to run each iteration as N
+//! scans in separate tasks and wait for all of them. The N values in
 //! `CONCURRENCY` load `spawn_blocking` until its shared lock limits the
 //! throughput, which criterion reports in scans per second.
 //!
 //! Run: cargo bench -p slatedb --bench recency_scan_bench
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+#[allow(clippy::disallowed_types)]
+use std::time::{Duration, Instant};
 
 use chrono::TimeDelta;
-use criterion::{criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, Criterion, SamplingMode, Throughput};
 use fail_parallel::FailPointRegistry;
 use object_store::memory::InMemory;
 use object_store::ObjectStore;
@@ -464,6 +467,50 @@ async fn build_db(config: Config) -> BenchDb {
     }
 }
 
+/// Runs `scans` scans of the group that starts at `first` in `concurrency`
+/// tasks. Each task starts its next scan as soon as its last one ends, so
+/// `concurrency` scans stay in flight until the last few. Returns the elapsed
+/// time.
+async fn run_continuous(
+    db: &Db,
+    next: &Arc<AtomicUsize>,
+    first: usize,
+    all: bool,
+    expected: usize,
+    concurrency: usize,
+    scans: u64,
+) -> Duration {
+    let base = next.fetch_add(scans as usize, Ordering::Relaxed);
+    let issued = Arc::new(AtomicU64::new(0));
+    #[allow(clippy::disallowed_methods, clippy::disallowed_types)]
+    let start = Instant::now();
+    let mut tasks = JoinSet::new();
+    for _ in 0..concurrency {
+        let db = db.clone();
+        let issued = Arc::clone(&issued);
+        tasks.spawn(async move {
+            loop {
+                let i = issued.fetch_add(1, Ordering::Relaxed);
+                if i >= scans {
+                    break;
+                }
+                let prefix_idx = first + (base + i as usize) % PREFIXES_PER_GROUP;
+                assert_eq!(read_prefix(&db, prefix_idx, all).await, expected);
+            }
+        });
+    }
+    while let Some(result) = tasks.join_next().await {
+        result.expect("scan task failed");
+    }
+    start.elapsed()
+}
+
+/// Whether the `/xN` cases wait for all N scans of an iteration before the
+/// next iteration starts.
+fn barrier() -> bool {
+    std::env::var("BENCH_BARRIER").is_ok_and(|value| value == "1")
+}
+
 /// Each case is a name, the group of prefixes it reads, whether it reads every
 /// entry, and the number of entries it reads.
 const CASES: [(&str, Group, bool, usize); 6] = [
@@ -514,9 +561,22 @@ fn bench_recency_scan(c: &mut Criterion) {
             if !CONCURRENT_CASES.contains(&name) {
                 continue;
             }
+            if !barrier() {
+                // Each sample ends with a tail where fewer than N scans are in
+                // flight. Few large samples make that tail a small part of each.
+                group.sample_size(10).sampling_mode(SamplingMode::Flat);
+            }
             for concurrency in CONCURRENCY {
                 group.throughput(Throughput::Elements(concurrency as u64));
                 group.bench_function(format!("{name}/x{concurrency}"), |b| {
+                    if !barrier() {
+                        let (db, next) = (&db, &next);
+                        b.to_async(&runtime).iter_custom(|iters| {
+                            let scans = iters * concurrency as u64;
+                            run_continuous(db, next, first, all, expected, concurrency, scans)
+                        });
+                        return;
+                    }
                     b.to_async(&runtime).iter(|| async {
                         let mut scans = JoinSet::new();
                         for _ in 0..concurrency {
@@ -534,6 +594,7 @@ fn bench_recency_scan(c: &mut Criterion) {
                     });
                 });
             }
+            group.sample_size(100).sampling_mode(SamplingMode::Auto);
         }
         group.finish();
 

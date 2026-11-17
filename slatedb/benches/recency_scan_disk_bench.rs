@@ -29,7 +29,10 @@
 //! and indexes in the meta cache and no block cache. Each scan reads the first
 //! entry of the next existing key, in write order, so consecutive scans read
 //! unrelated blocks and each scan reads one data block. A case with an `/xN`
-//! suffix runs N scans at the same time in separate tasks.
+//! suffix keeps N scans in flight: N tasks each start a new scan as soon as
+//! their last one ends. Criterion counts N scans as one iteration. Set
+//! `BENCH_BARRIER=1` to run each iteration as N scans in separate tasks and
+//! wait for all of them, so cores stay idle while the slowest scans finish.
 //!
 //! On Linux, the bench also prints, for each case, the bytes per scan that
 //! the process read from storage and through `read` system calls.
@@ -37,10 +40,11 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+#[allow(clippy::disallowed_types)]
+use std::time::{Duration, Instant};
 
 use chrono::TimeDelta;
-use criterion::{criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, Criterion, SamplingMode, Throughput};
 use object_store::local::LocalFileSystem;
 use object_store::ObjectStore;
 use pprof::criterion::{Output, PProfProfiler};
@@ -351,6 +355,46 @@ async fn run_scans(db: &Db, next: &Arc<AtomicU64>, keys: u64, concurrency: usize
     }
 }
 
+/// Runs `scans` scans of consecutive IDs in `concurrency` tasks. Each task
+/// starts its next scan as soon as its last one ends, so `concurrency` scans
+/// stay in flight until the last few. Returns the elapsed time.
+async fn run_scans_continuous(
+    db: &Db,
+    next: &Arc<AtomicU64>,
+    keys: u64,
+    concurrency: usize,
+    scans: u64,
+) -> Duration {
+    let first = next.fetch_add(scans, Ordering::Relaxed);
+    let issued = Arc::new(AtomicU64::new(0));
+    #[allow(clippy::disallowed_methods, clippy::disallowed_types)]
+    let start = Instant::now();
+    let mut tasks = JoinSet::new();
+    for _ in 0..concurrency {
+        let db = db.clone();
+        let issued = Arc::clone(&issued);
+        tasks.spawn(async move {
+            loop {
+                let i = issued.fetch_add(1, Ordering::Relaxed);
+                if i >= scans {
+                    break;
+                }
+                read_first(&db, (first + i) % keys).await;
+            }
+        });
+    }
+    while let Some(result) = tasks.join_next().await {
+        result.expect("scan task failed");
+    }
+    start.elapsed()
+}
+
+/// Whether the `/xN` cases wait for all N scans of an iteration before the
+/// next iteration starts.
+fn barrier() -> bool {
+    std::env::var("BENCH_BARRIER").is_ok_and(|value| value == "1")
+}
+
 /// Process I/O counters from `/proc/self/io`.
 #[derive(Clone, Copy, Default)]
 struct IoStats {
@@ -423,13 +467,26 @@ fn bench_recency_scan_disk(c: &mut Criterion) {
         ));
 
         let mut group = c.benchmark_group(format!("recency_scan_disk/{}", config.name()));
+        if !barrier() {
+            // Each sample ends with a tail where fewer than N scans are in
+            // flight. Few large samples make that tail a small part of each.
+            group.sample_size(10).sampling_mode(SamplingMode::Flat);
+        }
         for concurrency in CONCURRENCY {
             let name = format!("first_entry/x{concurrency}");
             let before = (IoStats::read(), next.load(Ordering::Relaxed));
             group.throughput(Throughput::Elements(concurrency as u64));
             group.bench_function(&name, |b| {
-                b.to_async(&runtime)
-                    .iter(|| run_scans(&db, &next, keys, concurrency, concurrency as u64));
+                if barrier() {
+                    b.to_async(&runtime)
+                        .iter(|| run_scans(&db, &next, keys, concurrency, concurrency as u64));
+                } else {
+                    let (db, next) = (&db, &next);
+                    b.to_async(&runtime).iter_custom(|iters| {
+                        let scans = iters * concurrency as u64;
+                        run_scans_continuous(db, next, keys, concurrency, scans)
+                    });
+                }
             });
             if let (Some(start), Some(end)) = (before.0, IoStats::read()) {
                 let scans = (next.load(Ordering::Relaxed) - before.1).max(1) as f64;
