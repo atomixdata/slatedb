@@ -15,6 +15,9 @@
 //! `<md5>.foo.obj.meta`.
 
 use std::collections::{BTreeMap, HashMap};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use md5::{Digest, Md5};
@@ -156,6 +159,63 @@ pub(crate) fn classify(name: &str) -> FileKind<'_> {
 pub(crate) struct LocalObject {
     pub(crate) meta: ObjectMeta,
     pub(crate) attributes: Attributes,
+}
+
+/// The data file of a complete local copy.
+///
+/// The mirror marks the file removed when it evicts, deletes or replaces the
+/// copy. A caller that keeps a `LocalFile` can then tell that the file is
+/// gone, without a lookup in the mirror.
+#[derive(Debug)]
+pub struct LocalFile {
+    path: PathBuf,
+    size: u64,
+    removed: AtomicBool,
+}
+
+impl LocalFile {
+    fn new(path: PathBuf, size: u64) -> Self {
+        Self {
+            path,
+            size,
+            removed: AtomicBool::new(false),
+        }
+    }
+
+    /// The path of the data file.
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    /// The size of the object in bytes.
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    /// Whether the mirror has removed this copy. A read of a removed file can
+    /// fail with `NotFound`.
+    pub fn is_removed(&self) -> bool {
+        self.removed.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn mark_removed(&self) {
+        self.removed.store(true, Ordering::Release);
+    }
+}
+
+/// A complete local copy in the mirror's map: its metadata and its data file.
+#[derive(Debug, Clone)]
+pub(crate) struct LocalEntry {
+    pub(crate) object: Arc<LocalObject>,
+    pub(crate) file: Arc<LocalFile>,
+}
+
+impl LocalEntry {
+    /// The entry for `object`, whose data file is `file`.
+    pub(crate) fn new(object: Arc<LocalObject>, file: PathBuf) -> Self {
+        let file = Arc::new(LocalFile::new(file, object.meta.size));
+        Self { object, file }
+    }
 }
 
 /// The JSON contents of a `.meta` file.

@@ -22,7 +22,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::download::Downloads;
 use crate::error::MIRROR_STORE_NAME;
-use crate::layout::{LocalName, LocalObject, PrefixMap};
+use crate::layout::{LocalEntry, LocalFile, LocalName, LocalObject, PrefixMap};
 use crate::ordering::{OpKind, PathOrdering};
 use crate::retry::Retry;
 use crate::{MirrorError, MirrorPolicy};
@@ -57,7 +57,7 @@ pub(crate) struct Inner {
     /// tasks.
     pub(crate) shutdown: CancellationToken,
     /// Every complete local copy, by object path.
-    pub(crate) entries: Mutex<HashMap<Path, Arc<LocalObject>>>,
+    pub(crate) entries: Mutex<HashMap<Path, LocalEntry>>,
     pub(crate) prefixes: Mutex<PrefixMap>,
     pub(crate) ordering: PathOrdering,
     pub(crate) downloads: Downloads,
@@ -80,6 +80,13 @@ impl Inner {
         download_concurrency: usize,
         lock: Box<dyn VfsLock>,
     ) -> Self {
+        let entries = entries
+            .into_iter()
+            .map(|(path, object)| {
+                let file = root.join(LocalName::new(&path).object_file_name);
+                (path, LocalEntry::new(object, file))
+            })
+            .collect();
         Self {
             root,
             remote,
@@ -103,7 +110,17 @@ impl Inner {
     }
 
     pub(crate) fn local(&self, path: &Path) -> Option<Arc<LocalObject>> {
-        self.entries.lock().get(path).cloned()
+        self.entries
+            .lock()
+            .get(path)
+            .map(|entry| Arc::clone(&entry.object))
+    }
+
+    pub(crate) fn local_file(&self, path: &Path) -> Option<Arc<LocalFile>> {
+        self.entries
+            .lock()
+            .get(path)
+            .map(|entry| Arc::clone(&entry.file))
     }
 
     /// Returns a guard for a new temporary data file for `name`.
@@ -167,9 +184,10 @@ impl Inner {
         }
         temp.disarm();
         let object = Arc::new(object);
-        self.entries
-            .lock()
-            .insert(path.clone(), Arc::clone(&object));
+        let entry = LocalEntry::new(Arc::clone(&object), self.file(&name.object_file_name));
+        if let Some(replaced) = self.entries.lock().insert(path.clone(), entry) {
+            replaced.file.mark_removed();
+        }
         Ok(object)
     }
 
@@ -207,9 +225,10 @@ impl Inner {
     /// Removes the local copy of `path`, if there is one. The caller must hold
     /// `path`'s turn in the ordering.
     pub(crate) async fn remove_local(&self, path: &Path) -> Result<(), MirrorError> {
-        if self.entries.lock().remove(path).is_none() {
+        let Some(entry) = self.entries.lock().remove(path) else {
             return Ok(());
-        }
+        };
+        entry.file.mark_removed();
         self.remove_files(path).await
     }
 
@@ -256,7 +275,9 @@ impl Inner {
             .register(path, OpKind::Delete)
             .expect("deletes are always queued");
         ticket.ready().await;
-        self.entries.lock().remove(path);
+        if let Some(entry) = self.entries.lock().remove(path) {
+            entry.file.mark_removed();
+        }
         self.remove_files(path).await
     }
 

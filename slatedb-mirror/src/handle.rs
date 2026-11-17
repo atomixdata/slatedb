@@ -11,6 +11,7 @@ use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt};
 
 use crate::inner::Inner;
+use crate::layout::LocalFile;
 use crate::ordering::{OpKind, Ticket};
 
 /// Lets a [`MirrorPolicy`](crate::MirrorPolicy) download, evict, and inspect
@@ -65,6 +66,17 @@ impl MirrorHandle {
             .await?;
             Ok(())
         }
+    }
+
+    /// The local data file of `path`, if the mirror has a complete local copy.
+    /// The file holds the bytes that a
+    /// [`ReadRoute::Local`](crate::ReadRoute::Local) GET returns, so a caller
+    /// can read it directly. The mirror stores the file when it installs the
+    /// copy, so this call builds no file name. The mirror can evict the copy
+    /// at any time. It then marks the file removed, and a read of the file can
+    /// fail with `NotFound`.
+    pub fn local_file(&self, path: &Path) -> Option<Arc<LocalFile>> {
+        self.inner.local_file(path)
     }
 
     /// Downloads in the background, best effort. Failures are logged.
@@ -174,6 +186,26 @@ mod tests {
         assert!(mirror.handle().contains(&path));
         eventually(|| mirror.inner.ordering.is_empty()).await;
         assert!(mirror.handle().contains(&path));
+    }
+
+    #[tokio::test]
+    async fn should_mark_local_file_removed_on_eviction() {
+        let dir = tempfile::tempdir().unwrap();
+        let mirror = ObjectStoreMirror::for_test(dir.path(), Arc::new(InMemory::new())).await;
+        let path = Path::from(SST);
+        mirror
+            .put(&path, PutPayload::from_static(b"xyz"))
+            .await
+            .unwrap();
+
+        let file = mirror.handle().local_file(&path).expect("local copy");
+        assert_eq!(file.size(), 3);
+        assert_eq!(std::fs::read(file.path()).unwrap(), b"xyz");
+        assert!(!file.is_removed());
+
+        mirror.handle().evict([path.clone()]);
+        eventually(|| file.is_removed()).await;
+        assert!(mirror.handle().local_file(&path).is_none());
     }
 
     #[tokio::test]
