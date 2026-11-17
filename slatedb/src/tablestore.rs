@@ -55,6 +55,8 @@ pub(crate) struct TableStore {
     block_cache_policy: BlockCachePolicy,
     /// Which component owns this store. Tagged on compacted-SST calls.
     kind: TableStoreKind,
+    /// Prototype: reads mirrored blocks through concrete types.
+    direct_mirror: Option<Arc<crate::direct_mirror::DirectMirror>>,
 }
 
 fn record_read_cached(span: &tracing::Span, lookup: CacheLookup) {
@@ -106,6 +108,7 @@ impl TableStore {
             cache,
             block_cache_policy,
             kind,
+            direct_mirror: crate::direct_mirror::current(),
         }
     }
 
@@ -674,9 +677,16 @@ impl TableStore {
         let sst_format = self.sst_format.clone();
         let tag =
             ObjectStoreCallTag::new_with_segment(self.kind, SstType::from(&handle.id), segment);
+        let direct_mirror = self.direct_mirror.clone();
         Box::new(move || {
             Box::pin(async move {
                 let path = path_resolver.sst_path(&id);
+                if let Some(blob) = direct_mirror.as_ref().and_then(|d| d.local_blob(&path)) {
+                    if let Ok(block) = sst_format.read_block(&info, &index, block_num, &blob).await
+                    {
+                        return Ok(CachedEntry::with_block(&block));
+                    }
+                }
                 let block = read_with_validation_retry(tag, async |tag| {
                     let obj = ReadOnlyObject {
                         object_store: object_store.clone(),
