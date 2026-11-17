@@ -24,6 +24,7 @@ use crate::tablestore::TableStore;
 use crate::types::{KeyValue, RowEntry, ValueDeletable};
 
 use bytes::Bytes;
+use futures::future::BoxFuture;
 use futures::stream::{self, BoxStream, StreamExt};
 use parking_lot::Mutex;
 use std::collections::VecDeque;
@@ -286,6 +287,18 @@ row_entry_iterator_enum! {
     }
 }
 
+impl DbIter {
+    /// Initializes the iterator in a boxed future. See `next_entry_inner`
+    /// for why the future is boxed. A generic caller of
+    /// [`DbIterator::new`] lays out its future in the crate that calls it, so
+    /// the box alone would not keep the depth out of that crate. This
+    /// function is not generic and returns a trait object, so the init future
+    /// is laid out only here.
+    fn boxed_init(&mut self) -> BoxFuture<'_, Result<(), SlateDBError>> {
+        Box::pin(self.init())
+    }
+}
+
 pub struct DbIterator {
     range: BytesRange,
     iter: DbIter,
@@ -359,8 +372,7 @@ impl DbIterator {
             DbIter::MergeOperatorRequired(MergeOperatorRequiredIterator::new(iter))
         };
 
-        // See `next_entry_inner` for why this future is boxed.
-        Box::pin(iter.init()).instrument(read_span.clone()).await?;
+        iter.boxed_init().instrument(read_span.clone()).await?;
 
         Ok(DbIterator {
             range,
