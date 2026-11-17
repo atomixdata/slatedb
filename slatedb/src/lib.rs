@@ -90,6 +90,7 @@ pub mod compactor;
 pub mod config;
 pub mod db_cache;
 pub mod db_stats;
+pub mod direct_mirror;
 pub mod manifest;
 pub mod object_store_tag;
 pub mod prefix_extractor;

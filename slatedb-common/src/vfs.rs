@@ -116,6 +116,31 @@ impl StdVfs {
         self.file_handle_cache = FileHandleCache::new(max_open_file_handles);
         self
     }
+
+    /// [`Vfs::read_range`] without the boxed future of the trait method, for
+    /// callers that hold a `StdVfs`.
+    pub async fn read_range_direct(&self, path: &Path, range: Range<u64>) -> io::Result<Bytes> {
+        let len = usize::try_from(range.end.saturating_sub(range.start))
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "range is too large"))?;
+        let path = path.to_path_buf();
+        let file_handle_cache = self.file_handle_cache.clone();
+        #[allow(clippy::disallowed_methods)]
+        tokio::task::spawn_blocking(move || read_at(&file_handle_cache, &path, range.start, len))
+            .await?
+    }
+}
+
+/// Reads `len` bytes at `offset` from `path`, through `file_handle_cache`.
+fn read_at(
+    file_handle_cache: &FileHandleCache,
+    path: &Path,
+    offset: u64,
+    len: usize,
+) -> io::Result<Bytes> {
+    let handle = file_handle_cache.try_get_or_open(path)?;
+    let mut buf = vec![0; len];
+    read_exact_at_offset(&handle, &mut buf, offset)?;
+    Ok(Bytes::from(buf))
 }
 
 #[async_trait]
@@ -168,18 +193,7 @@ impl Vfs for StdVfs {
     }
 
     async fn read_range(&self, path: &Path, range: Range<u64>) -> io::Result<Bytes> {
-        let len = usize::try_from(range.end.saturating_sub(range.start))
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "range is too large"))?;
-        let path = path.to_path_buf();
-        let file_handle_cache = self.file_handle_cache.clone();
-        #[allow(clippy::disallowed_methods)]
-        tokio::task::spawn_blocking(move || {
-            let handle = file_handle_cache.try_get_or_open(&path)?;
-            let mut buf = vec![0; len];
-            read_exact_at_offset(&handle, &mut buf, range.start)?;
-            Ok(Bytes::from(buf))
-        })
-        .await?
+        self.read_range_direct(path, range).await
     }
 
     async fn read(&self, path: &Path) -> io::Result<Bytes> {
