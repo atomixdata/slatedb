@@ -668,17 +668,19 @@ impl<'a> InternalSstIterator<'a> {
 
     async fn ensure_metadata_loaded(&mut self) -> Result<(), SlateDBError> {
         if self.index.is_none() {
-            let read_trace = self.read_trace();
-            let index = self
-                .table_store
-                .read_index(
-                    &self.view.table_as_ref().sst,
-                    self.options.cache_metadata,
-                    self.options.segment.clone(),
-                    &read_trace,
-                    self.sst_level(),
-                )
-                .await?;
+            let sst = &self.view.table_as_ref().sst;
+            let index = get_or_pin(&sst.pinned.index, self.options.cache_metadata, async || {
+                self.table_store
+                    .read_index(
+                        sst,
+                        self.options.cache_metadata,
+                        self.options.segment.clone(),
+                        &self.read_trace(),
+                        self.sst_level(),
+                    )
+                    .await
+            })
+            .await?;
             let block_idx_range = partitioned_keyspace::partitions_covering_range(
                 &index.borrow(),
                 self.view.start_key(),
@@ -916,17 +918,21 @@ impl<'a> FilterIterator<'a> {
     }
 
     async fn read_filters(&self) -> Result<Arc<[NamedFilter]>, SlateDBError> {
-        let read_trace = self.inner.read_trace();
-        self.inner
-            .table_store()
-            .read_filters(
-                &self.inner.view().table_as_ref().sst,
-                self.inner.options.cache_metadata,
-                self.inner.options.segment.clone(),
-                &read_trace,
-                self.inner.sst_level(),
-            )
-            .await
+        let sst = &self.inner.view().table_as_ref().sst;
+        let options = &self.inner.options;
+        get_or_pin(&sst.pinned.filters, options.cache_metadata, async || {
+            self.inner
+                .table_store()
+                .read_filters(
+                    sst,
+                    options.cache_metadata,
+                    options.segment.clone(),
+                    &self.inner.read_trace(),
+                    self.inner.sst_level(),
+                )
+                .await
+        })
+        .await
     }
 }
 
@@ -1258,6 +1264,24 @@ fn block_fetch_panic_error(
         panic_string(&panic_err),
     );
     SlateDBError::BackgroundTaskPanic(task_name)
+}
+
+/// Prototype of RFC 0037: the value in `slot`, or else the value that `read`
+/// returns. With `pin`, a value that `read` returns also fills the slot. Only
+/// gets and scans call this, so other reads never pin.
+async fn get_or_pin<T: Clone>(
+    slot: &std::sync::OnceLock<T>,
+    pin: bool,
+    read: impl AsyncFnOnce() -> Result<T, SlateDBError>,
+) -> Result<T, SlateDBError> {
+    if let Some(value) = slot.get() {
+        return Ok(value.clone());
+    }
+    let value = read().await?;
+    if pin {
+        let _ = slot.set(value.clone());
+    }
+    Ok(value)
 }
 
 #[cfg(test)]
@@ -1617,6 +1641,9 @@ mod tests {
 
         for cache_blocks in [false, true] {
             meta_cache.remove(&filter_key).await;
+            // A new handle has an empty pin slot, so its read reaches the
+            // meta cache.
+            let handle = SsTableView::identity(handle.sst.unpinned());
 
             let options = SstIteratorOptions {
                 cache_blocks,
@@ -1706,6 +1733,9 @@ mod tests {
 
         for cache_blocks in [false, true] {
             meta_cache.remove(&index_key).await;
+            // A new handle has an empty pin slot, so its read reaches the
+            // meta cache.
+            let handle = SsTableView::identity(handle.sst.unpinned());
 
             let options = SstIteratorOptions {
                 cache_blocks,

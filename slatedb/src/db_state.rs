@@ -28,6 +28,46 @@ pub struct SsTableHandle {
 
     /// Metadata information about this SSTable.
     pub info: SsTableInfo,
+
+    /// Prototype of RFC 0037: the pinned filters and index of this SST. A
+    /// handle from [`Self::new`] starts with an empty slot, and its clones
+    /// share it.
+    #[serde(skip)]
+    pub(crate) pinned: Arc<pinning::PinnedSstMetadata>,
+}
+
+/// Prototype of RFC 0037 (slatedb PR #2206): pinned SST filters and indexes.
+///
+/// Each handle from `SsTableHandle::new` gets an empty slot, and the clones of
+/// the handle share it. A get or scan that reads the filters or the index of
+/// an SST with `cache_metadata` on fills the slot, usually from the meta cache.
+/// Later gets and scans skip the meta cache. A flush, the compactor and cache
+/// warming read through the `TableStore` and fill no slot.
+///
+/// The RFC carries each slot across manifest updates in `carry_pins`. This
+/// prototype does not. A manifest from the compactor brings new handles for
+/// the sorted runs, so after a compaction the first read of each of their SSTs
+/// reads the meta cache again.
+pub(crate) mod pinning {
+    use std::sync::{Arc, OnceLock};
+
+    use crate::filter_policy::NamedFilter;
+    use crate::flatbuffer_types::SsTableIndexOwned;
+
+    /// The filters and index of one SST, kept outside the cache. Each cell is
+    /// written once, by the first get or scan that reads the value.
+    #[derive(Default)]
+    pub(crate) struct PinnedSstMetadata {
+        pub(crate) filters: OnceLock<Arc<[NamedFilter]>>,
+        pub(crate) index: OnceLock<Arc<SsTableIndexOwned>>,
+    }
+
+    /// Handles compare equal whatever their slots hold.
+    impl PartialEq for PinnedSstMetadata {
+        fn eq(&self, _other: &Self) -> bool {
+            true
+        }
+    }
 }
 
 impl Debug for SsTableHandle {
@@ -39,10 +79,17 @@ impl Debug for SsTableHandle {
 impl SsTableHandle {
     pub(crate) fn new(id: SsTableId, format_version: u16, info: SsTableInfo) -> Self {
         SsTableHandle {
+            pinned: Arc::default(),
             id,
             format_version,
             info,
         }
+    }
+
+    /// A copy of this handle with an empty pin slot.
+    #[cfg(test)]
+    pub(crate) fn unpinned(&self) -> Self {
+        Self::new(self.id, self.format_version, self.info.clone())
     }
 
     /// Returns an estimate of the SST's on-disk size in bytes.

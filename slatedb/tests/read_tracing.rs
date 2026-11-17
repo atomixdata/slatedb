@@ -206,16 +206,26 @@ async fn test_source_gets(db: &Db, output: &CapturedOutput) {
         assert_span(&log, "slatedb.read.memtable", trace_id, &[]);
         assert_no_span(&log, "slatedb.read.merge", trace_id);
         if let Some(level) = level {
-            assert_sst_spans(&log, trace_id, level);
+            assert_pinned_sst_spans(&log, trace_id, level);
             if level == "l0" {
                 for name in SST_SPAN_NAMES {
                     assert_no_sst_span_at_level(&log, name, trace_id, "sorted_run:");
                 }
             }
         } else {
+            // A get can probe a pinned filter while it builds its sources,
+            // before the memtable answers. The filter is in memory, so the probe
+            // reads nothing, and it rules the SST out.
             for name in SST_SPAN_NAMES {
-                assert_no_span(&log, name, trace_id);
+                if name != "slatedb.read.evaluate_filter" {
+                    assert_no_span(&log, name, trace_id);
+                }
             }
+            assert!(
+                span_lines(&log, "slatedb.read.evaluate_filter", trace_id)
+                    .all(|line| line.contains("result=false")),
+                "a filter probe passed for a key in the memtable\n{log}"
+            );
         }
     }
 }
@@ -243,7 +253,7 @@ async fn test_range_scan(db: &Db, output: &CapturedOutput) {
     assert_no_span(&scan_log, "slatedb.read.read_filters", "range-scan");
     assert_no_span(&scan_log, "slatedb.read.evaluate_filter", "range-scan");
     for level in ["l0", "sorted_run:"] {
-        assert_sst_index_and_data(&scan_log, "range-scan", level);
+        assert_pinned_sst_data(&scan_log, "range-scan", level);
     }
 }
 
@@ -271,7 +281,7 @@ async fn test_prefix_scan(db: &Db, output: &CapturedOutput) {
     assert_no_span(&prefix_log, "slatedb.read.read_filters", "prefix-scan");
     assert_no_span(&prefix_log, "slatedb.read.evaluate_filter", "prefix-scan");
     for level in ["l0", "sorted_run:"] {
-        assert_sst_index_and_data(&prefix_log, "prefix-scan", level);
+        assert_pinned_sst_data(&prefix_log, "prefix-scan", level);
     }
 }
 
@@ -300,7 +310,7 @@ async fn test_recency_scan(db: &Db, output: &CapturedOutput) {
     assert_no_span(&recency_log, "slatedb.read.read_filters", "recency-scan");
     assert_no_span(&recency_log, "slatedb.read.evaluate_filter", "recency-scan");
     for level in ["l0", "sorted_run:"] {
-        assert_sst_index_and_data(&recency_log, "recency-scan", level);
+        assert_pinned_sst_data(&recency_log, "recency-scan", level);
     }
 }
 
@@ -324,7 +334,7 @@ async fn test_info_level(db: &Db) {
     assert_root(&info_log, "info-get");
     assert_merge_spans(&info_log, "info-get");
     for level in ["l0", "sorted_run:"] {
-        assert_sst_spans(&info_log, "info-get", level);
+        assert_pinned_sst_spans(&info_log, "info-get", level);
     }
     assert!(
         span_lines(&info_log, "slatedb.read.memtable", "info-get")
@@ -442,6 +452,31 @@ fn assert_sst_spans(log: &str, trace_id: &str, level: &str) {
         |fields| fields.get("filter_name") == Some(&"_bf") && fields.get("result") == Some(&"true"),
     );
     assert_sst_index_and_data(log, trace_id, level);
+}
+
+/// The first get of an SST pins its filters and index on its handle. A later
+/// read of that handle probes the pinned filters and reads only blocks.
+fn assert_pinned_sst_spans(log: &str, trace_id: &str, level: &str) {
+    assert_sst_span(
+        log,
+        "slatedb.read.evaluate_filter",
+        trace_id,
+        level,
+        |fields| fields.get("filter_name") == Some(&"_bf") && fields.get("result") == Some(&"true"),
+    );
+    assert_no_sst_span_at_level(log, "slatedb.read.read_filters", trace_id, level);
+    assert_pinned_sst_data(log, trace_id, level);
+}
+
+fn assert_pinned_sst_data(log: &str, trace_id: &str, level: &str) {
+    assert_no_sst_span_at_level(log, "slatedb.read.read_index", trace_id, level);
+    assert_sst_span(
+        log,
+        "slatedb.read.read_blocks",
+        trace_id,
+        level,
+        has_block_activity,
+    );
 }
 
 fn assert_sst_index_and_data(log: &str, trace_id: &str, level: &str) {
