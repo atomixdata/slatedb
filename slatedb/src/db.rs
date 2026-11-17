@@ -2997,6 +2997,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_get_counts_each_l0_filter_once() {
+        use crate::db_stats::{
+            FILTER_KIND_LABEL, FILTER_KIND_POINT, SST_FILTER_FALSE_POSITIVE_COUNT,
+            SST_FILTER_NEGATIVE_COUNT, SST_FILTER_POSITIVE_COUNT,
+        };
+        use crate::filter_policy::{BloomFilterPolicy, FilterPolicy};
+
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let metrics_recorder = Arc::new(DefaultMetricsRecorder::new());
+        let filter_policy: Arc<dyn FilterPolicy> = Arc::new(BloomFilterPolicy::new(10));
+        let db = Db::builder("/tmp/test_get_counts_each_l0_filter_once", object_store)
+            .with_settings(test_db_options(0, 64 * 1024, None))
+            .with_filter_policies(vec![filter_policy])
+            .with_metrics_recorder(metrics_recorder.clone())
+            .build()
+            .await
+            .unwrap();
+
+        // Three L0 SSTs that all span `px:a`, so only the filter can rule one
+        // out. Only the oldest holds `px:a`.
+        for key in [b"px:a", b"qx:a", b"rx:a"] {
+            db.put(b"aa:a", b"v").await.unwrap();
+            db.put(key, b"v").await.unwrap();
+            db.put(b"zz:a", b"v").await.unwrap();
+            db.flush_with_options(FlushOptions {
+                flush_type: FlushType::MemTable,
+            })
+            .await
+            .unwrap();
+        }
+
+        // The first get reads and pins the filters. The second get checks the
+        // pinned filters before it builds an iterator.
+        for _ in 0..2 {
+            let value = db.get(b"px:a").await.unwrap();
+            assert_eq!(value, Some(Bytes::from_static(b"v")));
+        }
+
+        // Each get checks each SST's filter once: the two newer SSTs are ruled
+        // out, and the oldest passes and holds the key.
+        let point_count = |name| {
+            lookup_metric_with_labels(
+                &metrics_recorder,
+                name,
+                &[(FILTER_KIND_LABEL, FILTER_KIND_POINT)],
+            )
+            .unwrap_or(0)
+        };
+        assert_eq!(point_count(SST_FILTER_NEGATIVE_COUNT), 4);
+        assert_eq!(point_count(SST_FILTER_POSITIVE_COUNT), 2);
+        assert_eq!(point_count(SST_FILTER_FALSE_POSITIVE_COUNT), 0);
+
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn test_scan_prefix_by_recency_resumes_a_source_after_a_dropped_next_entry() {
         let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let gated = Arc::new(GatedObjectStore::new(inner));
