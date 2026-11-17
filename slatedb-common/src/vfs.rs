@@ -8,12 +8,15 @@ use std::fmt::Debug;
 use std::fs::TryLockError;
 use std::io;
 use std::ops::Range;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc};
 
 use crate::file_handle_cache::{read_exact_at_offset, FileHandleCache};
 use async_trait::async_trait;
 use bytes::Bytes;
 use tokio::io::AsyncWriteExt;
+use tokio::sync::oneshot;
 
 /// A regular file in a [`Vfs::list`] result.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,19 +83,22 @@ pub trait VfsLock: Debug + Send + Sync {}
 
 /// A [`Vfs`] backed by the standard filesystem.
 ///
-/// Range reads reuse open files and run in one blocking task per read.
-/// Clones share the cache of open files.
+/// Range reads reuse open files. By default, each read runs in one blocking
+/// task. [`StdVfs::with_read_threads`] runs them on dedicated threads instead.
+/// Clones share the cache of open files and the read threads.
 /// The cache retains at most 1,000 open files by default.
 /// Writes are flushed before publication, without syncing them to disk.
 #[derive(Debug, Clone)]
 pub struct StdVfs {
     file_handle_cache: FileHandleCache,
+    read_pool: Option<Arc<ReadPool>>,
 }
 
 impl Default for StdVfs {
     fn default() -> Self {
         Self {
             file_handle_cache: FileHandleCache::new(1000),
+            read_pool: None,
         }
     }
 }
@@ -110,6 +116,104 @@ impl StdVfs {
     pub fn with_max_open_file_handles(mut self, max_open_file_handles: usize) -> Self {
         self.file_handle_cache = FileHandleCache::new(max_open_file_handles);
         self
+    }
+
+    /// Runs range reads on `threads` dedicated threads, each with its own
+    /// queue. The threads stop when the last clone is dropped.
+    ///
+    /// Fails if `threads` is zero or a thread cannot start.
+    pub fn with_read_threads(mut self, threads: usize) -> io::Result<Self> {
+        self.read_pool = Some(Arc::new(ReadPool::new(threads)?));
+        Ok(self)
+    }
+}
+
+/// Reads `len` bytes at `offset` from `path`, through `file_handle_cache`.
+fn read_at(
+    file_handle_cache: &FileHandleCache,
+    path: &Path,
+    offset: u64,
+    len: usize,
+) -> io::Result<Bytes> {
+    let handle = file_handle_cache.try_get_or_open(path)?;
+    let mut buf = vec![0; len];
+    read_exact_at_offset(&handle, &mut buf, offset)?;
+    Ok(Bytes::from(buf))
+}
+
+/// A range read for a [`ReadPool`] thread.
+struct ReadJob {
+    file_handle_cache: FileHandleCache,
+    path: PathBuf,
+    offset: u64,
+    len: usize,
+    reply: oneshot::Sender<io::Result<Bytes>>,
+}
+
+/// Dedicated threads for range reads, each with its own queue.
+///
+/// `spawn_blocking` allocates a task for each read. It also takes the lock of
+/// the blocking pool to queue the task, and the worker thread takes it again
+/// to dequeue it. This pool sends each read to the next queue in turn, with no
+/// shared lock. A slow read delays the reads queued behind it on that thread.
+#[derive(Debug)]
+struct ReadPool {
+    queues: Vec<mpsc::Sender<ReadJob>>,
+    next: AtomicUsize,
+}
+
+impl ReadPool {
+    // Read threads must not run on the async runtime.
+    #[allow(clippy::disallowed_types)]
+    fn new(threads: usize) -> io::Result<Self> {
+        if threads == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "read pool needs at least one thread",
+            ));
+        }
+        let mut queues = Vec::with_capacity(threads);
+        for i in 0..threads {
+            let (sender, receiver) = mpsc::channel::<ReadJob>();
+            std::thread::Builder::new()
+                .name(format!("slatedb-vfs-read-{i}"))
+                .spawn(move || {
+                    // Stops when the pool drops its sender.
+                    while let Ok(job) = receiver.recv() {
+                        let result =
+                            read_at(&job.file_handle_cache, &job.path, job.offset, job.len);
+                        // The caller can stop waiting for the result.
+                        let _ = job.reply.send(result);
+                    }
+                })?;
+            queues.push(sender);
+        }
+        Ok(Self {
+            queues,
+            next: AtomicUsize::new(0),
+        })
+    }
+
+    async fn read(
+        &self,
+        file_handle_cache: FileHandleCache,
+        path: PathBuf,
+        offset: u64,
+        len: usize,
+    ) -> io::Result<Bytes> {
+        let stopped = || io::Error::other("read pool thread stopped");
+        let (reply, result) = oneshot::channel();
+        let queue = self.next.fetch_add(1, Ordering::Relaxed) % self.queues.len();
+        self.queues[queue]
+            .send(ReadJob {
+                file_handle_cache,
+                path,
+                offset,
+                len,
+                reply,
+            })
+            .map_err(|_| stopped())?;
+        result.await.map_err(|_| stopped())?
     }
 }
 
@@ -167,14 +271,14 @@ impl Vfs for StdVfs {
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "range is too large"))?;
         let path = path.to_path_buf();
         let file_handle_cache = self.file_handle_cache.clone();
+        if let Some(read_pool) = &self.read_pool {
+            return read_pool
+                .read(file_handle_cache, path, range.start, len)
+                .await;
+        }
         #[allow(clippy::disallowed_methods)]
-        tokio::task::spawn_blocking(move || {
-            let handle = file_handle_cache.try_get_or_open(&path)?;
-            let mut buf = vec![0; len];
-            read_exact_at_offset(&handle, &mut buf, range.start)?;
-            Ok(Bytes::from(buf))
-        })
-        .await?
+        tokio::task::spawn_blocking(move || read_at(&file_handle_cache, &path, range.start, len))
+            .await?
     }
 
     async fn read(&self, path: &Path) -> io::Result<Bytes> {
@@ -319,10 +423,30 @@ mod tests {
 
     #[tokio::test]
     async fn should_read_ranges_concurrently_through_shared_cache() {
+        read_ranges_concurrently(StdVfs::new().with_max_open_file_handles(2)).await;
+    }
+
+    #[tokio::test]
+    async fn should_read_ranges_concurrently_on_read_threads() {
+        let vfs = StdVfs::new()
+            .with_max_open_file_handles(2)
+            .with_read_threads(3)
+            .unwrap();
+        read_ranges_concurrently(vfs).await;
+    }
+
+    #[test]
+    fn should_reject_zero_read_threads() {
+        let err = StdVfs::new().with_read_threads(0).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    async fn read_ranges_concurrently(vfs: StdVfs) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("file");
         std::fs::write(&path, b"0123456789").unwrap();
-        let vfs = StdVfs::new().with_max_open_file_handles(2);
+        let missing = vfs.read_range(&dir.path().join("missing"), 0..1).await;
+        assert_eq!(missing.unwrap_err().kind(), io::ErrorKind::NotFound);
         let mut tasks = tokio::task::JoinSet::new();
         for offset in 0..10 {
             let vfs = vfs.clone();
