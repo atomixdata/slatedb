@@ -277,6 +277,15 @@ impl BytesRange {
             .map(|inner| Self { inner })
     }
 
+    /// Returns this range with borrowed bounds. Comparisons on the result
+    /// clone no key, so they touch no shared reference count.
+    pub(crate) fn as_slices(&self) -> ComparableRange<&[u8]> {
+        ComparableRange::new(
+            ByteRangeBounds::start_bound(self),
+            ByteRangeBounds::end_bound(self),
+        )
+    }
+
     pub(crate) fn is_start_bound_included_or_unbounded(&self) -> bool {
         !matches!(ByteRangeBounds::start_bound(self), Excluded(_))
     }

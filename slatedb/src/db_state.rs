@@ -1,4 +1,5 @@
 use crate::bytes_range::BytesRange;
+use crate::comparable_range::ComparableRange;
 use crate::config::CompressionCodec;
 use crate::error::SlateDBError;
 use crate::manifest::{Manifest, ManifestCore};
@@ -326,11 +327,16 @@ impl SsTableView {
         after_start && before_end && self.effective_range.non_empty()
     }
 
-    pub(crate) fn intersects_range(&self, end_bound: Bound<Bytes>, range: &BytesRange) -> bool {
-        let sst_range =
-            BytesRange::new(Unbounded, end_bound.clone()).intersect(&self.effective_range);
-        match sst_range {
-            Some(sst_range) => BytesRange::new(sst_range.start_bound().cloned(), end_bound)
+    /// Whether this view can hold a key in `range`, when its SST ends at
+    /// `end_bound`.
+    pub(crate) fn intersects_range(
+        &self,
+        end_bound: Bound<&[u8]>,
+        range: &ComparableRange<&[u8]>,
+    ) -> bool {
+        let effective = self.effective_range.as_slices();
+        match ComparableRange::new(Unbounded, end_bound).intersect(&effective) {
+            Some(sst_range) => ComparableRange::new(sst_range.start_bound().cloned(), end_bound)
                 .intersect(range)
                 .is_some(),
             None => false,
@@ -713,11 +719,16 @@ impl SortedRun {
             .sst_views
             .last()
             .expect("non-empty: first exists, so last exists");
-        let span = BytesRange::new(
-            first.compacted_effective_range().start_bound().cloned(),
-            last.compacted_effective_range().end_bound().cloned(),
+        let span = ComparableRange::new(
+            first
+                .compacted_effective_range()
+                .start_bound()
+                .map(Bytes::as_ref),
+            last.compacted_effective_range()
+                .end_bound()
+                .map(Bytes::as_ref),
         );
-        span.intersect(range).is_some()
+        span.intersect(&range.as_slices()).is_some()
     }
 
     pub(crate) fn find_last_sst_with_range_covering_key(&self, key: &[u8]) -> Option<usize> {
@@ -783,6 +794,14 @@ impl SortedRun {
         if views.is_empty() {
             return 0..0;
         }
+        let slices = range.as_slices();
+        // Whether the view at `idx` can hold a key in `range`. It compares
+        // slices: many scans share these keys, so a clone would change a
+        // reference count that other cores also change.
+        let intersects = |idx: usize| {
+            let end_bound = self.table_end_bound(idx).map(Bytes::as_ref);
+            views[idx].intersects_range(end_bound, &slices)
+        };
 
         // Upper bound: last SST whose start key falls within the range's upper
         // bound. SST[i]'s slot begins at start_key[i]; if start_key[i] is past
@@ -805,7 +824,7 @@ impl SortedRun {
             Unbounded => views.len() - 1,
         };
 
-        if !views[max_idx].intersects_range(self.table_end_bound(max_idx).cloned(), range) {
+        if !intersects(max_idx) {
             return 0..0;
         }
 
@@ -820,17 +839,12 @@ impl SortedRun {
         };
 
         let mut min_idx = match start_candidate {
-            Some(idx) if views[idx].intersects_range(self.table_end_bound(idx).cloned(), range) => {
-                idx
-            }
+            Some(idx) if intersects(idx) => idx,
             Some(idx) => idx + 1,
             None => 0,
         };
 
-        while min_idx > 0
-            && views[min_idx - 1]
-                .intersects_range(self.table_end_bound(min_idx - 1).cloned(), range)
-        {
+        while min_idx > 0 && intersects(min_idx - 1) {
             min_idx -= 1;
         }
 
@@ -1459,8 +1473,9 @@ mod tests {
                 }
             };
             let point_range = BytesRange::from_slice(&key[..]..=&key[..]);
-            let expected = view.intersects_range(end_bound.clone(), &point_range);
-            let actual = view.intersects_point(end_bound.as_ref().map(Bytes::as_ref), &key);
+            let end_bound = end_bound.as_ref().map(Bytes::as_ref);
+            let expected = view.intersects_range(end_bound, &point_range.as_slices());
+            let actual = view.intersects_point(end_bound, &key);
             proptest::prop_assert_eq!(
                 actual,
                 expected,
