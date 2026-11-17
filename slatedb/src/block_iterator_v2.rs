@@ -1,4 +1,3 @@
-use async_trait::async_trait;
 use bytes::Bytes;
 
 use crate::block_iterator::BlockLike;
@@ -191,7 +190,6 @@ impl<B: BlockLike> AscendingState<B> {
     }
 }
 
-#[async_trait]
 impl<B: BlockLike> RowEntryIterator for BlockIteratorV2<B> {
     async fn init(&mut self) -> Result<(), SlateDBError> {
         Ok(())
@@ -321,7 +319,6 @@ impl<B: BlockLike> DescendingBlockIteratorV2<B> {
     }
 }
 
-#[async_trait]
 impl<B: BlockLike> RowEntryIterator for DescendingBlockIteratorV2<B> {
     async fn init(&mut self) -> Result<(), SlateDBError> {
         if !self.initialized && !self.exhausted {
