@@ -11,7 +11,7 @@ use crate::merge_operator::{instrument_merge_operator, MergeOperatorType};
 use crate::oracle::Oracle;
 use crate::read_trace::ReadTrace;
 use crate::segment_iterator::{build_segment_iter, SegmentIter, SegmentScanContext};
-use crate::sst_iter::SstIteratorOptions;
+use crate::sst_iter::{pinned_filter_query, SstIteratorOptions};
 use crate::tablestore::TableStore;
 use crate::types::KeyValue;
 use crate::{error::SlateDBError, DbIterator};
@@ -465,21 +465,21 @@ impl Reader {
         }
 
         // Single-segment chain: L0 newest-first, then sorted runs newest-first.
-        if let Some(segment) = segment {
-            sst_iter_options.segment = Some(segment.prefix.clone());
-            for sst in segment.tree.l0.iter().cloned() {
-                sources.push_back(RecencySource::L0(sst));
+        // Each SST source is an index into the segment's tree, so the scan
+        // clones no view until it opens one.
+        let tree = segment.map(|segment| {
+            sst_iter_options.segment = Some(segment.prefix);
+            for idx in 0..segment.tree.l0.len() {
+                sources.push_back(RecencySource::L0(idx));
             }
-            for sr in segment
-                .tree
-                .compacted
-                .iter()
-                .filter(|sr| sr.overlaps_range(&range))
-                .cloned()
-            {
-                sources.push_back(RecencySource::SortedRun(sr));
+            for (idx, sr) in segment.tree.compacted.iter().enumerate() {
+                if sr.overlaps_range(&range) {
+                    sources.push_back(RecencySource::SortedRun(idx));
+                }
             }
-        }
+            segment.tree
+        });
+        let filter_query = pinned_filter_query(&range, &sst_iter_options, &self.table_store);
 
         let context = RecencySourceContext {
             table_store: self.table_store.clone(),
@@ -488,6 +488,8 @@ impl Reader {
             sst_iter_options,
             max_seq,
             read_trace: read_trace.clone(),
+            tree,
+            filter_query,
         };
         Ok(DbRecencyIterator::new(
             sources,

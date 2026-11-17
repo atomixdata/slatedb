@@ -41,9 +41,25 @@ pub(crate) fn current() -> Option<Arc<DirectMirror>> {
 }
 
 impl DirectMirror {
-    /// The local copy of `path`, if the mirror has one.
-    pub(crate) fn local_blob(&self, path: &Path) -> Option<LocalBlob<'_>> {
-        let file = self.handle.local_file(path)?;
+    /// The local copy of an SST. The first call for a slot asks the mirror
+    /// for the file of `path()` and keeps it in the slot.
+    ///
+    /// The mirror lookup takes a lock that every read shares. If the mirror
+    /// later evicts or deletes the copy, it marks the kept file removed. Reads
+    /// of the SST then take the normal path, until a new handle replaces this
+    /// one.
+    pub(crate) fn local_blob<'a>(
+        &'a self,
+        pinned: &'a crate::db_state::pinning::PinnedSstMetadata,
+        path: impl FnOnce() -> Path,
+    ) -> Option<LocalBlob<'a>> {
+        if pinned.local_file.get().is_none() {
+            let _ = pinned.local_file.set(self.handle.local_file(&path())?);
+        }
+        let file = pinned.local_file.get()?;
+        if file.is_removed() {
+            return None;
+        }
         Some(LocalBlob {
             vfs: &self.vfs,
             file,
@@ -54,7 +70,7 @@ impl DirectMirror {
 /// The local file of one mirrored SST.
 pub(crate) struct LocalBlob<'a> {
     vfs: &'a StdVfs,
-    file: Arc<LocalFile>,
+    file: &'a LocalFile,
 }
 
 impl ReadOnlyBlob for LocalBlob<'_> {

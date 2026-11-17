@@ -11,6 +11,7 @@ use tokio_util::task::AbortOnDropHandle;
 
 use crate::block_iterator::DataBlockIterator;
 use crate::bytes_range::BytesRange;
+use crate::comparable_range::ComparableRange;
 use crate::db_state::{SsTableId, SsTableView};
 use crate::db_stats::DbStats;
 use crate::error::SlateDBError;
@@ -228,6 +229,17 @@ impl FilterEvaluator {
         }
     }
 
+    /// An evaluator whose filters already passed, in [`check_pinned_filters`].
+    fn passed(query: FilterQuery, db_stats: Option<DbStats>) -> Self {
+        Self {
+            query,
+            db_stats,
+            state: FilterState::Positive,
+            found_key: false,
+            false_positive_recorded: false,
+        }
+    }
+
     fn new_range(
         lower: Bound<Bytes>,
         upper: Bound<Bytes>,
@@ -267,51 +279,15 @@ impl FilterEvaluator {
         // AND logic: if any filter says the key is NOT present, filter it out.
         // All filters reaching here are decoded. TableStore::read_filters
         // resolves any raw cache entries before returning.
-        let might_match = filters
-            .iter()
-            .all(|nf| self.filter_might_match(nf, sst_id, sst_level, read_trace));
-
-        if might_match {
-            if let Some(stats) = &self.db_stats {
-                self.positives_counter(stats).increment(1);
-            }
-            self.state = FilterState::Positive;
+        let might_match = filters_might_match(filters, &self.query, sst_id, sst_level, read_trace);
+        if let Some(stats) = &self.db_stats {
+            count_filter_result(&self.query, might_match, stats);
+        }
+        self.state = if might_match {
+            FilterState::Positive
         } else {
-            if let Some(stats) = &self.db_stats {
-                self.negatives_counter(stats).increment(1);
-            }
-            self.state = FilterState::Negative;
-        }
-    }
-
-    fn filter_might_match(
-        &self,
-        filter: &NamedFilter,
-        sst_id: SsTableId,
-        sst_level: Option<&SstTraceLevel>,
-        read_trace: &ReadTrace,
-    ) -> bool {
-        let span = read_trace.new_evaluate_filter_span(sst_id, sst_level, &filter.name);
-        let _guard = span.enter();
-        let result = filter.filter.might_match(&self.query);
-        span.record("result", result);
-        result
-    }
-
-    fn positives_counter<'a>(&self, stats: &'a DbStats) -> &'a Arc<dyn CounterFn> {
-        match &self.query.target {
-            FilterTarget::Point(_) => &stats.sst_filter_point_positives,
-            FilterTarget::Prefix(_) => &stats.sst_filter_prefix_positives,
-            FilterTarget::Range { .. } => &stats.sst_filter_range_positives,
-        }
-    }
-
-    fn negatives_counter<'a>(&self, stats: &'a DbStats) -> &'a Arc<dyn CounterFn> {
-        match &self.query.target {
-            FilterTarget::Point(_) => &stats.sst_filter_point_negatives,
-            FilterTarget::Prefix(_) => &stats.sst_filter_prefix_negatives,
-            FilterTarget::Range { .. } => &stats.sst_filter_range_negatives,
-        }
+            FilterState::Negative
+        };
     }
 
     fn false_positives_counter<'a>(&self, stats: &'a DbStats) -> &'a Arc<dyn CounterFn> {
@@ -937,11 +913,14 @@ impl<'a> FilterIterator<'a> {
 impl RowEntryIterator for FilterIterator<'_> {
     async fn init(&mut self) -> Result<(), SlateDBError> {
         if !self.initialized {
-            let filters = self.read_filters().await?;
-            let sst_id = self.inner.view().table_as_ref().sst.id;
-            let read_trace = self.inner.read_trace();
-            self.filter
-                .evaluate(&filters, sst_id, self.inner.sst_level(), &read_trace);
+            // A filter that `check_pinned_filters` passed needs no probe.
+            if self.filter.state == FilterState::NotChecked {
+                let filters = self.read_filters().await?;
+                let sst_id = self.inner.view().table_as_ref().sst.id;
+                let read_trace = self.inner.read_trace();
+                self.filter
+                    .evaluate(&filters, sst_id, self.inner.sst_level(), &read_trace);
+            }
 
             if self.is_filtered_out() {
                 return Ok(());
@@ -992,7 +971,16 @@ pub(crate) struct SstIterator<'a> {
 }
 
 impl<'a> SstIterator<'a> {
-    fn from_internal(internal: InternalSstIterator<'a>, db_stats: Option<DbStats>) -> Self {
+    fn from_internal(
+        internal: InternalSstIterator<'a>,
+        db_stats: Option<DbStats>,
+        passed: Option<FilterEvaluator>,
+    ) -> Self {
+        if let Some(filter) = passed {
+            return Self {
+                delegate: SstIteratorDelegate::Filter(FilterIterator::new(internal, filter)),
+            };
+        }
         let point_key = internal.view().point_key().map(Bytes::copy_from_slice);
         let prefix = internal.options.prefix.clone();
         let range = internal.view().bounds();
@@ -1052,7 +1040,7 @@ impl<'a> SstIterator<'a> {
         db_stats: Option<DbStats>,
     ) -> Result<Self, SlateDBError> {
         let internal = InternalSstIterator::new(view, table_store, options, tracing_context)?;
-        Ok(Self::from_internal(internal, db_stats))
+        Ok(Self::from_internal(internal, db_stats, None))
     }
 
     #[allow(dead_code)]
@@ -1066,7 +1054,7 @@ impl<'a> SstIterator<'a> {
     ) -> Result<Option<Self>, SlateDBError> {
         let internal =
             InternalSstIterator::new_owned(range, table, table_store, options, tracing_context)?;
-        Ok(internal.map(|iter| Self::from_internal(iter, db_stats.clone())))
+        Ok(internal.map(|iter| Self::from_internal(iter, db_stats.clone(), None)))
     }
 
     #[allow(dead_code)]
@@ -1098,6 +1086,34 @@ impl<'a> SstIterator<'a> {
         tracing_context: Option<SstTracingContext>,
         db_stats: Option<DbStats>,
     ) -> Result<Option<Self>, SlateDBError> {
+        Self::new_owned_initialized_checked(
+            range,
+            table,
+            table_store,
+            options,
+            tracing_context,
+            db_stats,
+            PinnedFilterCheck::Unchecked,
+        )
+        .await
+    }
+
+    /// [`Self::new_owned_initialized_with_stats`] for an SST that
+    /// [`check_pinned_filters`] checked.
+    pub(crate) async fn new_owned_initialized_checked<T: RangeBounds<Bytes>>(
+        range: T,
+        table: SsTableView,
+        table_store: Arc<TableStore>,
+        options: SstIteratorOptions,
+        tracing_context: Option<SstTracingContext>,
+        db_stats: Option<DbStats>,
+        check: PinnedFilterCheck,
+    ) -> Result<Option<Self>, SlateDBError> {
+        let passed = match check {
+            PinnedFilterCheck::Skip => return Ok(None),
+            PinnedFilterCheck::Passed(PassedFilter(filter)) => Some(filter),
+            PinnedFilterCheck::Unchecked => None,
+        };
         // Construct the inner iterator without initializing it. The filter
         // is evaluated first so that an SST whose filter rules out the query
         // never pays for an index or data block read.
@@ -1105,7 +1121,7 @@ impl<'a> SstIterator<'a> {
             InternalSstIterator::new_owned(range, table, table_store, options, tracing_context)?;
         match internal {
             Some(inner) => {
-                let mut iterator = Self::from_internal(inner, db_stats);
+                let mut iterator = Self::from_internal(inner, db_stats, passed);
                 match &mut iterator.delegate {
                     SstIteratorDelegate::Filter(filter_iter) => {
                         filter_iter.init().await?;
@@ -1132,7 +1148,7 @@ impl<'a> SstIterator<'a> {
         db_stats: Option<DbStats>,
     ) -> Result<Option<Self>, SlateDBError> {
         let internal = InternalSstIterator::new_borrowed(range, table, table_store, options)?;
-        Ok(internal.map(|iter| Self::from_internal(iter, db_stats.clone())))
+        Ok(internal.map(|iter| Self::from_internal(iter, db_stats.clone(), None)))
     }
 
     #[allow(dead_code)]
@@ -1154,7 +1170,7 @@ impl<'a> SstIterator<'a> {
         let internal = InternalSstIterator::new_borrowed(range, table, table_store, options)?;
         match internal {
             Some(inner) => {
-                let mut iterator = Self::from_internal(inner, None);
+                let mut iterator = Self::from_internal(inner, None, None);
                 match &mut iterator.delegate {
                     SstIteratorDelegate::Filter(filter_iter) => {
                         filter_iter.init().await?;
@@ -1181,7 +1197,7 @@ impl<'a> SstIterator<'a> {
         db_stats: Option<DbStats>,
     ) -> Result<Option<Self>, SlateDBError> {
         let internal = InternalSstIterator::for_key(table, key, table_store, options)?;
-        Ok(internal.map(|iter| Self::from_internal(iter, db_stats.clone())))
+        Ok(internal.map(|iter| Self::from_internal(iter, db_stats.clone(), None)))
     }
 
     #[cfg(test)]
@@ -1195,7 +1211,7 @@ impl<'a> SstIterator<'a> {
         let internal = InternalSstIterator::for_key(table, key, table_store, options)?;
         match internal {
             Some(inner) => {
-                let mut iterator = Self::from_internal(inner, db_stats);
+                let mut iterator = Self::from_internal(inner, db_stats, None);
                 match &mut iterator.delegate {
                     SstIteratorDelegate::Filter(filter_iter) => {
                         filter_iter.init().await?;
@@ -1260,6 +1276,111 @@ fn block_fetch_panic_error(
         panic_string(&panic_err),
     );
     SlateDBError::BackgroundTaskPanic(task_name)
+}
+
+/// Whether every filter in `filters` says that `query` might match. Each
+/// probe gets its own evaluate-filter span.
+fn filters_might_match(
+    filters: &[NamedFilter],
+    query: &FilterQuery,
+    sst_id: SsTableId,
+    sst_level: Option<&SstTraceLevel>,
+    read_trace: &ReadTrace,
+) -> bool {
+    filters.iter().all(|filter| {
+        let span = read_trace.new_evaluate_filter_span(sst_id, sst_level, &filter.name);
+        let _guard = span.enter();
+        let result = filter.filter.might_match(query);
+        span.record("result", result);
+        result
+    })
+}
+
+/// Counts one filter result for `query`.
+fn count_filter_result(query: &FilterQuery, might_match: bool, stats: &DbStats) {
+    let counter: &Arc<dyn CounterFn> = match (&query.target, might_match) {
+        (FilterTarget::Point(_), true) => &stats.sst_filter_point_positives,
+        (FilterTarget::Point(_), false) => &stats.sst_filter_point_negatives,
+        (FilterTarget::Prefix(_), true) => &stats.sst_filter_prefix_positives,
+        (FilterTarget::Prefix(_), false) => &stats.sst_filter_prefix_negatives,
+        (FilterTarget::Range { .. }, true) => &stats.sst_filter_range_positives,
+        (FilterTarget::Range { .. }, false) => &stats.sst_filter_range_negatives,
+    };
+    counter.increment(1);
+}
+
+/// Prototype of RFC 0037: the query that [`check_pinned_filters`] uses for a
+/// read over `range`, or `None` when no pinned check applies. It picks the
+/// query as the iterator does: a point for a one-key range, else the prefix
+/// when a filter policy answers prefixes. Build it once per read.
+pub(crate) fn pinned_filter_query(
+    range: &BytesRange,
+    options: &SstIteratorOptions,
+    table_store: &TableStore,
+) -> Option<FilterQuery> {
+    let query = match (
+        RangeBounds::start_bound(range),
+        RangeBounds::end_bound(range),
+        &options.prefix,
+    ) {
+        (Included(start), Included(end), _) if start == end => FilterQuery::point(start.clone()),
+        (_, _, Some(prefix)) if table_store.any_filter_policy_supports_prefix_queries() => {
+            FilterQuery::prefix(prefix.clone())
+        }
+        _ => return None,
+    };
+    Some(query.with_context(options.filter_context.clone()))
+}
+
+/// Prototype of RFC 0037: the result of [`check_pinned_filters`].
+pub(crate) enum PinnedFilterCheck {
+    /// The SST holds nothing for the read: the range misses its view, or its
+    /// pinned filters rule the query out.
+    Skip,
+    /// The pinned filters pass. The iterator does not probe them again.
+    Passed(PassedFilter),
+    /// No pinned check applies. The iterator reads and checks the filters.
+    Unchecked,
+}
+
+/// Filters that passed in [`check_pinned_filters`].
+pub(crate) struct PassedFilter(FilterEvaluator);
+
+/// Prototype of RFC 0037: checks one SST for a read on a borrowed view,
+/// before its iterator is built. A skipped SST costs only slice compares and
+/// filter probes, and clones nothing. The check counts its filter result once,
+/// in the counters that the iterator uses, and the iterator does not count it
+/// again.
+pub(crate) fn check_pinned_filters(
+    view: &SsTableView,
+    range: &ComparableRange<&[u8]>,
+    query: Option<&FilterQuery>,
+    sst_level: Option<&SstTraceLevel>,
+    read_trace: &ReadTrace,
+    db_stats: Option<&DbStats>,
+) -> PinnedFilterCheck {
+    // The iterator of a view that misses the range is `None`, and it probes
+    // no filter.
+    if !view.view_range_intersects(range) {
+        return PinnedFilterCheck::Skip;
+    }
+    let (Some(query), Some(filters)) = (query, view.sst.pinned.filters.get()) else {
+        return PinnedFilterCheck::Unchecked;
+    };
+    if filters.is_empty() {
+        return PinnedFilterCheck::Unchecked;
+    }
+    let might_match = filters_might_match(filters, query, view.sst.id, sst_level, read_trace);
+    if let Some(stats) = db_stats {
+        count_filter_result(query, might_match, stats);
+    }
+    if !might_match {
+        return PinnedFilterCheck::Skip;
+    }
+    PinnedFilterCheck::Passed(PassedFilter(FilterEvaluator::passed(
+        query.clone(),
+        db_stats.cloned(),
+    )))
 }
 
 /// Prototype of RFC 0037: the value in `slot`, or else the value that `read`

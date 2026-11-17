@@ -1,9 +1,10 @@
 use crate::batch::WriteBatchIterator;
 use crate::bytes_range::BytesRange;
-use crate::db_state::{SortedRun, SsTableView};
+use crate::db_state::SsTableView;
 use crate::db_stats::DbStats;
 use crate::error::SlateDBError;
 use crate::filter_iterator::FilterIterator;
+use crate::filter_policy::FilterQuery;
 use crate::iter::{row_entry_iterator_enum, EmptyIterator, IterationOrder, RowEntryIterator};
 use crate::manifest::LsmTreeState;
 use crate::mem_table::{KVTable, MemTableIterator};
@@ -16,7 +17,9 @@ use crate::segment_iterator::{
     build_l0_point_iters, build_sr_point_iters, SegmentIter, SegmentScanContext,
 };
 use crate::sorted_run_iterator::SortedRunIterator;
-use crate::sst_iter::{SstIterator, SstIteratorOptions, SstTracingContext};
+use crate::sst_iter::{
+    check_pinned_filters, PinnedFilterCheck, SstIterator, SstIteratorOptions, SstTracingContext,
+};
 use crate::tablestore::TableStore;
 use crate::types::{KeyValue, RowEntry, ValueDeletable};
 
@@ -581,11 +584,17 @@ row_entry_iterator_enum! {
 
 /// A source of a recency scan. Its iterator is built only when the walk
 /// reaches it.
-#[allow(clippy::large_enum_variant)]
+///
+/// Prototype: an SST source is an index into [`RecencySourceContext::tree`].
+/// Many scans share each view, so a clone of a view changes reference counts
+/// that other cores also change. Only a source that the walk opens clones its
+/// view.
 pub(crate) enum RecencySource {
     MemTable(Arc<KVTable>),
-    L0(SsTableView),
-    SortedRun(SortedRun),
+    /// The L0 SST view at this index of the tree.
+    L0(usize),
+    /// The sorted run at this index of the tree.
+    SortedRun(usize),
 }
 
 /// What a recency scan needs to build the iterator of a [`RecencySource`].
@@ -596,6 +605,10 @@ pub(crate) struct RecencySourceContext {
     pub(crate) sst_iter_options: SstIteratorOptions,
     pub(crate) max_seq: Option<u64>,
     pub(crate) read_trace: ReadTrace,
+    /// The tree that holds the L0 SSTs and sorted runs of the sources.
+    pub(crate) tree: Option<Arc<LsmTreeState>>,
+    /// The query of the pinned filter check, built once per scan.
+    pub(crate) filter_query: Option<FilterQuery>,
 }
 
 impl RecencySourceContext {
@@ -626,52 +639,77 @@ impl RecencySourceContext {
                 iter.init().await?;
                 RecencyIter::MemTable(Box::new(iter))
             }
-            RecencySource::L0(view) => {
-                match self.open_sst(view.clone(), SstTraceLevel::L0).await? {
+            RecencySource::L0(idx) => {
+                let view = &self.tree()?.l0[*idx];
+                match self.open_sst(view, SstTraceLevel::L0).await? {
                     Some(iter) => RecencyIter::Sst(Box::new(iter)),
                     None => return Ok(None),
                 }
             }
-            RecencySource::SortedRun(sorted_run) => {
-                let mut views = sorted_run.clone().into_tables_covering_range(&self.range);
+            RecencySource::SortedRun(idx) => {
+                let sorted_run = &self.tree()?.compacted[*idx];
+                let covering = sorted_run.table_idx_covering_range(&self.range);
                 let trace_level = SstTraceLevel::SortedRun(sorted_run.id);
                 // The SSTs of a run hold disjoint key ranges, so a prefix
                 // usually falls inside one of them. The run's iterator would
                 // read only that SST, so open it directly and let its filter
                 // rule out the whole run.
-                if views.len() <= 1 {
-                    let Some(view) = views.pop_front() else {
-                        return Ok(None);
-                    };
-                    match self.open_sst(view, trace_level).await? {
-                        Some(iter) => RecencyIter::Sst(Box::new(iter)),
-                        None => return Ok(None),
+                match covering.len() {
+                    0 => return Ok(None),
+                    1 => {
+                        let view = &sorted_run.sst_views()[covering.start];
+                        match self.open_sst(view, trace_level).await? {
+                            Some(iter) => RecencyIter::Sst(Box::new(iter)),
+                            None => return Ok(None),
+                        }
                     }
-                } else {
-                    RecencyIter::SortedRun(self.open_sorted_run(views, trace_level).await?)
+                    _ => {
+                        let views = sorted_run.sst_views()[covering].iter().cloned().collect();
+                        RecencyIter::SortedRun(self.open_sorted_run(views, trace_level).await?)
+                    }
                 }
             }
         };
         Ok(Some(FilterIterator::new_with_max_seq(iter, self.max_seq)))
     }
 
-    /// Opens an initialized iterator over one SST.
+    fn tree(&self) -> Result<&LsmTreeState, SlateDBError> {
+        // The reader sets the tree whenever it lists an SST source.
+        self.tree.as_deref().ok_or(SlateDBError::InvalidDBState)
+    }
+
+    /// Opens an initialized iterator over one SST, or returns `None` when the
+    /// SST holds nothing for the scan.
     ///
-    /// Initializing checks the SST's filters before any index or block read,
-    /// and returns `None` when they rule the prefix out, so a filtered-out SST
-    /// is never boxed or read.
+    /// Prototype: it first checks the pinned filters on the borrowed view.
+    /// Many scans share each view, so a clone of a view changes reference
+    /// counts that other cores also change. A skipped SST costs only the
+    /// filter probes. Otherwise initializing checks the SST's filters before
+    /// any index or block read, unless the pinned check already passed them.
     async fn open_sst(
         &self,
-        view: SsTableView,
+        view: &SsTableView,
         trace_level: SstTraceLevel,
     ) -> Result<Option<SstIterator<'static>>, SlateDBError> {
-        SstIterator::new_owned_initialized_with_stats(
-            self.range.clone(),
+        let check = check_pinned_filters(
             view,
+            &self.range.as_slices(),
+            self.filter_query.as_ref(),
+            Some(&trace_level),
+            &self.read_trace,
+            Some(&self.db_stats),
+        );
+        if let PinnedFilterCheck::Skip = check {
+            return Ok(None);
+        }
+        SstIterator::new_owned_initialized_checked(
+            self.range.clone(),
+            view.clone(),
             self.table_store.clone(),
             self.sst_iter_options.clone(),
             Some(SstTracingContext::new(trace_level, self.read_trace.clone())),
             Some(self.db_stats.clone()),
+            check,
         )
         .await
     }

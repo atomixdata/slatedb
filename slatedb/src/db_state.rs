@@ -60,6 +60,9 @@ pub(crate) mod pinning {
     pub(crate) struct PinnedSstMetadata {
         pub(crate) filters: OnceLock<Arc<[NamedFilter]>>,
         pub(crate) index: OnceLock<Arc<SsTableIndexOwned>>,
+        /// The local mirror file of the SST, set by the first direct read that
+        /// finds it. A block read then needs no mirror lookup.
+        pub(crate) local_file: OnceLock<Arc<slatedb_mirror::LocalFile>>,
     }
 
     /// Handles compare equal whatever their slots hold.
@@ -341,6 +344,18 @@ impl SsTableView {
                 .is_some(),
             None => false,
         }
+    }
+
+    /// Whether [`Self::calculate_view_range`] finds a view range for
+    /// `range`. It compares slices and clones no key.
+    pub(crate) fn view_range_intersects(&self, range: &ComparableRange<&[u8]>) -> bool {
+        if let Some(visible_range) = &self.visible_range {
+            return visible_range.as_slices().intersect(range).is_some();
+        }
+        if self.sst.info.last_entry.is_some() {
+            return self.effective_range.as_slices().intersect(range).is_some();
+        }
+        true
     }
 
     /// Calculate the view range for the given range.
@@ -789,7 +804,7 @@ impl SortedRun {
         min_idx..(max_idx + 1)
     }
 
-    fn table_idx_covering_range(&self, range: &BytesRange) -> Range<usize> {
+    pub(crate) fn table_idx_covering_range(&self, range: &BytesRange) -> Range<usize> {
         let views = &self.sst_views;
         if views.is_empty() {
             return 0..0;
@@ -1445,6 +1460,40 @@ mod tests {
             small_key().prop_map(Included),
             small_key().prop_map(Excluded),
         ]
+    }
+
+    #[test]
+    fn test_view_range_intersects_matches_calculate_view_range() {
+        proptest!(|(
+            first in proptest::option::of(small_key()),
+            last in proptest::option::of(small_key()),
+            visible_start in proptest::option::of(small_key()),
+            visible_end in small_bound(),
+            start in small_bound(),
+            end in small_bound(),
+        )| {
+            let view = match first {
+                // No first entry: the view's effective range is empty.
+                None => create_compacted_sst_view(None),
+                Some(first) => {
+                    let last = last.filter(|last| *last >= first);
+                    let view = create_compacted_sst_view_with_bounds(&first, last.as_deref());
+                    let visible_start = visible_start.map_or(Unbounded, Included);
+                    match BytesRange::try_new(visible_start, visible_end) {
+                        Some(visible) => view
+                            .try_with_visible_range(visible, &DbRand::new(0))
+                            .unwrap_or(view),
+                        None => view,
+                    }
+                }
+            };
+            let Some(range) = BytesRange::try_new(start, end) else {
+                return Ok(());
+            };
+            let expected = view.calculate_view_range(range.clone()).is_some();
+            let actual = view.view_range_intersects(&range.as_slices());
+            proptest::prop_assert_eq!(actual, expected, "view {:?}, range {:?}", view, range);
+        });
     }
 
     #[test]
