@@ -14,7 +14,10 @@ use crate::manifest::{LsmTreeState, Segment};
 use crate::merge_iterator::MergeIterator;
 use crate::read_trace::{ReadTrace, SstTraceLevel};
 use crate::sorted_run_iterator::SortedRunIterator;
-use crate::sst_iter::{SstIterator, SstIteratorOptions, SstTracingContext};
+use crate::sst_iter::{
+    check_pinned_filters, pinned_filter_query, PinnedFilterCheck, SstIterator, SstIteratorOptions,
+    SstTracingContext,
+};
 use crate::tablestore::TableStore;
 use crate::types::RowEntry;
 use crate::utils::build_concurrent;
@@ -370,10 +373,25 @@ pub(crate) fn build_l0_point_iters(
 ) -> Result<VecDeque<SstIterator<'static>>, SlateDBError> {
     let mut iters = VecDeque::new();
     let options = ctx.sst_iter_options.clone();
-    for sst in l0.iter().cloned() {
-        let iter = SstIterator::new_owned_with_stats(
-            ctx.range.clone(),
+    let query = pinned_filter_query(&ctx.range, &options, &ctx.table_store);
+    let range = ctx.range.as_slice_range();
+    for sst in l0 {
+        // Prototype of RFC 0037: check the borrowed view first, so a skipped
+        // SST clones nothing.
+        let check = check_pinned_filters(
             sst,
+            &range,
+            query.as_ref(),
+            Some(&SstTraceLevel::L0),
+            &ctx.read_trace,
+            ctx.point_lookup_stats.as_ref(),
+        );
+        if let PinnedFilterCheck::Skip = check {
+            continue;
+        }
+        let iter = SstIterator::new_owned_checked(
+            ctx.range.clone(),
+            sst.clone(),
             ctx.table_store.clone(),
             options.clone(),
             Some(SstTracingContext::new(
@@ -381,6 +399,7 @@ pub(crate) fn build_l0_point_iters(
                 ctx.read_trace.clone(),
             )),
             ctx.point_lookup_stats.clone(),
+            check,
         )?;
         if let Some(iter) = iter {
             iters.push_back(iter);
@@ -396,18 +415,33 @@ pub(crate) fn build_sr_point_iters(
 ) -> Result<VecDeque<SstIterator<'static>>, SlateDBError> {
     let mut iters = VecDeque::new();
     let options = ctx.sst_iter_options.clone();
+    let query = pinned_filter_query(&ctx.range, &options, &ctx.table_store);
+    let range = ctx.range.as_slice_range();
     for sr in compacted.iter() {
+        let level = SstTraceLevel::SortedRun(sr.id);
         for handle in sr.tables_covering_point_key(key.as_ref()) {
-            let iter = SstIterator::new_owned_with_stats(
+            let check = check_pinned_filters(
+                handle,
+                &range,
+                query.as_ref(),
+                Some(&level),
+                &ctx.read_trace,
+                ctx.point_lookup_stats.as_ref(),
+            );
+            if let PinnedFilterCheck::Skip = check {
+                continue;
+            }
+            let iter = SstIterator::new_owned_checked(
                 ctx.range.clone(),
                 handle.clone(),
                 ctx.table_store.clone(),
                 options.clone(),
                 Some(SstTracingContext::new(
-                    SstTraceLevel::SortedRun(sr.id),
+                    level.clone(),
                     ctx.read_trace.clone(),
                 )),
                 ctx.point_lookup_stats.clone(),
+                check,
             )?;
             if let Some(iter) = iter {
                 iters.push_back(iter);
@@ -429,20 +463,41 @@ async fn build_l0_range_iters(
         ctx.read_trace.clone(),
     ));
     let stats = ctx.db_stats.clone();
-    build_concurrent(l0.iter().cloned(), ctx.max_parallel, move |sst| {
+    // Prototype of RFC 0037: check each borrowed view first, so a skipped SST
+    // clones nothing.
+    let query = pinned_filter_query(&range, &opts, &table_store);
+    let slices = range.as_slice_range();
+    let checked: Vec<_> = l0
+        .iter()
+        .filter_map(|sst| {
+            match check_pinned_filters(
+                sst,
+                &slices,
+                query.as_ref(),
+                Some(&SstTraceLevel::L0),
+                &ctx.read_trace,
+                Some(&stats),
+            ) {
+                PinnedFilterCheck::Skip => None,
+                check => Some((sst.clone(), check)),
+            }
+        })
+        .collect();
+    build_concurrent(checked, ctx.max_parallel, move |(sst, check)| {
         let table_store = table_store.clone();
         let range = range.clone();
         let opts = opts.clone();
         let sst_tracing_context = sst_tracing_context.clone();
         let stats = stats.clone();
         async move {
-            SstIterator::new_owned_initialized_with_stats(
+            SstIterator::new_owned_initialized_checked(
                 range,
                 sst,
                 table_store,
                 opts,
                 sst_tracing_context,
                 Some(stats),
+                check,
             )
             .await
         }

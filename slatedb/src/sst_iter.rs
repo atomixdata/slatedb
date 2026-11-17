@@ -1057,6 +1057,27 @@ impl<'a> SstIterator<'a> {
         Ok(internal.map(|iter| Self::from_internal(iter, db_stats.clone(), None)))
     }
 
+    /// [`Self::new_owned_with_stats`] for an SST that [`check_pinned_filters`]
+    /// checked.
+    pub(crate) fn new_owned_checked<T: RangeBounds<Bytes>>(
+        range: T,
+        table: SsTableView,
+        table_store: Arc<TableStore>,
+        options: SstIteratorOptions,
+        tracing_context: Option<SstTracingContext>,
+        db_stats: Option<DbStats>,
+        check: PinnedFilterCheck,
+    ) -> Result<Option<Self>, SlateDBError> {
+        let passed = match check {
+            PinnedFilterCheck::Skip => return Ok(None),
+            PinnedFilterCheck::Passed(PassedFilter(filter)) => Some(filter),
+            PinnedFilterCheck::Unchecked => None,
+        };
+        let internal =
+            InternalSstIterator::new_owned(range, table, table_store, options, tracing_context)?;
+        Ok(internal.map(|iter| Self::from_internal(iter, db_stats, passed)))
+    }
+
     #[allow(dead_code)]
     pub(crate) fn new_owned<T: RangeBounds<Bytes>>(
         range: T,
@@ -1075,9 +1096,19 @@ impl<'a> SstIterator<'a> {
         table_store: Arc<TableStore>,
         options: SstIteratorOptions,
     ) -> Result<Option<Self>, SlateDBError> {
-        Self::new_owned_initialized_with_stats(range, table, table_store, options, None, None).await
+        Self::new_owned_initialized_checked(
+            range,
+            table,
+            table_store,
+            options,
+            None,
+            None,
+            PinnedFilterCheck::Unchecked,
+        )
+        .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn new_owned_initialized_with_stats<T: RangeBounds<Bytes>>(
         range: T,
         table: SsTableView,
@@ -1098,8 +1129,9 @@ impl<'a> SstIterator<'a> {
         .await
     }
 
-    /// [`Self::new_owned_initialized_with_stats`] for an SST that
-    /// [`check_pinned_filters`] checked.
+    /// Builds and initializes an iterator over an SST that
+    /// [`check_pinned_filters`] checked. Returns `None` when the SST holds
+    /// nothing for the read.
     pub(crate) async fn new_owned_initialized_checked<T: RangeBounds<Bytes>>(
         range: T,
         table: SsTableView,
