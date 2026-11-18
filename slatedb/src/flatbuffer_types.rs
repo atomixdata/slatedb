@@ -4,9 +4,7 @@ use std::sync::Arc;
 
 use bytes::{BufMut, Bytes, BytesMut};
 use chrono::{DateTime, Utc};
-use flatbuffers::{
-    FlatBufferBuilder, ForwardsUOffset, InvalidFlatbuffer, Vector, VerifierOptions, WIPOffset,
-};
+use flatbuffers::{FlatBufferBuilder, ForwardsUOffset, Vector, VerifierOptions, WIPOffset};
 use log::warn;
 use ulid::Ulid;
 
@@ -55,9 +53,7 @@ use crate::flatbuffer_types::root_generated::{
 };
 use crate::format::sst::SST_FORMAT_VERSION;
 use crate::manifest::{ExternalDb, LsmTreeState, Manifest, ManifestCore, Segment};
-use crate::partitioned_keyspace::RangePartitionedKeySpace;
 use crate::seq_tracker::SequenceTracker;
-use crate::utils::clamp_allocated_size_bytes;
 use slatedb_txn_obj::ObjectCodec;
 
 pub(crate) const MANIFEST_FORMAT_VERSION: u16 = 2;
@@ -72,54 +68,14 @@ pub(crate) const ORIGINAL_SST_FORMAT_VERSION: u16 = SST_FORMAT_VERSION;
 /// FlatBuffer verifier options with increased table limit.
 /// The default limit is 1M tables, but with compression enabled, SST files
 /// can have many more blocks than the uncompressed file size would suggest.
-fn verifier_options() -> VerifierOptions {
+pub(crate) fn verifier_options() -> VerifierOptions {
     VerifierOptions {
         max_tables: 1_000_000_000,
         ..Default::default()
     }
 }
 
-/// A wrapper around a `Bytes` buffer containing a FlatBuffer-encoded `SsTableIndex`.
-#[derive(PartialEq, Eq, Clone)]
-pub(crate) struct SsTableIndexOwned {
-    data: Bytes,
-}
-
-impl SsTableIndexOwned {
-    pub(crate) fn new(data: Bytes) -> Result<Self, InvalidFlatbuffer> {
-        flatbuffers::root_with_opts::<SsTableIndex>(&verifier_options(), &data)?;
-        Ok(Self { data })
-    }
-
-    pub(crate) fn borrow(&self) -> SsTableIndex<'_> {
-        let raw = &self.data;
-        unsafe { flatbuffers::root_unchecked::<SsTableIndex>(raw) }
-    }
-
-    pub(crate) fn data(&self) -> Bytes {
-        self.data.clone()
-    }
-
-    pub(crate) fn clamp_allocated_size(&self) -> Self {
-        Self::new(clamp_allocated_size_bytes(&self.data))
-            .expect("clamped buffer could not be decoded to index")
-    }
-
-    /// Returns the size of the SSTable index in bytes.
-    pub(crate) fn size(&self) -> usize {
-        self.data.len()
-    }
-}
-
-impl RangePartitionedKeySpace for SsTableIndex<'_> {
-    fn partitions(&self) -> usize {
-        self.block_meta().len()
-    }
-
-    fn partition_first_key(&self, partition: usize) -> &[u8] {
-        self.block_meta().get(partition).first_key().bytes()
-    }
-}
+pub(crate) use crate::format::sst_index::SsTableIndexOwned;
 
 #[derive(Clone)]
 pub(crate) struct FlatBufferSsTableInfoCodec {}
@@ -1563,8 +1519,9 @@ pub(crate) mod test_utils {
     use crate::flatbuffer_types::SsTableIndexOwned;
 
     pub(crate) fn assert_index_clamped(index1: &SsTableIndexOwned, index2: &SsTableIndexOwned) {
-        assert_eq!(index1.data, index2.data);
-        assert_ne!(index1.data.as_ptr(), index2.data.as_ptr());
+        // The decoded arrays have exact sizes and never refer to the read
+        // buffer, so a clamped index shares them and does not copy them.
+        assert!(index1.shares_arrays_with(index2));
     }
 }
 

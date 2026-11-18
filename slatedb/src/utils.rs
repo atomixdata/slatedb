@@ -223,7 +223,7 @@ pub(crate) async fn last_written_key_and_seq(
             None,
         )
         .await?;
-    let num_blocks = index.borrow().block_meta().len();
+    let num_blocks = index.len();
     if num_blocks == 0 {
         return Ok(None);
     }

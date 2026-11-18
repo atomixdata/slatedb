@@ -4202,7 +4202,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(!index.borrow().block_meta().is_empty());
+        assert!(!index.is_empty());
         assert_eq!(
             Some(Bytes::copy_from_slice(last_val.as_bytes())),
             db.get(b"key").await.unwrap()
@@ -5881,11 +5881,8 @@ mod tests {
             )
             .await
             .unwrap();
-        let borrowed = index.borrow();
-        borrowed
-            .block_meta()
-            .iter()
-            .map(|meta| (meta.offset(), u64::from(meta.encoded_len())))
+        (0..index.len())
+            .map(|block| (index.offset(block), u64::from(index.encoded_len(block))))
             .collect()
     }
 
