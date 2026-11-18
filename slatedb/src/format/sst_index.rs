@@ -2,28 +2,22 @@
 //!
 //! An index has one entry for each data block: the block offset, the block
 //! length, and the index key. An index key is a lower bound for the keys in
-//! its block. The first index key is empty. [`SsTableIndexOwned::new`]
-//! verifies the `SsTableIndex` FlatBuffer and copies it into three parts:
+//! its block. [`SsTableIndexOwned::new`] verifies the `SsTableIndex`
+//! FlatBuffer and copies it into two parts:
 //!
 //! 1. Flat arrays. Each field has its own array. All index keys are in one
-//!    buffer, with an array of end positions. A search reads only the keys and
-//!    their end positions.
-//! 2. Prefix values. The shared prefix is the prefix that all index keys but
-//!    the first share. The prefix value of a key is the 8 bytes after the
-//!    shared prefix, padded with zeros and read as a big-endian `u64`. If one
-//!    key is smaller than another, its prefix value is smaller or equal.
-//! 3. A static B+ tree over the prefix values. Each node is one cache line,
-//!    and the target architecture sets the node size at compile time. Each
-//!    upper level holds the first value of each node in the level below.
+//!    buffer, with an array of start positions.
+//! 2. A static B+ tree over prefix values. Each node has 128 bytes, aligned to
+//!    cache lines. Each node has its own shared prefix: the common prefix of
+//!    its boundary keys.
+//!    The prefix value of a key in a node is the 8 bytes of the key after that
+//!    prefix, padded with zeros and read as a big-endian `u64`.
 //!
-//! A search first finds the candidate blocks: the blocks whose prefix value
-//! equals the prefix value of the key. To find them, the search reads one tree
-//! node for each level. Only the candidates need a full key compare.
-//!
-//! The index builds the prefix values and the tree only if it has at least 2
-//! blocks, an empty first key, and no other empty key. At least half of the
-//! prefix values must also be distinct. Otherwise, a search is a binary search
-//! over the full keys.
+//! A search finds the candidate blocks: the blocks whose prefix value equals
+//! the prefix value of the key. The search goes down one node on each level,
+//! and the prefix values decide which child to go to. Only ties in the prefix
+//! values need an index key compare. In the leaf level, the tied blocks are
+//! the candidate blocks.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -42,170 +36,6 @@ pub(crate) struct SsTableIndexOwned {
     inner: Arc<IndexArrays>,
 }
 
-/// The flat arrays of an index, with one array for each field of a block.
-/// Block `i` is at position `i` in every array.
-///
-/// The arrays never change after [`SsTableIndexOwned::new`] builds them.
-#[derive(PartialEq, Eq)]
-struct IndexArrays {
-    /// The offset of each block in the SST.
-    offsets: Box<[u64]>,
-    /// The encoded length of each block. `None` when every length is zero.
-    encoded_lens: Option<Box<[u32]>>,
-    /// The first key of each block, one after the other.
-    keys: Box<[u8]>,
-    /// The end of each key in `keys`. Key `i` starts at the end of key `i - 1`.
-    key_ends: Box<[u32]>,
-    /// The prefix array, or `None` when it does not help the search.
-    prefixes: Option<PrefixArray>,
-}
-
-/// The prefix values of an index.
-///
-/// All index keys but the first start with the same bytes, the shared prefix.
-/// The bytes after the shared prefix tell the keys apart. The prefix value of
-/// a key is the first 8 of those bytes, padded with zeros and read as a
-/// big-endian `u64`. The prefix value of a block is the prefix value of its
-/// first key.
-#[derive(PartialEq, Eq)]
-struct PrefixArray {
-    /// The length of the shared prefix that all keys but the first share. The
-    /// shared prefix can be read from the start of the last key in `keys`.
-    shared_len: usize,
-    /// A copy of the shared prefix, if it is at most `INLINE_PREFIX_LEN` bytes
-    /// long.
-    shared_inline: [u8; INLINE_PREFIX_LEN],
-    /// A B+ tree over the prefix value of each block: the 8 key bytes after
-    /// the shared prefix, padded with zeros and read as big-endian.
-    btree: StaticBTree,
-}
-
-/// The size of a cache line on the target, in bytes.
-///
-/// Apple M-series CPUs have 128-byte lines. x86 and other ARM CPUs, such as
-/// AWS Graviton, have 64-byte lines. Other targets use 64.
-#[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
-pub(crate) const CACHE_LINE: usize = 128;
-#[cfg(not(all(target_arch = "aarch64", target_vendor = "apple")))]
-pub(crate) const CACHE_LINE: usize = 64;
-
-/// The number of values in one node of a [`StaticBTree`].
-const NODE_LEN: usize = CACHE_LINE / size_of::<u64>();
-
-/// One node of a [`StaticBTree`]: `NODE_LEN` values in one cache line.
-#[derive(Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(
-    all(target_arch = "aarch64", target_vendor = "apple"),
-    repr(C, align(128))
-)]
-#[cfg_attr(
-    not(all(target_arch = "aarch64", target_vendor = "apple")),
-    repr(C, align(64))
-)]
-struct Node([u64; NODE_LEN]);
-
-const _: () = assert!(size_of::<Node>() == CACHE_LINE && align_of::<Node>() == CACHE_LINE);
-
-impl Node {
-    /// Returns the number of values in the node that are at or below `target`.
-    #[inline]
-    fn count_le(&self, target: u64) -> usize {
-        self.0.iter().filter(|&&v| v <= target).count()
-    }
-}
-
-/// A B+ tree over sorted values.
-///
-/// It is static: it is built one time and never changes. It knows nothing
-/// about keys; [`PrefixArray`] maps keys to its values.
-#[derive(PartialEq, Eq)]
-struct StaticBTree {
-    /// The number of values.
-    len: usize,
-    /// The levels of the tree, from the leaves to the root.
-    ///
-    /// The leaf level, `levels[0]`, holds the values. Each next level holds
-    /// the first value of each node of the level before it. All levels are
-    /// padded with `u64::MAX` to whole nodes. The topmost level has one node.
-    levels: Box<[Box<[Node]>]>,
-}
-
-impl StaticBTree {
-    /// Builds the tree over sorted `values`.
-    fn new(values: &[u64]) -> Self {
-        let mut levels = vec![to_nodes(values.iter().copied())];
-        while levels[levels.len() - 1].len() > 1 {
-            let below = &levels[levels.len() - 1];
-            let next = to_nodes(below.iter().map(|node| node.0[0]));
-            levels.push(next);
-        }
-        Self {
-            len: values.len(),
-            levels: levels.into_boxed_slice(),
-        }
-    }
-
-    /// Returns the value at index `i`.
-    fn value(&self, i: usize) -> u64 {
-        self.levels[0][i / NODE_LEN].0[i % NODE_LEN]
-    }
-
-    /// Returns the number of values at or below `target`.
-    fn count_le(&self, target: u64) -> usize {
-        self.descend(self.levels.len() - 1, 0, target)
-    }
-
-    /// Descends the tree from node `node` at level `level` and counts the
-    /// values at or below `target`.
-    fn descend(&self, level: usize, mut node: usize, target: u64) -> usize {
-        for level in (1..=level).rev() {
-            // Each value in this node is the first value of one child.
-            // Count the number of children that start at or below `target`.
-            let count = self.levels[level][node].count_le(target);
-            // Go to the last of those children. A point search picks a block
-            // in the same way. If no child starts at or below `target`, go to
-            // the first child. Then limit the child index to the last node in
-            // the level below.
-            node = (node * NODE_LEN + count)
-                .saturating_sub(1)
-                .min(self.levels[level - 1].len() - 1);
-        }
-        // `node` is now a leaf. The values in the leaves before it are all at
-        // or below `target`, so add their number to the count in this leaf.
-        // The padding slots of the last leaf can add to the count if `target`
-        // is `u64::MAX`, so limit the result to the number of values.
-        (node * NODE_LEN + self.levels[0][node].count_le(target)).min(self.len)
-    }
-
-    /// Returns the memory of the nodes, in bytes.
-    fn size(&self) -> usize {
-        self.levels
-            .iter()
-            .map(|l| l.len() * size_of::<Node>())
-            .sum()
-    }
-}
-
-/// Packs `values` into nodes, and pads the last node with `u64::MAX`.
-fn to_nodes(values: impl ExactSizeIterator<Item = u64>) -> Box<[Node]> {
-    let mut nodes = vec![Node([u64::MAX; NODE_LEN]); values.len().div_ceil(NODE_LEN).max(1)];
-    for (i, v) in values.enumerate() {
-        nodes[i / NODE_LEN].0[i % NODE_LEN] = v;
-    }
-    nodes.into_boxed_slice()
-}
-
-/// The longest shared prefix that [`PrefixArray`] keeps a copy of.
-const INLINE_PREFIX_LEN: usize = 16;
-
-/// The longest run of equal prefix values that the search scans one by one.
-const MAX_LINEAR_STEP_BACK: usize = 8;
-
-/// The index keeps the prefix array only if at least one in
-/// `MIN_DISTINCT_DENOMINATOR` prefix values is distinct. With 2, at least half
-/// of the values must be distinct.
-const MIN_DISTINCT_DENOMINATOR: usize = 2;
-
 impl SsTableIndexOwned {
     /// Verifies an `SsTableIndex` FlatBuffer, and copies it into arrays.
     ///
@@ -222,7 +52,7 @@ impl SsTableIndexOwned {
 
     /// Returns the number of data blocks.
     pub(crate) fn len(&self) -> usize {
-        self.inner.offsets.len()
+        self.inner.len()
     }
 
     /// Returns whether the index has no data blocks.
@@ -236,7 +66,7 @@ impl SsTableIndexOwned {
         self.inner.offsets[block]
     }
 
-    /// Returns the first key of block `block`.
+    /// Returns the index key of block `block`.
     pub(crate) fn first_key(&self, block: usize) -> &[u8] {
         self.inner.key(block)
     }
@@ -290,124 +120,36 @@ impl SsTableIndexOwned {
 
     /// Returns the memory that the index uses, in bytes.
     pub(crate) fn size(&self) -> usize {
-        let a = &self.inner;
+        let index_arrays = &self.inner;
         size_of::<IndexArrays>()
-            + a.offsets.len() * size_of::<u64>()
-            + a.encoded_lens
+            + index_arrays.offsets.len() * size_of::<u64>()
+            + index_arrays
+                .encoded_lens
                 .as_ref()
                 .map_or(0, |l| l.len() * size_of::<u32>())
-            + a.keys.len()
-            + a.key_ends.len() * size_of::<u32>()
-            + a.prefixes.as_ref().map_or(0, |p| p.btree.size())
+            + index_arrays.index_keys.len()
+            + index_arrays.key_ends.len() * size_of::<u32>()
+            + index_arrays.tree.as_ref().map_or(0, |t| t.size())
     }
 
-    /// Returns the number of blocks whose first key is at or below `key`. If
-    /// `inclusive` is false, returns the number of blocks whose first key is
+    /// Returns the number of blocks whose index key is at or below `key`. If
+    /// `inclusive` is false, returns the number of blocks whose index key is
     /// below `key`.
     ///
     /// The result is the position where `key` would be inserted, as in
     /// `slice::partition_point`. The block that can hold `key` is the block
     /// before it.
     fn partition_point(&self, key: &[u8], inclusive: bool) -> usize {
-        let a = &self.inner;
-        let candidates = a.candidates(key);
+        let index_arrays = &self.inner;
+        let candidates = index_arrays.candidates(key, inclusive);
         partition_point_by_predicate(candidates.start, candidates.end, |block| {
-            let k = a.key(block);
+            let k = index_arrays.key(block);
             if inclusive {
                 k <= key
             } else {
                 k < key
             }
         })
-    }
-}
-
-/// Returns the first position in `low..high` for which `pred` is false. `pred`
-/// must be true for a contiguous start of the range.
-fn partition_point_by_predicate(
-    mut low: usize,
-    mut high: usize,
-    pred: impl Fn(usize) -> bool,
-) -> usize {
-    while low < high {
-        let mid = low + (high - low) / 2;
-        if pred(mid) {
-            low = mid + 1;
-        } else {
-            high = mid;
-        }
-    }
-    low
-}
-
-impl IndexArrays {
-    /// Returns the candidate blocks for `key`: the blocks whose prefix value
-    /// equals the prefix value of `key`. The returned candidates are the
-    /// blocks that need a full key compare to decide whether they can hold
-    /// `key`.
-    ///
-    /// Every block before the range has a first key below `key`. Every block
-    /// after the range has a first key above `key`. The range is empty if no
-    /// block has the same prefix value.
-    ///
-    /// If `key` does not start with the shared prefix, the shared prefix alone
-    /// decides the order. The range is then empty, or it holds only the first
-    /// block, whose key is empty. If the index has no prefix array, the range
-    /// holds all blocks.
-    fn candidates(&self, key: &[u8]) -> Range<usize> {
-        let n = self.offsets.len();
-        let Some(prefixes) = &self.prefixes else {
-            return 0..n;
-        };
-        let shared = if prefixes.shared_len <= INLINE_PREFIX_LEN {
-            &prefixes.shared_inline[..prefixes.shared_len]
-        } else {
-            &self.key(n - 1)[..prefixes.shared_len]
-        };
-        if !key.starts_with(shared) {
-            // Every key but the first starts with `shared`, and the first key
-            // is empty. If `key` is above `shared`, it is above every key.
-            // Otherwise it is below every key but the first. An empty `key`
-            // equals the first key, so it needs the full compare.
-            if key > shared {
-                return n..n;
-            }
-            if key.is_empty() {
-                return 0..1;
-            }
-            return 1..1;
-        }
-        let target = head(key, prefixes.shared_len);
-        let btree = &prefixes.btree;
-        // The values are in key order. A smaller value means a smaller key, and
-        // a larger value means a larger key. Only the keys with an equal value
-        // need a full compare.
-        let end = btree.count_le(target);
-        if end == 0 || btree.value(end - 1) != target {
-            return end..end;
-        }
-        // Step back over the run of equal values. With distinct values, the run
-        // is one block long, so the loop reads one more value and stops.
-        let mut start = end - 1;
-        let mut steps = 0;
-        while start > 0 && btree.value(start - 1) == target {
-            steps += 1;
-            if steps > MAX_LINEAR_STEP_BACK {
-                start = partition_point_by_predicate(0, start, |i| btree.value(i) < target);
-                break;
-            }
-            start -= 1;
-        }
-        start..end
-    }
-
-    fn key(&self, block: usize) -> &[u8] {
-        let start = if block == 0 {
-            0
-        } else {
-            self.key_ends[block - 1] as usize
-        };
-        &self.keys[start..self.key_ends[block] as usize]
     }
 }
 
@@ -429,73 +171,418 @@ impl RangePartitionedKeySpace for SsTableIndexOwned {
     }
 
     fn partitions_covering_key(&self, key: &[u8]) -> Range<usize> {
-        let a = &self.inner;
-        let candidates = a.candidates(key);
-        // Blocks before `first_equal` start below `key`. The blocks from
-        // `first_equal` to `end` start with `key`. If the candidates are empty,
-        // no block starts with `key`, and no full key compare happens.
+        let index_arrays = &self.inner;
+        let candidates = index_arrays.candidates(key, false);
+        // Blocks before `first_equal` have an index key below `key`. The blocks
+        // from `first_equal` to `end` have an index key equal to `key`. These
+        // blocks can go past the candidates, into the next leaf.
         let first_equal = partition_point_by_predicate(candidates.start, candidates.end, |block| {
-            a.key(block) < key
+            index_arrays.key(block) < key
         });
+        // Read the key at `first_equal` only if it can equal `key`: when the
+        // block is a candidate, or is the first block of the next leaf, which
+        // this search did not count. Any other block after the candidates has
+        // a larger prefix value, so its index key is above `key`.
+        let may_equal = first_equal < candidates.end || first_equal % NUM_ENTRIES_PER_NODE == 0;
         let mut end = first_equal;
-        while end < candidates.end && a.key(end) == key {
+        while may_equal && end < self.len() && index_arrays.key(end) == key {
             end += 1;
         }
-        // The block before the first candidate starting at `key` may still end
-        // with `key`.
+        // The block before `first_equal` can still hold `key`.
         first_equal.saturating_sub(1)..end
     }
 }
 
+/// The flat arrays of an index, with one array for each field of a block.
+/// Block `i` is at position `i` in every array.
+///
+/// The arrays never change after [`SsTableIndexOwned::new`] builds them.
+#[derive(PartialEq, Eq)]
+struct IndexArrays {
+    /// The offset of each block in the SST.
+    offsets: Box<[u64]>,
+    /// The encoded length of each block. `None` when every length is zero.
+    encoded_lens: Option<Box<[u32]>>,
+    /// The index key of each block, one after the other.
+    index_keys: Box<[u8]>,
+    /// The start of each key in `index_keys`, and then the end of the last
+    /// key. Key `i` is `index_keys[key_ends[i]..key_ends[i + 1]]`.
+    key_ends: Box<[u32]>,
+    /// The tree over the prefix values, or `None` for an empty index.
+    tree: Option<StaticBTree>,
+}
+
+impl IndexArrays {
+    /// Returns the candidate blocks for `key`.
+    ///
+    /// See [`StaticBTree::candidates`] for details.
+    fn candidates(&self, key: &[u8], inclusive: bool) -> Range<usize> {
+        match &self.tree {
+            Some(tree) => tree.candidates(key, inclusive, self),
+            // If the index is empty, the range is empty.
+            None => 0..0,
+        }
+    }
+
+    fn key(&self, block: usize) -> &[u8] {
+        &self.index_keys[self.key_ends[block] as usize..self.key_ends[block + 1] as usize]
+    }
+
+    fn len(&self) -> usize {
+        self.offsets.len()
+    }
+}
+
+/// The number of entries below a target, and the number at or below it.
+///
+/// The entries from `lt` to `le` equal the target: they are the ties.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Count {
+    /// The number of entries below the target.
+    lt: usize,
+    /// The number of entries at or below the target.
+    le: usize,
+}
+
+impl Count {
+    fn new(lt: usize, le: usize) -> Self {
+        Self { lt, le }
+    }
+
+    /// Limits both numbers to `real`, the number of entries that are not
+    /// padding.
+    fn clamp(self, real: usize) -> Self {
+        Self {
+            lt: self.lt.min(real),
+            le: self.le.min(real),
+        }
+    }
+}
+
+/// The size of one node of a [`StaticBTree`], in bytes.
+///
+/// A node is one cache line on CPUs with 128-byte lines. On CPUs with 64-byte
+/// cache lines, such as x86 and AWS Graviton, a node is two adjacent lines.
+/// These CPUs usually fetch the two lines together, and a node of 128 bytes
+/// holds twice as many entries as a node of one line, so the tree has fewer
+/// levels. In benchmarks on Graviton and x86, 128-byte nodes were faster than
+/// 64-byte nodes.
+pub(crate) const NODE_BYTES: usize = 128;
+
+/// The number of entries in one node. The first 8 bytes of a node hold the
+/// location of its shared prefix, and each entry is one `u64`.
+const NUM_ENTRIES_PER_NODE: usize = NODE_BYTES / size_of::<u64>() - 1;
+
+/// One node of a [`StaticBTree`]: the location of the shared prefix, then up
+/// to `NUM_ENTRIES_PER_NODE` entries, padded with `u64::MAX`.
+///
+/// The shared prefix is the start of the lower boundary key of the node, so
+/// its bytes are already in `index_keys`. The node stores only where they
+/// start there, and the prefix length.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(C, align(128))]
+struct Node {
+    /// The start of the shared prefix in `index_keys`.
+    prefix_start: u32,
+    /// The length of the shared prefix.
+    prefix_len: u32,
+    /// The entries. Each entry holds the prefix value of the index key of one
+    /// block. The padding is `u64::MAX`.
+    entries: [u64; NUM_ENTRIES_PER_NODE],
+}
+
+impl Node {
+    /// Builds node `node_idx` of `level`.
+    fn build(arrays: &IndexArrays, level: &Level, node_idx: usize) -> Self {
+        let (prefix_start, prefix_len) = level.node_prefix(arrays, node_idx);
+        let mut node = Node {
+            prefix_start,
+            prefix_len,
+            entries: [u64::MAX; NUM_ENTRIES_PER_NODE],
+        };
+        let skip = node.prefix_len();
+        for (entry, entry_idx) in node.entries.iter_mut().zip(level.node_entries(node_idx)) {
+            *entry = head(arrays.key(level.block(entry_idx)), skip);
+        }
+        node
+    }
+
+    fn prefix_len(&self) -> usize {
+        self.prefix_len as usize
+    }
+
+    /// Returns the bytes of the shared prefix, from `index_keys`.
+    fn prefix<'a>(&self, index_keys: &'a [u8]) -> &'a [u8] {
+        let start = self.prefix_start as usize;
+        &index_keys[start..start + self.prefix_len()]
+    }
+
+    /// Counts the entries of the node against `target`.
+    #[inline]
+    fn count(&self, target: u64) -> Count {
+        let (mut lt, mut le) = (0, 0);
+        for &entry in &self.entries {
+            lt += usize::from(entry < target);
+            le += usize::from(entry <= target);
+        }
+        Count::new(lt, le)
+    }
+}
+
+const _: () = assert!(size_of::<Node>() == NODE_BYTES && align_of::<Node>() == NODE_BYTES);
+
+/// One level of a [`StaticBTree`].
+///
+/// An entry is one slot in one of the nodes on the level, and holds one
+/// prefix value. On level 0 it stands for a block, and on a higher level it
+/// stands for a node of the level below.
+#[derive(PartialEq, Eq)]
+struct Level {
+    nodes: Box<[Node]>,
+    /// The number of entries on the level.
+    num_entries: usize,
+    /// The number of blocks for each entry: `NUM_ENTRIES_PER_NODE^l` on level
+    /// `l`.
+    stride: usize,
+}
+
+impl Level {
+    /// Builds a level of `num_entries` entries, with `stride` blocks for each
+    /// entry.
+    fn build(arrays: &IndexArrays, stride: usize, num_entries: usize) -> Self {
+        let mut level = Self {
+            nodes: Box::default(),
+            num_entries,
+            stride,
+        };
+        let num_nodes = num_entries.div_ceil(NUM_ENTRIES_PER_NODE);
+        let nodes = (0..num_nodes)
+            .map(|node_idx| Node::build(arrays, &level, node_idx))
+            .collect();
+        level.nodes = nodes;
+        level
+    }
+
+    /// Returns the entries of node `node_idx`.
+    #[inline]
+    fn node_entries(&self, node_idx: usize) -> Range<usize> {
+        let first_entry = node_idx * NUM_ENTRIES_PER_NODE;
+        first_entry..(first_entry + NUM_ENTRIES_PER_NODE).min(self.num_entries)
+    }
+
+    /// Returns the block of entry `entry_idx`.
+    fn block(&self, entry_idx: usize) -> usize {
+        entry_idx * self.stride
+    }
+
+    /// Returns the shared prefix of node `node_idx`, as its start in
+    /// `index_keys` and its length: the common prefix of the boundary keys,
+    /// at the start of the lower boundary key.
+    fn node_prefix(&self, arrays: &IndexArrays, node_idx: usize) -> (u32, u32) {
+        let (lower_block, upper_block) = self.boundary_blocks(arrays, node_idx);
+        let len = common_prefix_len(arrays.key(lower_block), arrays.key(upper_block));
+        // A prefix is part of a key, and `decode_index` makes sure that all
+        // keys fit in `u32` positions.
+        (arrays.key_ends[lower_block], len as u32)
+    }
+
+    /// Returns the blocks of the boundary keys of node `node_idx`.
+    ///
+    /// Usually, the lower boundary key is the first key of the node, and the
+    /// upper boundary key is the first key of the next node on the level.
+    /// There are two special cases:
+    ///
+    /// 1. If the node starts with an empty key and has a second key, the lower
+    ///    boundary key is the second key.
+    /// 2. The last node of a level has no next node, so its upper boundary key
+    ///    is its own last key.
+    fn boundary_blocks(&self, arrays: &IndexArrays, node_idx: usize) -> (usize, usize) {
+        let entries = self.node_entries(node_idx);
+        let mut lower_entry_idx = entries.start;
+        if arrays.key(self.block(lower_entry_idx)).is_empty() && entries.len() >= 2 {
+            lower_entry_idx += 1;
+        }
+        let upper_entry_idx = if entries.end < self.num_entries {
+            entries.end
+        } else {
+            entries.end - 1
+        };
+        (self.block(lower_entry_idx), self.block(upper_entry_idx))
+    }
+}
+
+/// A static B+ tree over prefix values, with a shared prefix for each node.
+///
+/// It is built one time and never changes. Entry `i` of level `l` stands for
+/// block `i * NUM_ENTRIES_PER_NODE^l`, the first block below it. It holds the
+/// prefix value of the index key of that block, at the shared prefix of its
+/// node.
+///
+/// The shared prefix of a node is the common prefix of its two boundary keys
+/// (see [`Level::boundary_blocks`]). The keys between the boundary keys all
+/// start with it. So the prefix values of the node use only the bytes after it.
+///
+/// In most nodes, the search key is between the boundary keys, because the
+/// parent node sent the search there. So the search key also starts with the
+/// shared prefix, and the search skips it without a compare.
+///
+/// The first and the last node of a level are different. A search key below
+/// every index key reaches the first node, and a search key above every
+/// index key reaches the last node. Such a key can be outside the boundary
+/// keys. So in these two nodes, [`StaticBTree::count_first_or_last_node`]
+/// compares the search key with the prefix bytes first.
+#[derive(PartialEq, Eq)]
+struct StaticBTree {
+    /// The levels of the tree, from the leaves to the root.
+    levels: Box<[Level]>,
+    /// Whether the first index key is empty.
+    first_key_empty: bool,
+}
+
+impl StaticBTree {
+    /// Builds the tree over the index keys of `arrays`, which must have at
+    /// least one block.
+    fn new(arrays: &IndexArrays) -> Self {
+        let n = arrays.len();
+        debug_assert!(n > 0);
+        let mut levels = Vec::new();
+        let (mut len, mut stride) = (n, 1usize);
+        loop {
+            let level = Level::build(arrays, stride, len);
+            let num_nodes = level.nodes.len();
+            levels.push(level);
+            if num_nodes == 1 {
+                break;
+            }
+            len = num_nodes;
+            stride = stride.saturating_mul(NUM_ENTRIES_PER_NODE);
+        }
+        Self {
+            levels: levels.into_boxed_slice(),
+            first_key_empty: arrays.key(0).is_empty(),
+        }
+    }
+
+    /// Returns the candidate blocks for `key`: the blocks whose prefix value
+    /// equals the prefix value of `key`. Only these blocks need an index key
+    /// compare to decide whether they can hold `key`.
+    ///
+    /// If `inclusive`, every block before the range has an index key at or
+    /// below `key`, and every block after it has an index key above `key`.
+    /// Otherwise, every block before the range has an index key below `key`,
+    /// and every block after it has an index key at or above `key`.
+    fn candidates(&self, key: &[u8], inclusive: bool, arrays: &IndexArrays) -> Range<usize> {
+        let mut node_idx = 0;
+        for (depth, level) in self.levels.iter().enumerate().rev() {
+            let first_entry_idx = node_idx * NUM_ENTRIES_PER_NODE;
+            let count = self.count_node(level, node_idx, key, arrays);
+            if depth == 0 {
+                return (first_entry_idx + count.lt)..(first_entry_idx + count.le);
+            }
+            // Above the leaves, each tied entry is a child. The search compares
+            // the first index key of each tied child, and descends to the last
+            // child whose index key is below the key, or at or below it if
+            // `inclusive`.
+            let child_idx = partition_point_by_predicate(count.lt, count.le, |pos| {
+                let k = arrays.key(level.block(first_entry_idx + pos));
+                if inclusive {
+                    k <= key
+                } else {
+                    k < key
+                }
+            });
+            node_idx = (first_entry_idx + child_idx)
+                .saturating_sub(1)
+                .min(self.levels[depth - 1].nodes.len() - 1);
+        }
+        0..0
+    }
+
+    /// Counts the entries of node `node_idx` of `level` against `key`. The
+    /// count leaves out the padding.
+    #[inline]
+    fn count_node(
+        &self,
+        level: &Level,
+        node_idx: usize,
+        key: &[u8],
+        arrays: &IndexArrays,
+    ) -> Count {
+        let node = &level.nodes[node_idx];
+        let is_first = node_idx == 0;
+        let is_first_or_last = is_first || node_idx + 1 == level.nodes.len();
+        let count = if is_first_or_last && node.prefix_len() > 0 {
+            self.count_first_or_last_node(node, key, node.prefix(&arrays.index_keys), is_first)
+        } else {
+            node.count(head(key, node.prefix_len()))
+        };
+        count.clamp(level.node_entries(node_idx).len())
+    }
+
+    /// Counts like [`Node::count`] in the first or last node of a level, where
+    /// the search key can be outside the boundary keys. `prefix` is the shared
+    /// prefix of the node.
+    fn count_first_or_last_node(
+        &self,
+        node: &Node,
+        key: &[u8],
+        prefix: &[u8],
+        is_first: bool,
+    ) -> Count {
+        if key.starts_with(prefix) {
+            return node.count(head(key, prefix.len()));
+        }
+        if key > prefix {
+            return Count::new(NUM_ENTRIES_PER_NODE, NUM_ENTRIES_PER_NODE);
+        }
+        // `key` is below every key of the node, except an empty first index
+        // key.
+        match (is_first && self.first_key_empty, key.is_empty()) {
+            (true, true) => Count::new(0, 1),
+            (true, false) => Count::new(1, 1),
+            (false, _) => Count::new(0, 0),
+        }
+    }
+
+    /// Returns the memory of the nodes, in bytes.
+    fn size(&self) -> usize {
+        self.levels
+            .iter()
+            .map(|l| l.nodes.len() * size_of::<Node>() + size_of::<Level>())
+            .sum::<usize>()
+    }
+}
+
+/// Returns the length of the common prefix of `a` and `b`.
+fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
+    a.iter().zip(b).take_while(|(x, y)| x == y).count()
+}
+
+/// Returns the first position in `low..high` for which `pred` is false.
+fn partition_point_by_predicate(
+    mut low: usize,
+    mut high: usize,
+    predicate: impl Fn(usize) -> bool,
+) -> usize {
+    while low < high {
+        let mid = low + (high - low) / 2;
+        if predicate(mid) {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    low
+}
+
 /// Returns the 8 bytes of `key` after its first `skip` bytes, padded with
-/// zeros, as a big-endian `u64`.
+/// zeros, as a big-endian `u64`. A key with at most `skip` bytes gives 0.
 fn head(key: &[u8], skip: usize) -> u64 {
-    let rest = &key[skip..];
+    let rest = key.get(skip..).unwrap_or(&[]);
     let len = rest.len().min(8);
     let mut bytes = [0u8; 8];
     bytes[..len].copy_from_slice(&rest[..len]);
     u64::from_be_bytes(bytes)
-}
-
-/// Builds the prefix array, or returns `None` when it does not help the search.
-///
-/// The index must have at least 2 blocks, an empty first key, and no other
-/// empty key, as `compute_index_key` makes them.
-fn build_prefixes<'a>(n: usize, key: impl Fn(usize) -> &'a [u8]) -> Option<PrefixArray> {
-    if n < 2 || !key(0).is_empty() || (1..n).any(|block| key(block).is_empty()) {
-        return None;
-    }
-    let first = key(1);
-    let last = key(n - 1);
-    let shared_len = first.iter().zip(last).take_while(|(a, b)| a == b).count();
-    let values: Vec<u64> = (0..n)
-        .map(|block| {
-            let k = key(block);
-            // Only the empty first key, or a key in an unsorted index, is
-            // shorter.
-            if k.len() < shared_len {
-                0
-            } else {
-                head(k, shared_len)
-            }
-        })
-        .collect();
-    // If few values are distinct, most searches compare full keys, and the
-    // array does not help.
-    let rest = &values[1..];
-    let distinct = 1 + rest.windows(2).filter(|w| w[0] != w[1]).count();
-    if distinct * MIN_DISTINCT_DENOMINATOR < rest.len() {
-        return None;
-    }
-    let mut shared_inline = [0u8; INLINE_PREFIX_LEN];
-    if shared_len <= INLINE_PREFIX_LEN {
-        shared_inline[..shared_len].copy_from_slice(&last[..shared_len]);
-    }
-    Some(PrefixArray {
-        shared_len,
-        shared_inline,
-        btree: StaticBTree::new(&values),
-    })
 }
 
 /// Copies a verified `SsTableIndex` into arrays.
@@ -506,41 +593,34 @@ fn decode_index(index: SsTableIndex<'_>) -> Result<IndexArrays, InvalidFlatbuffe
 
     let mut offsets = Vec::with_capacity(n);
     let mut encoded_lens = Vec::with_capacity(n);
-    let mut keys = Vec::with_capacity(key_bytes);
-    let mut key_ends = Vec::with_capacity(n);
+    let mut index_keys = Vec::with_capacity(key_bytes);
+    let mut key_ends = Vec::with_capacity(n + 1);
+    key_ends.push(0);
     for meta in block_meta.iter() {
         offsets.push(meta.offset());
         encoded_lens.push(meta.encoded_len());
-        keys.extend_from_slice(meta.first_key().bytes());
+        index_keys.extend_from_slice(meta.first_key().bytes());
         // The verifier limits the size of the buffer that it accepts to 2 GiB.
-        key_ends
-            .push(u32::try_from(keys.len()).map_err(|_| InvalidFlatbuffer::ApparentSizeTooLarge)?);
+        key_ends.push(
+            u32::try_from(index_keys.len()).map_err(|_| InvalidFlatbuffer::ApparentSizeTooLarge)?,
+        );
     }
-    let keys = keys.into_boxed_slice();
-    let key_ends = key_ends.into_boxed_slice();
-    let prefixes = {
-        let key = |block: usize| {
-            let start = if block == 0 {
-                0
-            } else {
-                key_ends[block - 1] as usize
-            };
-            &keys[start..key_ends[block] as usize]
-        };
-        build_prefixes(n, key)
-    };
     let encoded_lens = if encoded_lens.iter().all(|&len| len == 0) {
         None
     } else {
         Some(encoded_lens.into_boxed_slice())
     };
-    Ok(IndexArrays {
+    let mut arrays = IndexArrays {
         offsets: offsets.into_boxed_slice(),
         encoded_lens,
-        keys,
-        key_ends,
-        prefixes,
-    })
+        index_keys: index_keys.into_boxed_slice(),
+        key_ends: key_ends.into_boxed_slice(),
+        tree: None,
+    };
+    if n > 0 {
+        arrays.tree = Some(StaticBTree::new(&arrays));
+    }
+    Ok(arrays)
 }
 
 #[cfg(feature = "bench-internal")]
@@ -590,14 +670,14 @@ mod tests {
         SsTableIndexOwned::new(build(&blocks)).unwrap()
     }
 
-    /// Sorted keys that share a prefix, with an empty first key, as
+    /// Sorted keys that share a prefix, with an empty first index key, as
     /// `compute_index_key` makes them.
     fn sorted_keys() -> impl Strategy<Value = Vec<Vec<u8>>> {
         sorted_keys_from(0u8..4, 1..200, Just(true))
     }
 
     /// Like [`sorted_keys`], with suffix bytes from `bytes` and `count` keys.
-    /// The first key is empty when `empty_first` gives `true`.
+    /// The first index key is empty when `empty_first` gives `true`.
     fn sorted_keys_from(
         bytes: impl Strategy<Value = u8>,
         count: Range<usize>,
@@ -650,32 +730,36 @@ mod tests {
     }
 
     #[test]
-    fn should_skip_prefix_array_when_few_values_are_distinct() {
-        // The shared prefix is `p/`, and the next 8 bytes take only two values.
-        let keys: Vec<Vec<u8>> = std::iter::once(Vec::new())
-            .chain([b"aaaaaaaa", b"bbbbbbbb"].iter().flat_map(|group| {
-                (0..32u8).map(move |i| [b"p/".as_slice(), *group, &[i]].concat())
-            }))
-            .collect();
-        let index = build_keys(&keys);
-        assert!(index.inner.prefixes.is_none());
-        assert_eq!(index.partition_point_le(&keys[10]), 11);
-        assert_eq!(index.partition_point_lt(&keys[40]), 40);
+    fn should_count_node_entries() {
+        let mut node = Node {
+            prefix_start: 0,
+            prefix_len: 3,
+            entries: [u64::MAX; NUM_ENTRIES_PER_NODE],
+        };
+        node.entries[..4].copy_from_slice(&[0, 5, 5, 9]);
+        assert_eq!(node.prefix_len(), 3);
+        assert_eq!(node.count(0), Count::new(0, 1));
+        assert_eq!(node.count(5), Count::new(1, 3));
+        assert_eq!(node.count(7), Count::new(3, 3));
+        assert_eq!(node.count(10), Count::new(4, 4));
+        // The padding equals `u64::MAX`, so it counts as at or below it. The
+        // search clamps the counts to the real entries.
+        assert_eq!(node.count(u64::MAX), Count::new(4, NUM_ENTRIES_PER_NODE));
+        assert_eq!(node.count(u64::MAX).clamp(4), Count::new(4, 4));
     }
 
     #[test]
-    fn should_build_prefix_array_only_with_one_empty_first_key() {
-        let has_prefixes = |keys: &[&[u8]]| {
+    fn should_build_tree_unless_empty() {
+        let has_tree = |keys: &[&[u8]]| {
             let keys: Vec<Vec<u8>> = keys.iter().map(|k| k.to_vec()).collect();
-            build_keys(&keys).inner.prefixes.is_some()
+            build_keys(&keys).inner.tree.is_some()
         };
-        assert!(has_prefixes(&[b"", b"p/a", b"p/b"]));
-        // One block.
-        assert!(!has_prefixes(&[b""]));
-        // The first key is not empty.
-        assert!(!has_prefixes(&[b"p/a", b"p/b", b"p/c"]));
-        // A second empty key.
-        assert!(!has_prefixes(&[b"", b"", b"p/a", b"p/b"]));
+        assert!(!has_tree(&[]));
+        assert!(has_tree(&[b""]));
+        assert!(has_tree(&[b"p/a"]));
+        assert!(has_tree(&[b"", b"p/a"]));
+        // The first index key need not be empty, as in a WAL SST.
+        assert!(has_tree(&[b"p/a", b"p/b", b"p/c"]));
     }
 
     /// The verifier does not check that the keys are sorted. With unsorted
@@ -685,7 +769,7 @@ mod tests {
     fn should_search_unsorted_keys_without_panic() {
         let long = |c: u8| [vec![b'x'; 20], vec![c]].concat();
         let cases: Vec<Vec<Vec<u8>>> = vec![
-            // A shared prefix of `p/`, with the values out of order.
+            // A shared prefix of `p/`, with the keys out of order.
             vec![
                 b"".to_vec(),
                 b"p/zz".to_vec(),
@@ -712,7 +796,7 @@ mod tests {
         ];
         for keys in cases {
             let index = build_keys(&keys);
-            assert!(index.inner.prefixes.is_some());
+            assert!(index.inner.tree.is_some());
             check_in_range(&index, &keys);
         }
     }
@@ -736,7 +820,7 @@ mod tests {
     }
 
     /// Makes sure that the index search gives the same results as a binary
-    /// search over the full keys, for `targets` and for keys at, after, and
+    /// search over the index keys, for `targets` and for keys at, after, and
     /// before about 20 of `keys`.
     fn check_search(keys: &[Vec<u8>], targets: Vec<Vec<u8>>) -> Result<(), TestCaseError> {
         let index = build_keys(keys);
@@ -772,29 +856,52 @@ mod tests {
 
     #[test]
     fn should_build_tree_levels() {
-        let values: Vec<u64> = (0..300).collect();
-        let tree = StaticBTree::new(&values);
-        // Each level has one node for each `NODE_LEN` nodes of the level
-        // below, until one node is left. With 16 values in each node, 300
-        // values need 19, 2, and 1 nodes. With 8, they need 38, 5, and 1.
-        let nodes: Vec<usize> = tree.levels.iter().map(|l| l.len()).collect();
-        let mut expected = vec![300usize.div_ceil(NODE_LEN)];
+        // An empty first index key, then `k` and a 3-byte number.
+        let keys: Vec<Vec<u8>> = std::iter::once(Vec::new())
+            .chain((1..302u32).map(|i| [&b"k"[..], &i.to_be_bytes()[1..]].concat()))
+            .collect();
+        let index = build_keys(&keys);
+        let tree = index.inner.tree.as_ref().unwrap();
+        // Each level has one node for each `NUM_ENTRIES_PER_NODE` entries of
+        // the level below, until one node is left.
+        let nodes: Vec<usize> = tree.levels.iter().map(|l| l.nodes.len()).collect();
+        let mut expected = vec![302usize.div_ceil(NUM_ENTRIES_PER_NODE)];
         while expected[expected.len() - 1] > 1 {
-            expected.push(expected[expected.len() - 1].div_ceil(NODE_LEN));
+            expected.push(expected[expected.len() - 1].div_ceil(NUM_ENTRIES_PER_NODE));
         }
         assert_eq!(nodes, expected);
-        // Each separator is the first value of its child.
-        let l = NODE_LEN as u64;
-        assert_eq!(tree.levels[1][0].0[1], l);
-        assert_eq!(tree.levels[1][1].0[0], l * l);
-        assert_eq!(tree.levels[2][0].0[..2], [0, l * l]);
-        // 300 is not a multiple of the node size, so the last leaf has padding.
-        assert_eq!(tree.levels[0][nodes[0] - 1].0[NODE_LEN - 1], u64::MAX);
-        assert_eq!(tree.count_le(u64::MAX), 300);
-        assert_eq!(tree.count_le(150), 151);
-        assert_eq!(tree.count_le(256), 257);
-        assert_eq!(StaticBTree::new(&[1, 2]).count_le(0), 0);
-        assert_eq!(StaticBTree::new(&[]).count_le(u64::MAX), 0);
+        // The second leaf holds keys `NUM_ENTRIES_PER_NODE` to
+        // `2 * NUM_ENTRIES_PER_NODE - 1`. Its boundary keys share `k`, the
+        // first number byte, and the start of the second one.
+        let leaf = &tree.levels[0].nodes[1];
+        let lower = &keys[NUM_ENTRIES_PER_NODE];
+        let upper = &keys[2 * NUM_ENTRIES_PER_NODE];
+        let prefix_len = common_prefix_len(lower, upper);
+        let index_keys = &index.inner.index_keys;
+        assert_eq!(leaf.prefix_len(), prefix_len);
+        assert_eq!(leaf.prefix(index_keys), &lower[..prefix_len]);
+        assert_eq!(leaf.entries[0], head(lower, prefix_len));
+        // The first leaf starts with the empty key, so its lower boundary key
+        // is key 1.
+        assert_eq!(tree.levels[0].nodes[0].entries[0], 0);
+        let first_len = common_prefix_len(&keys[1], &keys[NUM_ENTRIES_PER_NODE]);
+        assert_eq!(tree.levels[0].nodes[0].prefix_len(), first_len);
+        assert_eq!(
+            tree.levels[0].nodes[0].prefix(index_keys),
+            &keys[1][..first_len]
+        );
+        // Each upper entry holds the prefix value of the index key of a child,
+        // at the prefix of its node.
+        let upper_node = &tree.levels[1].nodes[0];
+        assert_eq!(
+            upper_node.entries[1],
+            head(&keys[NUM_ENTRIES_PER_NODE], upper_node.prefix_len())
+        );
+        // 302 is not a multiple of the node size, so the last leaf has padding.
+        assert_eq!(
+            tree.levels[0].nodes[nodes[0] - 1].entries[NUM_ENTRIES_PER_NODE - 1],
+            u64::MAX
+        );
     }
 
     proptest! {
@@ -819,57 +926,22 @@ mod tests {
             check_search(&keys, targets)?;
         }
 
-        /// Without an empty first key, the index has no prefix array, and the
-        /// search is a binary search over the full keys.
+        /// Without an empty first index key, as in a WAL SST.
         #[test]
-        fn should_search_without_prefix_array_like_binary_search(
+        fn should_search_without_empty_first_key_like_binary_search(
             keys in sorted_keys_from(0u8..4, 1..200, Just(false)),
             targets in vec(vec(any::<u8>(), 0..16), 1..20),
         ) {
-            // An empty shared prefix and an empty suffix can still make an
-            // empty first key.
-            prop_assume!(!keys[0].is_empty());
-            prop_assert!(build_keys(&keys).inner.prefixes.is_none());
             check_search(&keys, targets)?;
         }
 
-        #[test]
-        fn should_count_like_partition_point(
-            len in 0usize..5000,
-            seed in any::<u64>(),
-            targets in vec(any::<u64>(), 1..20),
-        ) {
-            // The values come from a seed, because proptest generates large
-            // vectors slowly. A quarter of them are small, and some are 0 or
-            // u64::MAX, so values repeat.
-            let mut x = seed;
-            let mut values: Vec<u64> = (0..len)
-                .map(|_| {
-                    x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-                    match x >> 61 {
-                        0 => 0,
-                        1 => u64::MAX,
-                        2 | 3 => x % 64,
-                        _ => x,
-                    }
-                })
-                .collect();
-            values.sort_unstable();
-            let tree = StaticBTree::new(&values);
-            let mut all_targets = targets;
-            all_targets.extend([0, 1, u64::MAX - 1, u64::MAX]);
-            all_targets.extend(values.iter().step_by(values.len().div_ceil(20).max(1)));
-            for t in all_targets {
-                prop_assert_eq!(tree.count_le(t), values.partition_point(|&v| v <= t));
-            }
-        }
     }
 
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(16))]
 
         /// Larger indexes have several tree levels. Bytes `0xFE` and `0xFF`
-        /// make values near `u64::MAX`, the value that pads the nodes.
+        /// make prefix values near `u64::MAX`, the value that pads the nodes.
         #[test]
         fn should_search_large_index_like_binary_search(
             keys in sorted_keys_from(
