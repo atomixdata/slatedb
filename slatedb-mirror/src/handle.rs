@@ -8,10 +8,10 @@ use bytes::Bytes;
 use futures::future::{join_all, try_join_all};
 use log::warn;
 use object_store::path::Path;
-use object_store::{ObjectStore, ObjectStoreExt};
+use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt};
 
 use crate::inner::Inner;
-use crate::layout::LocalFile;
+use crate::layout::{LocalFile, LocalObject};
 use crate::ordering::{OpKind, Ticket};
 
 /// Lets a [`MirrorPolicy`](crate::MirrorPolicy) download, evict, and inspect
@@ -123,6 +123,31 @@ impl MirrorHandle {
         self.inner.entries.lock().contains_key(path)
     }
 
+    /// Returns the metadata of each complete local copy under `prefix`, or of
+    /// every complete local copy if `prefix` is `None`. The result is a
+    /// snapshot in no particular order. It does not include writes and
+    /// downloads in progress.
+    ///
+    /// A wrapped store that does not keep the objects that the mirror keeps
+    /// can add these to its listings.
+    pub fn local_objects(&self, prefix: Option<&Path>) -> Vec<ObjectMeta> {
+        // Reads of local copies take the same lock, so copy only the
+        // pointers while holding it.
+        let objects: Vec<Arc<LocalObject>> = self
+            .inner
+            .entries
+            .lock()
+            .values()
+            .map(|entry| Arc::clone(&entry.object))
+            .collect();
+        objects
+            .iter()
+            .map(|object| &object.meta)
+            .filter(|meta| prefix.is_none_or(|prefix| meta.location.prefix_matches(prefix)))
+            .cloned()
+            .collect()
+    }
+
     /// The wrapped store. Calls made here skip the policy.
     pub fn remote(&self) -> &Arc<dyn ObjectStore> {
         &self.inner.remote
@@ -206,6 +231,46 @@ mod tests {
         mirror.handle().evict([path.clone()]);
         eventually(|| file.is_removed()).await;
         assert!(mirror.handle().local_file(&path).is_none());
+    }
+
+    #[tokio::test]
+    async fn should_list_local_objects_under_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let mirror = ObjectStoreMirror::for_test(dir.path(), Arc::new(InMemory::new())).await;
+        for (path, bytes) in [
+            (SST, &b"x"[..]),
+            ("db/compacted/01B.sst", b"yz"),
+            ("db/compactedx/01C.sst", b"w"),
+        ] {
+            mirror
+                .put(&Path::from(path), PutPayload::from_static(bytes))
+                .await
+                .unwrap();
+        }
+
+        let listed = |prefix: Option<&str>| {
+            let mut objects: Vec<(String, u64)> = mirror
+                .handle()
+                .local_objects(prefix.map(Path::from).as_ref())
+                .into_iter()
+                .map(|meta| (meta.location.to_string(), meta.size))
+                .collect();
+            objects.sort();
+            objects
+        };
+        // The prefix matches whole path segments.
+        assert_eq!(
+            listed(Some("db/compacted")),
+            vec![
+                (SST.to_string(), 1),
+                ("db/compacted/01B.sst".to_string(), 2)
+            ]
+        );
+        assert_eq!(listed(None).len(), 3);
+        assert!(listed(Some("other")).is_empty());
+
+        mirror.handle().evict([Path::from(SST)]);
+        eventually(|| listed(Some("db/compacted")).len() == 1).await;
     }
 
     #[tokio::test]
