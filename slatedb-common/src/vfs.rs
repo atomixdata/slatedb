@@ -87,11 +87,13 @@ pub trait VfsLock: Debug + Send + Sync {}
 /// task. [`StdVfs::with_read_threads`] runs them on dedicated threads instead.
 /// Clones share the cache of open files and the read threads.
 /// The cache retains at most 1,000 open files by default.
-/// Writes are flushed before publication, without syncing them to disk.
+/// By default, writes are flushed before publication, without syncing them to
+/// disk. [`StdVfs::with_fsync`] syncs them.
 #[derive(Debug, Clone)]
 pub struct StdVfs {
     file_handle_cache: FileHandleCache,
     read_pool: Option<Arc<ReadPool>>,
+    fsync: bool,
 }
 
 impl Default for StdVfs {
@@ -99,6 +101,7 @@ impl Default for StdVfs {
         Self {
             file_handle_cache: FileHandleCache::new(1000),
             read_pool: None,
+            fsync: false,
         }
     }
 }
@@ -125,6 +128,18 @@ impl StdVfs {
     pub fn with_read_threads(mut self, threads: usize) -> io::Result<Self> {
         self.read_pool = Some(Arc::new(ReadPool::new(threads)?));
         Ok(self)
+    }
+
+    /// With `true`, a file survives a machine crash once it is published.
+    /// [`VfsWriter::finish`] syncs the file. [`Vfs::rename`] syncs the
+    /// directories of both paths, and [`Vfs::create_dir_all`] syncs the parent
+    /// of each directory it creates. [`Vfs::remove`] does not sync. The
+    /// default is `false`.
+    ///
+    /// Directories are synced on Unix only.
+    pub fn with_fsync(mut self, fsync: bool) -> Self {
+        self.fsync = fsync;
+        self
     }
 
     /// [`Vfs::read_range`] without the boxed future of the trait method, for
@@ -156,6 +171,45 @@ fn read_at(
     let mut buf = vec![0; len];
     read_exact_at_offset(&handle, &mut buf, offset)?;
     Ok(Bytes::from(buf))
+}
+
+/// Creates `path` and its missing parents, and syncs the parent of each
+/// directory that it creates.
+fn create_dir_all_synced(path: &Path) -> io::Result<()> {
+    let missing: Vec<&Path> = path
+        .ancestors()
+        .take_while(|dir| !dir.as_os_str().is_empty() && !dir.exists())
+        .collect();
+    std::fs::create_dir_all(path)?;
+    // Sync from the top, so that each new directory is durable before its
+    // child is.
+    for dir in missing.into_iter().rev() {
+        sync_parent_dir(dir)?;
+    }
+    Ok(())
+}
+
+/// Syncs the directory that holds `path`, so that a new, renamed, or removed
+/// entry for `path` survives a machine crash.
+fn sync_parent_dir(path: &Path) -> io::Result<()> {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => sync_dir(parent),
+        // A relative path with one component is in the current directory.
+        Some(_) => sync_dir(Path::new(".")),
+        // The root has no parent.
+        None => Ok(()),
+    }
+}
+
+#[cfg(unix)]
+fn sync_dir(dir: &Path) -> io::Result<()> {
+    std::fs::File::open(dir)?.sync_all()
+}
+
+/// Other platforms cannot open a directory to sync it.
+#[cfg(not(unix))]
+fn sync_dir(_dir: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 /// A range read for a [`ReadPool`] thread.
@@ -237,7 +291,12 @@ impl ReadPool {
 #[async_trait]
 impl Vfs for StdVfs {
     async fn create_dir_all(&self, path: &Path) -> io::Result<()> {
-        tokio::fs::create_dir_all(path).await
+        if !self.fsync {
+            return tokio::fs::create_dir_all(path).await;
+        }
+        let path = path.to_path_buf();
+        #[allow(clippy::disallowed_methods)]
+        tokio::task::spawn_blocking(move || create_dir_all_synced(&path)).await?
     }
 
     async fn lock(&self, path: &Path) -> io::Result<Box<dyn VfsLock>> {
@@ -297,19 +356,29 @@ impl Vfs for StdVfs {
             .create_new(true)
             .open(path)
             .await?;
-        Ok(Box::new(StdVfsWriter { file }))
+        Ok(Box::new(StdVfsWriter {
+            file,
+            fsync: self.fsync,
+        }))
     }
 
     async fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
         let from = from.to_path_buf();
         let to = to.to_path_buf();
         let file_handle_cache = self.file_handle_cache.clone();
+        let fsync = self.fsync;
         #[allow(clippy::disallowed_methods)]
         tokio::task::spawn_blocking(move || {
             std::fs::rename(&from, &to)?;
             // Keep invalidation in this task so cancellation cannot skip it.
             file_handle_cache.invalidate(&from);
             file_handle_cache.invalidate(&to);
+            if fsync {
+                sync_parent_dir(&to)?;
+                if from.parent() != to.parent() {
+                    sync_parent_dir(&from)?;
+                }
+            }
             Ok(())
         })
         .await?
@@ -339,6 +408,8 @@ impl VfsLock for StdVfsLock {}
 #[derive(Debug)]
 struct StdVfsWriter {
     file: tokio::fs::File,
+    /// Whether `finish` syncs the file. See [`StdVfs::with_fsync`].
+    fsync: bool,
 }
 
 #[async_trait]
@@ -348,7 +419,11 @@ impl VfsWriter for StdVfsWriter {
     }
 
     async fn finish(&mut self) -> io::Result<()> {
-        self.file.flush().await
+        self.file.flush().await?;
+        if self.fsync {
+            self.file.sync_all().await?;
+        }
+        Ok(())
     }
 }
 
@@ -380,6 +455,30 @@ mod tests {
                 size: 11
             }]
         );
+    }
+
+    #[tokio::test]
+    async fn should_write_rename_and_create_dirs_with_fsync() {
+        let dir = tempfile::tempdir().unwrap();
+        let vfs = StdVfs::new().with_fsync(true);
+        let sub = dir.path().join("a").join("b");
+        vfs.create_dir_all(&sub).await.unwrap();
+        assert!(sub.is_dir());
+        // An existing directory is not an error.
+        vfs.create_dir_all(&sub).await.unwrap();
+
+        let temp = sub.join("file.tmp");
+        let mut writer = vfs.create(&temp).await.unwrap();
+        writer.write(Bytes::from_static(b"synced")).await.unwrap();
+        writer.finish().await.unwrap();
+
+        // Rename within a directory and across directories.
+        let file = sub.join("file");
+        vfs.rename(&temp, &file).await.unwrap();
+        let moved = dir.path().join("a").join("file");
+        vfs.rename(&file, &moved).await.unwrap();
+        assert_eq!(vfs.read(&moved).await.unwrap(), "synced");
+        assert!(!file.exists());
     }
 
     #[tokio::test]
