@@ -1,10 +1,11 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use bytes::Bytes;
 use futures::future::BoxFuture;
-use tokio::sync::watch;
+use parking_lot::Mutex;
+use tokio::sync::{oneshot, watch};
 
 use crate::error::SlateDBError;
 use crate::manifest::VersionedManifest;
@@ -78,7 +79,84 @@ pub(crate) trait ClosedResultWriter: fmt::Debug + Send + Sync + 'static {
 pub(crate) struct DbStatusManager {
     cell: WatchableOnceCell<Result<(), SlateDBError>>,
     tx: watch::Sender<DbStatus>,
+    /// The writes waiting to become durable. The waiter only holds a weak
+    /// reference, so they see the database gone once every manager is.
+    durable_waiters: Arc<DurableWaiters>,
     durability_waiter: DurabilityWaiter,
+}
+
+/// Writes waiting for their sequence numbers to become durable, by sequence
+/// number. A durable advance wakes only the writes it covers. Waiting on the
+/// status watch instead woke every waiting write on each advance, so one
+/// advance cost time in proportion to the writes in flight.
+#[derive(Default)]
+struct DurableWaiters {
+    state: Mutex<DurableWaitersState>,
+}
+
+#[derive(Default)]
+struct DurableWaitersState {
+    durable_seq: u64,
+    closed: bool,
+    waiters: BTreeMap<u64, Vec<oneshot::Sender<()>>>,
+}
+
+impl DurableWaiters {
+    fn new(durable_seq: u64) -> Self {
+        Self {
+            state: Mutex::new(DurableWaitersState {
+                durable_seq,
+                ..DurableWaitersState::default()
+            }),
+        }
+    }
+
+    /// Records `seq` as durable and wakes the writes up to it.
+    fn advance(&self, seq: u64) {
+        let ready = {
+            let mut state = self.state.lock();
+            if seq <= state.durable_seq {
+                return;
+            }
+            state.durable_seq = seq;
+            let later = match seq.checked_add(1) {
+                Some(next) => state.waiters.split_off(&next),
+                None => BTreeMap::new(),
+            };
+            std::mem::replace(&mut state.waiters, later)
+        };
+        for sender in ready.into_values().flatten() {
+            let _ = sender.send(());
+        }
+    }
+
+    /// Wakes every waiting write: those not yet durable fail.
+    fn close(&self) {
+        let waiters = {
+            let mut state = self.state.lock();
+            state.closed = true;
+            std::mem::take(&mut state.waiters)
+        };
+        drop(waiters);
+    }
+
+    /// Returns `None` if `seq` is durable, or else a receiver that a durable
+    /// advance completes and a close drops.
+    fn register(&self, seq: u64) -> Option<oneshot::Receiver<()>> {
+        let mut state = self.state.lock();
+        if state.durable_seq >= seq {
+            return None;
+        }
+        let (sender, receiver) = oneshot::channel();
+        if !state.closed {
+            state.waiters.entry(seq).or_default().push(sender);
+        }
+        Some(receiver)
+    }
+
+    fn is_durable(&self, seq: u64) -> bool {
+        self.state.lock().durable_seq >= seq
+    }
 }
 
 impl fmt::Debug for DbStatusManager {
@@ -117,16 +195,20 @@ impl DbStatusManager {
             close_reason: None,
         });
         let cell = WatchableOnceCell::new();
-        let durability_waiter = new_durability_waiter(tx.subscribe(), cell.reader());
+        let durable_waiters = Arc::new(DurableWaiters::new(initial_durable_seq));
+        let durability_waiter =
+            new_durability_waiter(Arc::downgrade(&durable_waiters), cell.reader());
 
         Self {
             cell,
             tx,
+            durable_waiters,
             durability_waiter,
         }
     }
 
     pub(crate) fn report_fence_manifest(&self, durable_seq: u64, manifest: VersionedManifest) {
+        self.durable_waiters.advance(durable_seq);
         self.tx.send_if_modified(|s| {
             s.durable_seq = durable_seq;
             s.current_manifest = manifest;
@@ -135,6 +217,7 @@ impl DbStatusManager {
     }
 
     pub(crate) fn report_durable_seq(&self, seq: u64) {
+        self.durable_waiters.advance(seq);
         self.tx.send_if_modified(|s| {
             if seq > s.durable_seq {
                 s.durable_seq = seq;
@@ -217,6 +300,7 @@ impl DbStatusManager {
     }
 
     fn report_closed(&self, reason: CloseReason) {
+        self.durable_waiters.close();
         self.tx.send_if_modified(|s| {
             if s.close_reason.is_none() {
                 s.close_reason = Some(reason);
@@ -272,35 +356,47 @@ impl ClosedResultWriter for DbStatusManager {
 pub(crate) type DurabilityWaiter =
     Arc<dyn Fn(u64) -> BoxFuture<'static, Result<(), crate::Error>> + Send + Sync + 'static>;
 
-/// Creates a [`DurabilityWaiter`] backed by database status and close-result
-/// readers.
+/// Creates a [`DurabilityWaiter`] backed by the waiting writes and the
+/// close-result reader.
 ///
-/// The waiter captures only readers, so cloning it into a write handle does not
-/// keep the database's status sender alive after the database is dropped.
+/// The waiter holds the waiting writes weakly, so cloning it into a write
+/// handle does not keep them alive after the database is dropped.
 fn new_durability_waiter(
-    status_rx: watch::Receiver<DbStatus>,
+    durable_waiters: Weak<DurableWaiters>,
     close_result: WatchableOnceCellReader<Result<(), SlateDBError>>,
 ) -> DurabilityWaiter {
     Arc::new(move |seq| -> BoxFuture<'static, Result<(), crate::Error>> {
-        let mut status_rx = status_rx.clone();
+        let durable_waiters = durable_waiters.clone();
         let close_result = close_result.clone();
 
         Box::pin(async move {
-            let wait_result = status_rx
-                .wait_for(|status| status.durable_seq >= seq || status.close_reason.is_some())
-                .await;
-
-            match wait_result {
-                Ok(status) if status.durable_seq >= seq => Ok(()),
-                // The write was not durable before the database closed. Use the
-                // recorded close result to preserve fencing and panic errors.
-                Ok(_) | Err(_) => match close_result
-                    .read()
-                    .expect("database closed without recording a close result")
-                {
-                    Ok(()) => Err(SlateDBError::Closed.into()),
-                    Err(error) => Err(error.into()),
+            let durable = match durable_waiters.upgrade() {
+                Some(waiters) => match waiters.register(seq) {
+                    None => true,
+                    Some(receiver) => {
+                        drop(waiters);
+                        // A close or the database going away drops the sender,
+                        // possibly just as the write became durable.
+                        receiver.await.is_ok()
+                            || durable_waiters
+                                .upgrade()
+                                .is_some_and(|waiters| waiters.is_durable(seq))
+                    }
                 },
+                None => false,
+            };
+
+            if durable {
+                return Ok(());
+            }
+            // The write was not durable before the database closed. Use the
+            // recorded close result to preserve fencing and panic errors.
+            match close_result
+                .read()
+                .expect("database closed without recording a close result")
+            {
+                Ok(()) => Err(SlateDBError::Closed.into()),
+                Err(error) => Err(error.into()),
             }
         })
     })
@@ -623,5 +719,60 @@ mod tests {
 
         // then
         assert!(!rx.has_changed().unwrap());
+    }
+
+    #[tokio::test]
+    async fn should_wake_only_writes_that_became_durable() {
+        use futures::FutureExt;
+        let manager = DbStatusManager::new(0);
+        let waiter = manager.durability_waiter();
+        let mut early = waiter(5);
+        let mut late = waiter(10);
+        assert!((&mut early).now_or_never().is_none());
+        assert!((&mut late).now_or_never().is_none());
+
+        manager.report_durable_seq(7);
+        assert!(matches!((&mut early).now_or_never(), Some(Ok(()))));
+        assert!((&mut late).now_or_never().is_none());
+        // Only the later write is still registered.
+        let waiting: Vec<u64> = manager
+            .durable_waiters
+            .state
+            .lock()
+            .waiters
+            .keys()
+            .copied()
+            .collect();
+        assert_eq!(waiting, vec![10]);
+
+        manager.report_durable_seq(10);
+        assert!(matches!(late.now_or_never(), Some(Ok(()))));
+        assert!(manager.durable_waiters.state.lock().waiters.is_empty());
+    }
+
+    #[tokio::test]
+    async fn should_return_at_once_for_a_durable_write() {
+        use futures::FutureExt;
+        let manager = DbStatusManager::new(10);
+        assert!(matches!(
+            manager.durability_waiter()(10).now_or_never(),
+            Some(Ok(()))
+        ));
+        assert!(manager.durable_waiters.state.lock().waiters.is_empty());
+    }
+
+    #[tokio::test]
+    async fn should_fail_writes_still_waiting_when_closed() {
+        let manager = DbStatusManager::new(0);
+        let waiter = manager.durability_waiter();
+        let pending = tokio::spawn(waiter(5));
+        manager.report_durable_seq(3);
+        tokio::task::yield_now().await;
+        manager.write_result(Err(SlateDBError::Fenced));
+        let error = pending.await.unwrap().unwrap_err();
+        assert_eq!(error.kind(), crate::ErrorKind::Closed(CloseReason::Fenced));
+        // A write that became durable before the close still succeeds.
+        assert!(waiter(3).await.is_ok());
+        assert!(waiter(6).await.is_err());
     }
 }
