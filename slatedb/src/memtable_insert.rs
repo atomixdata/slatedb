@@ -11,10 +11,16 @@
 //! together: a condition variable's `notify_all` hands its mutex from one
 //! woken thread to the next, and the last helper would start only after a
 //! chain of wakeups.
+//!
+//! With `memtable_prune_overwrites`, each insert removes the next older version
+//! of its key, so a key's entries must land in order. Different keys do not
+//! interact, so such a group is split by key: every entry of a key goes to the
+//! same chunk, in group order, and the chunks are inserted in parallel.
 
 use crate::mem_table::KVTable;
 use crate::types::RowEntry;
 use parking_lot::Mutex;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -44,6 +50,8 @@ struct Shared {
 struct Job {
     table: Arc<KVTable>,
     chunks: Vec<Mutex<Option<Vec<RowEntry>>>>,
+    /// Whether each insert prunes the next older version of its key.
+    prune: bool,
     next: AtomicUsize,
     finished: AtomicUsize,
     panicked: AtomicBool,
@@ -58,7 +66,13 @@ impl Job {
             };
             let entries = chunk.lock().take().expect("each chunk is taken once");
             let _done = ChunkDone(self);
-            self.table.put_all(entries);
+            if self.prune {
+                for entry in entries {
+                    self.table.put_and_prune_overwritten(entry);
+                }
+            } else {
+                self.table.put_all(entries);
+            }
         }
     }
 }
@@ -105,13 +119,32 @@ impl MemtableInsertPool {
             table.put_all(entries);
             return true;
         }
-        let chunks = into_chunks(entries)
+        self.run(table, into_chunks(entries), false)
+    }
+
+    /// Inserts `entries` into `table` with
+    /// [`KVTable::put_and_prune_overwritten`], in group order for each key.
+    /// Returns `false` if an insert on a helper thread panicked.
+    pub(crate) fn insert_pruning(&self, table: &Arc<KVTable>, entries: Vec<RowEntry>) -> bool {
+        if self.helpers.is_empty() || entries.len() <= CHUNK_ENTRIES {
+            for entry in entries {
+                table.put_and_prune_overwritten(entry);
+            }
+            return true;
+        }
+        self.run(table, into_key_chunks(entries), true)
+    }
+
+    /// Inserts `chunks` from the writer and the helper threads.
+    fn run(&self, table: &Arc<KVTable>, chunks: Vec<Vec<RowEntry>>, prune: bool) -> bool {
+        let chunks = chunks
             .into_iter()
             .map(|chunk| Mutex::new(Some(chunk)))
             .collect();
         let job = Arc::new(Job {
             table: Arc::clone(table),
             chunks,
+            prune,
             next: AtomicUsize::new(0),
             finished: AtomicUsize::new(0),
             panicked: AtomicBool::new(false),
@@ -155,6 +188,25 @@ fn into_chunks(entries: Vec<RowEntry>) -> Vec<Vec<RowEntry>> {
         (!chunk.is_empty()).then_some(chunk)
     })
     .collect()
+}
+
+/// Splits `entries` into about one chunk per [`CHUNK_ENTRIES`] entries by the
+/// hash of the key, so that every entry of a key is in one chunk, in the order
+/// of `entries`.
+fn into_key_chunks(entries: Vec<RowEntry>) -> Vec<Vec<RowEntry>> {
+    let count = entries.len().div_ceil(CHUNK_ENTRIES);
+    let mut chunks: Vec<Vec<RowEntry>> = (0..count)
+        .map(|_| Vec::with_capacity(CHUNK_ENTRIES))
+        .collect();
+    for entry in entries {
+        let mut hasher = DefaultHasher::new();
+        entry.key.hash(&mut hasher);
+        let index =
+            usize::try_from(hasher.finish() % count as u64).expect("a chunk index fits in usize");
+        chunks[index].push(entry);
+    }
+    chunks.retain(|chunk| !chunk.is_empty());
+    chunks
 }
 
 /// Joins each new job until the pool shuts down.
@@ -216,6 +268,55 @@ mod tests {
             .all(|chunk| chunk.len() <= CHUNK_ENTRIES && chunk.capacity() <= CHUNK_ENTRIES));
         let seqs: Vec<u64> = chunks.iter().flatten().map(|entry| entry.seq).collect();
         assert_eq!(seqs, (1..=1000).collect::<Vec<_>>());
+    }
+
+    /// `versions` versions of each of `keys` keys, interleaved, with sequence
+    /// numbers rising in group order.
+    fn versioned_entries(keys: u64, versions: u64) -> Vec<RowEntry> {
+        (0..keys * versions)
+            .map(|i| {
+                let key = format!("key{:05}", i % keys);
+                RowEntry::new_value(key.as_bytes(), format!("value{i}").as_bytes(), i + 1)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn should_prune_with_helpers_as_one_thread_does() {
+        let pool = MemtableInsertPool::new(3);
+        for _ in 0..50 {
+            let expected = Arc::new(KVTable::new());
+            for entry in versioned_entries(64, 20) {
+                expected.put_and_prune_overwritten(entry);
+            }
+            let table = Arc::new(KVTable::new());
+            assert!(pool.insert_pruning(&table, versioned_entries(64, 20)));
+            let (got, want) = (table.metadata(), expected.metadata());
+            // Each insert pruned the version before it, so one version of
+            // each key is left.
+            assert_eq!(want.entry_num, 64);
+            assert_eq!(got.entry_num, want.entry_num);
+            assert_eq!(got.entries_size_in_bytes, want.entries_size_in_bytes);
+            assert_eq!(got.last_seq, want.last_seq);
+        }
+    }
+
+    #[test]
+    fn should_split_into_key_chunks_that_keep_each_key_in_order() {
+        let chunks = into_key_chunks(versioned_entries(64, 20));
+        assert!(chunks.len() > 1);
+        assert_eq!(chunks.iter().map(Vec::len).sum::<usize>(), 64 * 20);
+        for chunk in &chunks {
+            for key in chunk.iter().map(|entry| &entry.key) {
+                let seqs: Vec<u64> = chunk
+                    .iter()
+                    .filter(|entry| entry.key == *key)
+                    .map(|entry| entry.seq)
+                    .collect();
+                assert_eq!(seqs.len(), 20, "every version of a key is in one chunk");
+                assert!(seqs.is_sorted());
+            }
+        }
     }
 
     #[test]

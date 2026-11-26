@@ -479,13 +479,14 @@ impl DbInner {
         for staged in group.iter_mut() {
             entries.append(&mut staged.write.entries);
         }
-        // Pruning finds the next older version as each entry lands, so it
-        // inserts one entry at a time on the writer.
-        if self.settings.memtable_prune_overwrites {
-            entries
-                .into_iter()
-                .for_each(|entry| table.put_and_prune_overwritten(entry));
-        } else if !pool.insert(&table, entries) {
+        // Pruning finds the next older version as each entry lands, so the
+        // pool keeps each key's entries in order.
+        let inserted = if self.settings.memtable_prune_overwrites {
+            pool.insert_pruning(&table, entries)
+        } else {
+            pool.insert(&table, entries)
+        };
+        if !inserted {
             return Err(SlateDBError::BackgroundTaskPanic(
                 "memtable insert thread panicked".to_string(),
             ));
