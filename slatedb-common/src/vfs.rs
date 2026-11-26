@@ -15,6 +15,46 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use tokio::io::AsyncWriteExt;
 
+/// Reads as much of `buf` at `offset` as the page cache holds, and returns the
+/// number of bytes read.
+///
+/// This call does not wait for the disk. `preadv2` with `RWF_NOWAIT` copies only
+/// resident pages and stops at the first page that needs a disk read. The caller
+/// reads the remainder on the blocking pool. A read past the end of the file
+/// also stops here, and the caller reports that error.
+#[cfg(target_os = "linux")]
+fn read_cached_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> usize {
+    use std::os::unix::io::AsRawFd;
+    let mut filled = 0;
+    while filled < buf.len() {
+        let rest = &mut buf[filled..];
+        let Ok(at) = libc::off_t::try_from(offset + filled as u64) else {
+            break;
+        };
+        let iov = libc::iovec {
+            iov_base: rest.as_mut_ptr().cast(),
+            iov_len: rest.len(),
+        };
+        // SAFETY: `iov` describes `rest`, which outlives the call. `preadv2`
+        // writes at most `rest.len()` bytes into it.
+        let read = unsafe { libc::preadv2(file.as_raw_fd(), &iov, 1, at, libc::RWF_NOWAIT) };
+        match usize::try_from(read) {
+            Ok(0) => break,
+            Ok(read) => filled += read,
+            Err(_) if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted => {}
+            // `EAGAIN` when the next page is not resident, or another error.
+            Err(_) => break,
+        }
+    }
+    filled
+}
+
+/// Other platforms have no `RWF_NOWAIT`, so the blocking pool does all reads.
+#[cfg(not(target_os = "linux"))]
+fn read_cached_at(_file: &std::fs::File, _buf: &mut [u8], _offset: u64) -> usize {
+    0
+}
+
 /// A regular file in a [`Vfs::list`] result.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VfsEntry {
@@ -119,28 +159,64 @@ impl StdVfs {
 
     /// [`Vfs::read_range`] without the boxed future of the trait method, for
     /// callers that hold a `StdVfs`.
+    ///
+    /// On Linux, a file that is already open is read on the calling thread with
+    /// `preadv2(RWF_NOWAIT)`, which copies only pages in the page cache. The
+    /// rest of the range, and every read of a file that is not open, runs on the
+    /// blocking pool. A blocking pool round trip costs a lock and a thread wakeup
+    /// per read.
     pub async fn read_range_direct(&self, path: &Path, range: Range<u64>) -> io::Result<Bytes> {
         let len = usize::try_from(range.end.saturating_sub(range.start))
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "range is too large"))?;
+        let mut started = None;
+        if let Some(handle) = self.file_handle_cache.get(path) {
+            let mut buf = vec![0; len];
+            let filled = read_cached_at(&handle, &mut buf, range.start);
+            if filled == len {
+                return Ok(Bytes::from(buf));
+            }
+            started = Some(PartialRead {
+                handle,
+                buf,
+                filled,
+            });
+        }
         let path = path.to_path_buf();
         let file_handle_cache = self.file_handle_cache.clone();
         #[allow(clippy::disallowed_methods)]
-        tokio::task::spawn_blocking(move || read_at(&file_handle_cache, &path, range.start, len))
-            .await?
+        tokio::task::spawn_blocking(move || {
+            let started = match started {
+                Some(started) => started,
+                None => PartialRead {
+                    handle: file_handle_cache.try_get_or_open(&path)?,
+                    buf: vec![0; len],
+                    filled: 0,
+                },
+            };
+            started.finish(range.start)
+        })
+        .await?
     }
 }
 
-/// Reads `len` bytes at `offset` from `path`, through `file_handle_cache`.
-fn read_at(
-    file_handle_cache: &FileHandleCache,
-    path: &Path,
-    offset: u64,
-    len: usize,
-) -> io::Result<Bytes> {
-    let handle = file_handle_cache.try_get_or_open(path)?;
-    let mut buf = vec![0; len];
-    read_exact_at_offset(&handle, &mut buf, offset)?;
-    Ok(Bytes::from(buf))
+/// A range read whose first `filled` bytes are already in `buf`.
+struct PartialRead {
+    handle: std::sync::Arc<std::fs::File>,
+    buf: Vec<u8>,
+    filled: usize,
+}
+
+impl PartialRead {
+    /// Reads the rest of the range, which starts at `offset`, with blocking
+    /// reads.
+    fn finish(mut self, offset: u64) -> io::Result<Bytes> {
+        read_exact_at_offset(
+            &self.handle,
+            &mut self.buf[self.filled..],
+            offset + self.filled as u64,
+        )?;
+        Ok(Bytes::from(self.buf))
+    }
 }
 
 #[async_trait]
@@ -399,6 +475,66 @@ mod tests {
         assert!(vfs.read_range(&path, 10..10).await.unwrap().is_empty());
         let err = vfs.read_range(&path, 9..11).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[tokio::test]
+    async fn should_read_open_file_in_place_and_report_short_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file");
+        std::fs::write(&path, b"0123456789").unwrap();
+        let vfs = StdVfs::new();
+
+        // The first read opens the file. Later reads find it open.
+        assert_eq!(&vfs.read_range(&path, 0..4).await.unwrap()[..], b"0123");
+        assert_eq!(vfs.file_handle_cache.len(), 1);
+        assert_eq!(&vfs.read_range(&path, 2..6).await.unwrap()[..], b"2345");
+        assert_eq!(
+            &vfs.read_range(&path, 0..10).await.unwrap()[..],
+            b"0123456789"
+        );
+
+        // A read past the end fails on an open file, as on a file that is not open.
+        let err = vfs.read_range(&path, 8..12).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        let err = vfs.read_range(&path, 20..21).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn should_finish_a_partial_read_from_where_it_stopped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file");
+        std::fs::write(&path, b"0123456789").unwrap();
+        let handle = std::sync::Arc::new(std::fs::File::open(&path).unwrap());
+
+        // The first 3 bytes stand for an inline read. The blocking read keeps them.
+        let mut buf = vec![0; 8];
+        buf[..3].copy_from_slice(b"xyz");
+        let read = PartialRead {
+            handle,
+            buf,
+            filled: 3,
+        };
+        assert_eq!(&read.finish(1).unwrap()[..], b"xyz45678");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn should_read_resident_pages_inline() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file");
+        std::fs::write(&path, b"0123456789").unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+
+        // A file just written is in the page cache.
+        let mut buf = vec![0; 6];
+        assert_eq!(read_cached_at(&file, &mut buf, 2), 6);
+        assert_eq!(&buf, b"234567");
+
+        // A read past the end stops at the end.
+        let mut buf = vec![0; 6];
+        assert_eq!(read_cached_at(&file, &mut buf, 8), 2);
+        assert_eq!(read_cached_at(&file, &mut buf, 20), 0);
     }
 
     #[tokio::test]

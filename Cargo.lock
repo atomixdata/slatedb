@@ -3341,6 +3341,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "chrono",
+ "libc",
  "log",
  "object_store",
  "parking_lot",

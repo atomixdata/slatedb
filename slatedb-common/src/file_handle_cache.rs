@@ -53,6 +53,12 @@ impl FileHandleCache {
         self.inner.capacity() as usize
     }
 
+    /// Returns a cached file handle. This call never opens a file, so it does
+    /// not block.
+    pub fn get(&self, path: &std::path::Path) -> Option<Arc<std::fs::File>> {
+        self.inner.get(path)
+    }
+
     /// Look up a cached file handle, or open the file and cache it.
     /// Returns `Ok(None)` if the file does not exist on disk.
     /// The returned `Arc` keeps the file open after its cache entry is evicted.
