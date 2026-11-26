@@ -23,6 +23,7 @@
 pub use crate::db_status::{DbStatus, SegmentPrefix};
 
 use crate::db_cache::CacheTarget;
+use std::collections::VecDeque;
 use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
@@ -91,6 +92,9 @@ pub(crate) struct DbInner {
     /// Whether callers insert their own grouped writes into the memtable (see
     /// `SLATEDB_CALLER_INSERTS` in [`crate::batch_write`]).
     pub(crate) caller_inserts: bool,
+    /// Groups handed to their callers to insert and publish, in sequence order
+    /// (see `SLATEDB_CALLER_PUBLISH` in [`crate::batch_write`]).
+    pub(crate) caller_groups: parking_lot::Mutex<VecDeque<crate::batch_write::PendingGroup>>,
     pub(crate) db_stats: DbStats,
     /// Kept alive so the underlying `MetricsRecorder` is not dropped while
     /// metric handles in `DbStats` (and other stats structs) are still in use.
@@ -293,6 +297,7 @@ impl DbInner {
             wal_observer,
             write_notifier,
             caller_inserts: crate::batch_write::caller_inserts_enabled(),
+            caller_groups: parking_lot::Mutex::new(VecDeque::new()),
             db_stats,
             mono_clock,
             system_clock,
@@ -413,7 +418,9 @@ impl DbInner {
         let spin = caller_spin();
         if let Some(ticket_rx) = ticket_rx {
             if let Ok(ticket) = recv_spinning(ticket_rx, spin).await {
-                ticket.insert();
+                if ticket.insert() {
+                    self.publish_inserted_groups();
+                }
             }
         }
         recv_spinning(rx, spin).await?

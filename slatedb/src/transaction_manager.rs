@@ -258,6 +258,37 @@ impl TransactionManager {
         inner.oracle.advance_committed_seq(committed_seq);
     }
 
+    /// [`Self::track_recent_committed_write_batch`] for several write batches
+    /// in sequence order, under one lock. With no active transaction to
+    /// conflict with, nothing is recorded and their keys are not copied.
+    pub(crate) fn track_recent_committed_write_batches<'a>(
+        &self,
+        batches: impl IntoIterator<Item = (&'a HashSet<Bytes>, u64)>,
+    ) {
+        let mut inner = self.inner.write();
+        let mut last_seq = None;
+        let track = inner.min_conflict_check_seq().is_some();
+        for (keys, committed_seq) in batches {
+            if track {
+                inner.track_recent_committed_state(TransactionState {
+                    started_seq: committed_seq,
+                    committed_seq: Some(committed_seq),
+                    write_keys: keys.clone(),
+                    read_keys: HashSet::new(),
+                    read_ranges: Vec::new(),
+                });
+            }
+            last_seq = Some(committed_seq);
+        }
+        if !track {
+            // As track_recent_committed_state does once no transaction is active.
+            inner.recent_committed_txns.clear();
+        }
+        if let Some(seq) = last_seq {
+            inner.oracle.advance_committed_seq(seq);
+        }
+    }
+
     /// The min started_seq of all active transactions. This value
     /// is useful to inform the compactor about the min seq of data still needed to be
     /// retained for active transactions, so that the compactor can avoid deleting the

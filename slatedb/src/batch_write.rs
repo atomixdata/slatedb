@@ -74,6 +74,35 @@ pub(crate) fn caller_inserts_enabled() -> bool {
     std::env::var(CALLER_INSERTS_ENV).is_ok_and(|value| value == "1")
 }
 
+/// Environment variable: `1`, with [`CALLER_INSERTS_ENV`], also takes the
+/// inserts and publishing off the writer. The writer orders a group, hands
+/// its callers their tickets and moves on to the next group. The callers
+/// insert the group, and the one whose insert completes it publishes every
+/// inserted group at the head of the queue, in sequence order, and replies to
+/// their callers. The writer waits for the queue to drain only before
+/// freezing the memtable, applying a write on its own path, or a flush.
+const CALLER_PUBLISH_ENV: &str = "SLATEDB_CALLER_PUBLISH";
+
+/// Whether callers publish their groups. See [`CALLER_PUBLISH_ENV`].
+pub(crate) fn caller_publish_enabled() -> bool {
+    caller_inserts_enabled() && std::env::var(CALLER_PUBLISH_ENV).is_ok_and(|value| value == "1")
+}
+
+/// A group handed to its callers, waiting in [`DbInner::caller_groups`] to be
+/// inserted and then published in sequence order.
+pub(crate) struct PendingGroup {
+    inserts: Arc<InsertGroup>,
+    writes: Vec<PendingWrite>,
+}
+
+/// A write of a [`PendingGroup`], with what publishing it needs.
+struct PendingWrite {
+    seq: u64,
+    create_ts: i64,
+    keys: HashSet<Bytes>,
+    done: oneshot::Sender<WriteBatchResult>,
+}
+
 /// A batch with a sequence number and a place in the WAL, not yet in the
 /// memtable or visible to readers.
 struct PreparedWrite {
@@ -154,6 +183,8 @@ pub(crate) struct WriteBatchEventHandler {
     insert_pool: Option<MemtableInsertPool>,
     /// Whether a group's callers insert its entries. See [`CALLER_INSERTS_ENV`].
     caller_inserts: bool,
+    /// Whether a group's callers also publish it. See [`CALLER_PUBLISH_ENV`].
+    caller_publish: bool,
 }
 
 impl WriteBatchEventHandler {
@@ -173,6 +204,7 @@ impl WriteBatchEventHandler {
             memtable_insert_tasks,
             insert_pool: None,
             caller_inserts: caller_inserts_enabled(),
+            caller_publish: caller_publish_enabled(),
         }
     }
 
@@ -223,7 +255,24 @@ impl WriteBatchEventHandler {
             return Ok(());
         }
         let prune = self.db_inner.settings.memtable_prune_overwrites;
-        if self.caller_inserts && !(prune && has_repeated_keys(group)) {
+        let by_callers = self.caller_inserts && !(prune && has_repeated_keys(group));
+        if by_callers && self.caller_publish {
+            self.db_inner.hand_group_to_callers(group, prune);
+            if self
+                .db_inner
+                .memtable_should_freeze(self.wal_writer.as_deref())
+            {
+                self.db_inner.wait_caller_groups_published();
+                self.db_inner
+                    .maybe_freeze_current_memtable(self.wal_writer.as_deref())?;
+            }
+            return Ok(());
+        }
+        if self.caller_publish {
+            // Publishing in order: the groups handed out before this one go first.
+            self.db_inner.wait_caller_groups_published();
+        }
+        if by_callers {
             self.db_inner
                 .insert_staged_writes_by_callers(group, prune)?;
         } else {
@@ -278,6 +327,10 @@ fn fail_message(message: BatchWriterMessage, error: &SlateDBError) {
 #[async_trait]
 impl MessageHandler<BatchWriterMessage> for WriteBatchEventHandler {
     async fn handle(&mut self, message: BatchWriterMessage) -> Result<(), SlateDBError> {
+        if self.caller_publish {
+            // A commit or flush follows every group handed out before it.
+            self.db_inner.wait_caller_groups_published();
+        }
         match message {
             BatchWriterMessage::WriteBatch(WriteBatchRequest {
                 batch,
@@ -377,6 +430,9 @@ impl MessageHandler<BatchWriterMessage> for WriteBatchEventHandler {
         result: Result<(), SlateDBError>,
     ) -> Result<(), SlateDBError> {
         let error = result.clone().err().unwrap_or(SlateDBError::Closed);
+        if self.caller_publish {
+            self.db_inner.wait_caller_groups_published();
+        }
         while let Some(msg) = messages.next().await {
             match msg {
                 BatchWriterMessage::WriteBatch(req) => {
@@ -542,6 +598,7 @@ impl DbInner {
                 .iter_mut()
                 .map(|staged| std::mem::take(&mut staged.write.entries)),
             prune,
+            false,
         );
         for (slot, staged) in group.iter_mut().enumerate() {
             if let Some(ticket) = staged.ticket.take() {
@@ -554,6 +611,121 @@ impl DbInner {
             ));
         }
         Ok(())
+    }
+
+    /// Queues `group` for its callers to insert and publish (see
+    /// [`CALLER_PUBLISH_ENV`]) and hands out the tickets. A write whose
+    /// caller is gone is inserted here.
+    fn hand_group_to_callers(&self, group: &mut Vec<StagedWrite>, prune: bool) {
+        let table = self.group_memtable(group);
+        let inserts = InsertGroup::new(
+            table,
+            group
+                .iter_mut()
+                .map(|staged| std::mem::take(&mut staged.write.entries)),
+            prune,
+            true,
+        );
+        let mut tickets = Vec::with_capacity(group.len());
+        let writes = group
+            .drain(..)
+            .map(|staged| {
+                tickets.push(staged.ticket);
+                PendingWrite {
+                    seq: staged.write.seq,
+                    create_ts: staged.write.create_ts,
+                    keys: staged.keys,
+                    done: staged.done,
+                }
+            })
+            .collect();
+        // Queued before any ticket goes out, so the caller completing the
+        // group finds it.
+        self.caller_groups.lock().push_back(PendingGroup {
+            inserts: Arc::clone(&inserts),
+            writes,
+        });
+        let mut last = false;
+        for (slot, ticket) in tickets.into_iter().enumerate() {
+            let sent = ticket.is_some_and(|ticket| {
+                ticket
+                    .send(InsertTicket::new(Arc::clone(&inserts), slot))
+                    .is_ok()
+            });
+            if !sent {
+                last |= inserts.insert(slot);
+            }
+        }
+        if last {
+            self.publish_inserted_groups();
+        }
+    }
+
+    /// Publishes every inserted group at the head of [`Self::caller_groups`],
+    /// in sequence order, then replies to their callers. A group not yet
+    /// inserted stops it: the caller that completes that group publishes it
+    /// and those behind it.
+    pub(crate) fn publish_inserted_groups(&self) {
+        let mut replies = Vec::new();
+        {
+            let mut queue = self.caller_groups.lock();
+            while queue.front().is_some_and(|group| group.inserts.is_inserted()) {
+                let group = queue.pop_front().expect("the queue has a head");
+                if group.inserts.panicked() {
+                    let error =
+                        SlateDBError::BackgroundTaskPanic("memtable insert panicked".to_string());
+                    replies.extend(group.writes.into_iter().map(|w| (w.done, Err(error.clone()))));
+                    continue;
+                }
+                self.txn_manager.track_recent_committed_write_batches(
+                    group.writes.iter().map(|write| (&write.keys, write.seq)),
+                );
+                let ts = self.system_clock.now();
+                {
+                    let guard = self.state.read();
+                    for write in &group.writes {
+                        guard.memtable().record_sequence(write.seq, ts);
+                    }
+                }
+                for write in group.writes {
+                    let handle = WriteHandle::new_with_waiter(
+                        write.seq,
+                        write.create_ts,
+                        self.status_manager.durability_waiter(),
+                    );
+                    replies.push((write.done, Ok(handle)));
+                }
+            }
+        }
+        for (done, result) in replies {
+            let _ = done.send(result);
+        }
+    }
+
+    /// Inserts whatever callers have not taken from the queued groups and
+    /// publishes them, until the queue is empty.
+    pub(crate) fn wait_caller_groups_published(&self) {
+        let mut spins = 0u32;
+        loop {
+            let groups: Vec<Arc<InsertGroup>> = {
+                let queue = self.caller_groups.lock();
+                if queue.is_empty() {
+                    return;
+                }
+                queue.iter().map(|group| Arc::clone(&group.inserts)).collect()
+            };
+            for group in &groups {
+                group.insert_rest(0);
+            }
+            self.publish_inserted_groups();
+            if spins < 1 << 10 {
+                spins += 1;
+                std::hint::spin_loop();
+            } else {
+                #[allow(clippy::disallowed_methods)]
+                std::thread::yield_now();
+            }
+        }
     }
 
     /// Records the group's touched segments on the active memtable and
@@ -690,6 +862,17 @@ impl DbInner {
         &self,
         wal_writer: Option<&dyn WalWriter>,
     ) -> Result<(), SlateDBError> {
+        if !self.memtable_should_freeze(wal_writer) {
+            return Ok(());
+        }
+        let replay_after_wal_id = self.wal_observer.status()?.last_flushed_wal_id;
+        let mut guard = self.state.write();
+        self.freeze_current_memtable_with_state_guard(&mut guard, replay_after_wal_id);
+        Ok(())
+    }
+
+    /// Whether the active memtable is due to be frozen.
+    fn memtable_should_freeze(&self, wal_writer: Option<&dyn WalWriter>) -> bool {
         // extract the information required to make a freeze decision under a read-lock first
         // so we don't call into `WalWriter` while holding a lock
         let (l0_sst_size_est, last_freeze_wal_id) = {
@@ -713,14 +896,7 @@ impl DbInner {
         let wal_should_flush_memtable = wal_writer
             .is_some_and(|wal_writer| wal_writer.should_flush_memtable(last_freeze_wal_id));
 
-        if !wal_should_flush_memtable && l0_sst_size_est < self.settings.l0_sst_size_bytes {
-            return Ok(());
-        }
-
-        let replay_after_wal_id = self.wal_observer.status()?.last_flushed_wal_id;
-        let mut guard = self.state.write();
-        self.freeze_current_memtable_with_state_guard(&mut guard, replay_after_wal_id);
-        Ok(())
+        wal_should_flush_memtable || l0_sst_size_est >= self.settings.l0_sst_size_bytes
     }
 
     async fn flush_batch_writer(
@@ -1516,5 +1692,125 @@ mod tests {
             done_rx.await.unwrap().unwrap();
         }
         assert_eq!(active_memtable_entry_num(&db), 6);
+    }
+
+    /// Writes of one key each, with their tickets held by the test.
+    fn held_ticket_messages(
+        keys: &[&[u8]],
+    ) -> (
+        Vec<BatchWriterMessage>,
+        Vec<oneshot::Receiver<WriteBatchResult>>,
+        Vec<oneshot::Receiver<InsertTicket>>,
+    ) {
+        let mut messages = Vec::new();
+        let mut receivers = Vec::new();
+        let mut tickets = Vec::new();
+        for key in keys {
+            let mut batch = WriteBatch::new();
+            batch.put(key, b"value");
+            let (mut message, done_rx) = test_message(batch, WriteOptions::default());
+            let BatchWriterMessage::WriteBatch(request) = &mut message else {
+                unreachable!("test_message builds writes");
+            };
+            let (ticket, ticket_rx) = oneshot::channel();
+            request.ticket = Some(ticket);
+            messages.push(message);
+            receivers.push(done_rx);
+            tickets.push(ticket_rx);
+        }
+        (messages, receivers, tickets)
+    }
+
+    async fn caller_publish_handler(path: &str) -> (Db, WriteBatchEventHandler) {
+        let db = Db::open(path, Arc::new(InMemory::new())).await.unwrap();
+        let mut handler =
+            WriteBatchEventHandler::new(db.inner.clone(), Some(Box::new(FakeWalWriter::new(0))), 1);
+        handler.caller_inserts = true;
+        handler.caller_publish = true;
+        (db, handler)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_handle_batch_with_caller_publish_publishes_groups_in_order() {
+        let (db, mut handler) =
+            caller_publish_handler("/tmp/test_handle_batch_with_caller_publish_in_order").await;
+        let (first, mut first_done, first_tickets) = held_ticket_messages(&[b"a", b"b"]);
+        let (second, mut second_done, second_tickets) = held_ticket_messages(&[b"c", b"d"]);
+        // The writer hands out both groups without inserting either.
+        handler.handle_batch(first).await.unwrap();
+        handler.handle_batch(second).await.unwrap();
+        assert_eq!(active_memtable_entry_num(&db), 0);
+        let committed_before = db.inner.oracle.last_committed_seq();
+
+        // The second group is inserted first, but waits behind the first.
+        let mut publishes = 0;
+        for ticket in second_tickets {
+            if ticket.await.unwrap().insert() {
+                publishes += 1;
+                db.inner.publish_inserted_groups();
+            }
+        }
+        assert_eq!(publishes, 1);
+        assert_eq!(active_memtable_entry_num(&db), 2);
+        assert_eq!(db.inner.oracle.last_committed_seq(), committed_before);
+        for done in &mut second_done {
+            assert!(done.try_recv().is_err());
+        }
+
+        // One caller of the first group inserts the whole group and publishes
+        // both groups; the other finds its write inserted.
+        let mut first_tickets = first_tickets.into_iter();
+        assert!(first_tickets.next().unwrap().await.unwrap().insert());
+        db.inner.publish_inserted_groups();
+        assert!(!first_tickets.next().unwrap().await.unwrap().insert());
+        let mut last_seq = committed_before;
+        for done in first_done.iter_mut().chain(second_done.iter_mut()) {
+            let seq = done.await.unwrap().unwrap().seqnum();
+            assert!(seq > last_seq);
+            last_seq = seq;
+        }
+        assert_eq!(db.inner.oracle.last_committed_seq(), last_seq);
+        assert_eq!(active_memtable_entry_num(&db), 4);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_handle_batch_with_caller_publish_inserts_for_gone_callers() {
+        let (db, mut handler) =
+            caller_publish_handler("/tmp/test_handle_batch_with_caller_publish_gone").await;
+        let (messages, receivers, tickets) = held_ticket_messages(&[b"a", b"b", b"c"]);
+        drop(tickets);
+        handler.handle_batch(messages).await.unwrap();
+        for done in receivers {
+            done.await.unwrap().unwrap();
+        }
+        assert_eq!(active_memtable_entry_num(&db), 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_handle_with_caller_publish_flushes_after_queued_groups() {
+        let (db, mut handler) =
+            caller_publish_handler("/tmp/test_handle_with_caller_publish_flush").await;
+        let (messages, receivers, tickets) = held_ticket_messages(&[b"a", b"b"]);
+        handler.handle_batch(messages).await.unwrap();
+        // No caller inserts: the flush inserts and publishes the group first.
+        let (done, flush_rx) = oneshot::channel();
+        handler
+            .handle(BatchWriterMessage::Flush(BatchWriterFlush {
+                freeze_memtable: true,
+                done,
+            }))
+            .await
+            .unwrap();
+        drop(flush_rx.await.unwrap().unwrap());
+        for done in receivers {
+            done.await.unwrap().unwrap();
+        }
+        for ticket in tickets {
+            assert!(!ticket.await.unwrap().insert());
+        }
+        assert!(db.inner.caller_groups.lock().is_empty());
+        assert_eq!(active_memtable_entry_num(&db), 0);
+        let guard = db.inner.state.read();
+        assert_eq!(guard.state().imm_memtable.front().unwrap().table().metadata().entry_num, 2);
     }
 }

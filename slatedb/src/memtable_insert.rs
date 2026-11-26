@@ -194,10 +194,16 @@ fn wait_until(done: impl Fn() -> bool) {
 ///
 /// With `prune`, each insert prunes the next older version of its key, so the
 /// writer uses a group only if no key is in two of its writes.
+///
+/// With `callers_publish` (`SLATEDB_CALLER_PUBLISH=1`), the writer hands out
+/// the tickets and moves on without inserting or waiting: a caller inserts its
+/// own slot, then every slot of the group no one has taken, and the insert that
+/// completes the group tells its caller to publish.
 pub(crate) struct InsertGroup {
     table: Arc<KVTable>,
     slots: Vec<Mutex<Option<Vec<RowEntry>>>>,
     prune: bool,
+    callers_publish: bool,
     /// Slots whose entries are not yet in the memtable.
     pending: AtomicUsize,
     panicked: AtomicBool,
@@ -208,6 +214,7 @@ impl InsertGroup {
         table: Arc<KVTable>,
         writes: impl IntoIterator<Item = Vec<RowEntry>>,
         prune: bool,
+        callers_publish: bool,
     ) -> Arc<Self> {
         let slots: Vec<_> = writes
             .into_iter()
@@ -218,16 +225,18 @@ impl InsertGroup {
             pending: AtomicUsize::new(slots.len()),
             slots,
             prune,
+            callers_publish,
             panicked: AtomicBool::new(false),
         })
     }
 
     /// Inserts the entries in `slot` unless someone already took them.
-    fn insert(&self, slot: usize) {
+    /// Returns whether this insert was the group's last.
+    pub(crate) fn insert(&self, slot: usize) -> bool {
         let Some(entries) = self.slots[slot].lock().take() else {
-            return;
+            return false;
         };
-        let _done = SlotDone(self);
+        let done = SlotDone(self);
         if self.prune {
             for entry in entries {
                 self.table.put_and_prune_overwritten(entry);
@@ -235,6 +244,29 @@ impl InsertGroup {
         } else {
             self.table.put_all(entries);
         }
+        std::mem::forget(done);
+        self.pending.fetch_sub(1, Ordering::AcqRel) == 1
+    }
+
+    /// Inserts every slot no one has taken, starting at `from` and wrapping.
+    /// Returns whether one of these inserts was the group's last.
+    pub(crate) fn insert_rest(&self, from: usize) -> bool {
+        let len = self.slots.len();
+        let mut last = false;
+        for offset in 0..len {
+            last |= self.insert((from + offset) % len);
+        }
+        last
+    }
+
+    /// Whether every slot is in the memtable.
+    pub(crate) fn is_inserted(&self) -> bool {
+        self.pending.load(Ordering::Acquire) == 0
+    }
+
+    /// Whether an insert panicked.
+    pub(crate) fn panicked(&self) -> bool {
+        self.panicked.load(Ordering::Relaxed)
     }
 
     /// Inserts every slot no caller has taken, latest first since the earliest
@@ -273,9 +305,15 @@ impl InsertTicket {
         Self { group, slot }
     }
 
-    /// Inserts the write's entries, unless the writer already has.
-    pub(crate) fn insert(self) {
-        self.group.insert(self.slot);
+    /// Inserts the write's entries, unless the writer already has. If the
+    /// group's callers publish it, also inserts the rest of the group and
+    /// returns whether the group is now inserted and this caller must publish.
+    pub(crate) fn insert(self) -> bool {
+        let last = self.group.insert(self.slot);
+        if !self.group.callers_publish {
+            return false;
+        }
+        last | self.group.insert_rest(self.slot + 1)
     }
 }
 
@@ -435,7 +473,7 @@ mod tests {
     #[allow(clippy::disallowed_methods)]
     fn should_insert_each_slot_once_with_callers_and_writer() {
         let table = Arc::new(KVTable::new());
-        let group = InsertGroup::new(Arc::clone(&table), writes(200), false);
+        let group = InsertGroup::new(Arc::clone(&table), writes(200), false, false);
         // Callers insert the even slots on their own threads while the writer
         // finishes the group.
         let callers: Vec<_> = (0..200)
@@ -457,7 +495,7 @@ mod tests {
     #[test]
     fn should_skip_a_ticket_for_a_slot_already_inserted() {
         let table = Arc::new(KVTable::new());
-        let group = InsertGroup::new(Arc::clone(&table), writes(3), false);
+        let group = InsertGroup::new(Arc::clone(&table), writes(3), false, false);
         InsertTicket::new(Arc::clone(&group), 1).insert();
         assert_eq!(table.metadata().entry_num, 2);
         assert!(group.finish());
@@ -489,7 +527,7 @@ mod tests {
                     .collect()
             })
             .collect();
-        let group = InsertGroup::new(Arc::clone(&table), newer, true);
+        let group = InsertGroup::new(Arc::clone(&table), newer, true, false);
         let callers: Vec<_> = (0..100)
             .step_by(3)
             .map(|slot| {
@@ -502,6 +540,38 @@ mod tests {
             caller.join().unwrap();
         }
         assert_eq!(table.metadata().entry_num, 200);
+    }
+
+    #[test]
+    #[allow(clippy::disallowed_methods)]
+    fn should_tell_exactly_one_caller_to_publish() {
+        let table = Arc::new(KVTable::new());
+        let group = InsertGroup::new(Arc::clone(&table), writes(64), false, true);
+        let callers: Vec<_> = (0..64)
+            .map(|slot| {
+                let ticket = InsertTicket::new(Arc::clone(&group), slot);
+                thread::spawn(move || ticket.insert())
+            })
+            .collect();
+        let publishers = callers
+            .into_iter()
+            .map(|caller| caller.join().unwrap())
+            .filter(|publish| *publish)
+            .count();
+        assert_eq!(publishers, 1);
+        assert!(group.is_inserted());
+        assert_eq!(table.metadata().entry_num, 128);
+    }
+
+    #[test]
+    fn should_insert_the_rest_of_the_group_from_one_caller() {
+        let table = Arc::new(KVTable::new());
+        let group = InsertGroup::new(Arc::clone(&table), writes(5), false, true);
+        assert!(InsertTicket::new(Arc::clone(&group), 3).insert());
+        assert!(group.is_inserted());
+        assert_eq!(table.metadata().entry_num, 10);
+        // Later tickets find their slots inserted and do not publish again.
+        assert!(!InsertTicket::new(Arc::clone(&group), 0).insert());
     }
 
     #[test]
