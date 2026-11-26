@@ -155,15 +155,7 @@ impl MemtableInsertPool {
             helper.thread().unpark();
         }
         job.work();
-        let mut spins = 0u32;
-        while job.finished.load(Ordering::Acquire) < job.chunks.len() {
-            if spins < SPINS_BEFORE_YIELD {
-                spins += 1;
-                std::hint::spin_loop();
-            } else {
-                thread::yield_now();
-            }
-        }
+        wait_until(|| job.finished.load(Ordering::Acquire) == job.chunks.len());
         *self.shared.job.lock() = None;
         !job.panicked.load(Ordering::Relaxed)
     }
@@ -176,6 +168,114 @@ impl Drop for MemtableInsertPool {
             helper.thread().unpark();
             let _ = helper.join();
         }
+    }
+}
+
+/// Spins until `done`, yielding the thread between checks after a while.
+fn wait_until(done: impl Fn() -> bool) {
+    let mut spins = 0u32;
+    while !done() {
+        if spins < SPINS_BEFORE_YIELD {
+            spins += 1;
+            std::hint::spin_loop();
+        } else {
+            thread::yield_now();
+        }
+    }
+}
+
+/// The memtable inserts of one write group, shared by the writer and the
+/// group's callers (`SLATEDB_CALLER_INSERTS=1`). Each write's entries sit in a
+/// slot inserted by whoever takes it first: its caller, once handed an
+/// [`InsertTicket`], or the writer, which inserts every slot no caller has
+/// taken once it has handed out the tickets. Callers that wake promptly insert
+/// in parallel; one that is slow to wake, or gone, costs no more than the
+/// writer inserting its entries itself.
+///
+/// With `prune`, each insert prunes the next older version of its key, so the
+/// writer uses a group only if no key is in two of its writes.
+pub(crate) struct InsertGroup {
+    table: Arc<KVTable>,
+    slots: Vec<Mutex<Option<Vec<RowEntry>>>>,
+    prune: bool,
+    /// Slots whose entries are not yet in the memtable.
+    pending: AtomicUsize,
+    panicked: AtomicBool,
+}
+
+impl InsertGroup {
+    pub(crate) fn new(
+        table: Arc<KVTable>,
+        writes: impl IntoIterator<Item = Vec<RowEntry>>,
+        prune: bool,
+    ) -> Arc<Self> {
+        let slots: Vec<_> = writes
+            .into_iter()
+            .map(|entries| Mutex::new(Some(entries)))
+            .collect();
+        Arc::new(Self {
+            table,
+            pending: AtomicUsize::new(slots.len()),
+            slots,
+            prune,
+            panicked: AtomicBool::new(false),
+        })
+    }
+
+    /// Inserts the entries in `slot` unless someone already took them.
+    fn insert(&self, slot: usize) {
+        let Some(entries) = self.slots[slot].lock().take() else {
+            return;
+        };
+        let _done = SlotDone(self);
+        if self.prune {
+            for entry in entries {
+                self.table.put_and_prune_overwritten(entry);
+            }
+        } else {
+            self.table.put_all(entries);
+        }
+    }
+
+    /// Inserts every slot no caller has taken, latest first since the earliest
+    /// callers were woken first, then waits for the callers' inserts. Returns
+    /// `false` if an insert panicked.
+    pub(crate) fn finish(&self) -> bool {
+        for slot in (0..self.slots.len()).rev() {
+            self.insert(slot);
+        }
+        wait_until(|| self.pending.load(Ordering::Acquire) == 0);
+        !self.panicked.load(Ordering::Relaxed)
+    }
+}
+
+/// Counts a slot as inserted even if its insert panics, so the writer never
+/// waits for it forever.
+struct SlotDone<'a>(&'a InsertGroup);
+
+impl Drop for SlotDone<'_> {
+    fn drop(&mut self) {
+        if thread::panicking() {
+            self.0.panicked.store(true, Ordering::Relaxed);
+        }
+        self.0.pending.fetch_sub(1, Ordering::Release);
+    }
+}
+
+/// Lets a caller insert its own write's entries into the memtable.
+pub(crate) struct InsertTicket {
+    group: Arc<InsertGroup>,
+    slot: usize,
+}
+
+impl InsertTicket {
+    pub(crate) fn new(group: Arc<InsertGroup>, slot: usize) -> Self {
+        Self { group, slot }
+    }
+
+    /// Inserts the write's entries, unless the writer already has.
+    pub(crate) fn insert(self) {
+        self.group.insert(self.slot);
     }
 }
 
@@ -317,6 +417,91 @@ mod tests {
                 assert!(seqs.is_sorted());
             }
         }
+    }
+
+    /// One write of two entries per slot, with sequence numbers 1..=2 * count.
+    fn writes(count: u64) -> Vec<Vec<RowEntry>> {
+        (0..count)
+            .map(|i| {
+                vec![
+                    RowEntry::new_value(format!("key{i:05}a").as_bytes(), b"value", 2 * i + 1),
+                    RowEntry::new_value(format!("key{i:05}b").as_bytes(), b"value", 2 * i + 2),
+                ]
+            })
+            .collect()
+    }
+
+    #[test]
+    #[allow(clippy::disallowed_methods)]
+    fn should_insert_each_slot_once_with_callers_and_writer() {
+        let table = Arc::new(KVTable::new());
+        let group = InsertGroup::new(Arc::clone(&table), writes(200), false);
+        // Callers insert the even slots on their own threads while the writer
+        // finishes the group.
+        let callers: Vec<_> = (0..200)
+            .step_by(2)
+            .map(|slot| {
+                let ticket = InsertTicket::new(Arc::clone(&group), slot);
+                thread::spawn(move || ticket.insert())
+            })
+            .collect();
+        assert!(group.finish());
+        assert_eq!(group.pending.load(Ordering::Acquire), 0);
+        for caller in callers {
+            caller.join().unwrap();
+        }
+        assert_eq!(table.metadata().entry_num, 400);
+        assert_eq!(table.metadata().last_seq, 400);
+    }
+
+    #[test]
+    fn should_skip_a_ticket_for_a_slot_already_inserted() {
+        let table = Arc::new(KVTable::new());
+        let group = InsertGroup::new(Arc::clone(&table), writes(3), false);
+        InsertTicket::new(Arc::clone(&group), 1).insert();
+        assert_eq!(table.metadata().entry_num, 2);
+        assert!(group.finish());
+        assert_eq!(table.metadata().entry_num, 6);
+        // A late ticket for a slot the writer inserted does nothing.
+        InsertTicket::new(Arc::clone(&group), 2).insert();
+        assert_eq!(table.metadata().entry_num, 6);
+        assert_eq!(group.pending.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    #[allow(clippy::disallowed_methods)]
+    fn should_prune_older_versions_with_callers() {
+        let table = Arc::new(KVTable::new());
+        // Older versions of every key, which the group's inserts prune.
+        for (i, write) in writes(100).into_iter().enumerate() {
+            for entry in write {
+                let older = RowEntry::new_value(&entry.key, b"older", u64::try_from(i).unwrap());
+                table.put(older);
+            }
+        }
+        assert_eq!(table.metadata().entry_num, 200);
+        let newer: Vec<Vec<RowEntry>> = writes(100)
+            .into_iter()
+            .map(|write| {
+                write
+                    .into_iter()
+                    .map(|entry| RowEntry::new_value(&entry.key, b"newer", entry.seq + 1000))
+                    .collect()
+            })
+            .collect();
+        let group = InsertGroup::new(Arc::clone(&table), newer, true);
+        let callers: Vec<_> = (0..100)
+            .step_by(3)
+            .map(|slot| {
+                let ticket = InsertTicket::new(Arc::clone(&group), slot);
+                thread::spawn(move || ticket.insert())
+            })
+            .collect();
+        assert!(group.finish());
+        for caller in callers {
+            caller.join().unwrap();
+        }
+        assert_eq!(table.metadata().entry_num, 200);
     }
 
     #[test]

@@ -88,6 +88,9 @@ pub(crate) struct DbInner {
     pub(crate) table_store: Arc<TableStore>,
     pub(crate) memtable_flusher: Arc<MemtableFlusher>,
     pub(crate) write_notifier: SafeSender<BatchWriterMessage>,
+    /// Whether callers insert their own grouped writes into the memtable (see
+    /// `SLATEDB_CALLER_INSERTS` in [`crate::batch_write`]).
+    pub(crate) caller_inserts: bool,
     pub(crate) db_stats: DbStats,
     /// Kept alive so the underlying `MetricsRecorder` is not dropped while
     /// metric handles in `DbStats` (and other stats structs) are still in use.
@@ -117,6 +120,112 @@ pub(crate) struct DbInner {
     /// L0 SSTs. When `None`, the database is the singleton `prefix=""`
     /// segment encoded in the manifest's top-level tree.
     pub(crate) segment_extractor: Option<Arc<dyn PrefixExtractor>>,
+}
+
+/// How long a caller polls for its write's ticket and result before parking,
+/// from `SLATEDB_CALLER_SPIN_US` (default 0). A reply to a parked caller costs
+/// the writer a thread wakeup; a reply to a polling caller does not.
+fn caller_spin() -> Duration {
+    static SPIN: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *SPIN.get_or_init(|| {
+        Duration::from_micros(
+            std::env::var("SLATEDB_CALLER_SPIN_US")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0),
+        )
+    })
+}
+
+/// Receives from `rx`, polling for up to `spin` before parking. The deadline
+/// is on the real clock: tokio's stands still while paused.
+#[allow(clippy::disallowed_methods, clippy::disallowed_types)]
+async fn recv_spinning<T>(
+    mut rx: tokio::sync::oneshot::Receiver<T>,
+    spin: Duration,
+) -> Result<T, tokio::sync::oneshot::error::RecvError> {
+    if !spin.is_zero() {
+        let deadline = std::time::Instant::now() + spin;
+        let mut polls = 0u32;
+        loop {
+            match rx.try_recv() {
+                Ok(value) => return Ok(value),
+                // A receiver cannot be awaited once `try_recv` has found it
+                // closed, so the error comes from a channel closed the same way.
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                    let (_, closed) = tokio::sync::oneshot::channel::<()>();
+                    return Err(closed.await.expect_err("its sender is dropped"));
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+            }
+            polls = polls.wrapping_add(1);
+            if polls.is_multiple_of(64) {
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::yield_now();
+            } else {
+                std::hint::spin_loop();
+            }
+        }
+    }
+    rx.await
+}
+
+#[cfg(test)]
+mod recv_spinning_tests {
+    use super::recv_spinning;
+    use std::time::Duration;
+    use tokio::sync::oneshot;
+
+    #[tokio::test]
+    async fn should_receive_a_value_sent_before_polling() {
+        let (tx, rx) = oneshot::channel();
+        tx.send(7).unwrap();
+        assert_eq!(
+            recv_spinning(rx, Duration::from_millis(1)).await.unwrap(),
+            7
+        );
+    }
+
+    #[tokio::test]
+    async fn should_report_a_closed_channel() {
+        let (tx, rx) = oneshot::channel::<u32>();
+        drop(tx);
+        assert!(recv_spinning(rx, Duration::from_millis(1)).await.is_err());
+        let (tx, rx) = oneshot::channel::<u32>();
+        drop(tx);
+        assert!(recv_spinning(rx, Duration::ZERO).await.is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn should_stop_polling_while_time_is_paused() {
+        let (tx, rx) = oneshot::channel();
+        // The sender runs only once the poller parks and paused time advances.
+        let sender = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            tx.send(1).unwrap();
+        });
+        assert_eq!(
+            recv_spinning(rx, Duration::from_millis(1)).await.unwrap(),
+            1
+        );
+        sender.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn should_receive_a_value_sent_while_polling_or_after() {
+        for delay in [Duration::from_micros(100), Duration::from_millis(20)] {
+            let (tx, rx) = oneshot::channel();
+            let sender = tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                tx.send(delay).unwrap();
+            });
+            let received = recv_spinning(rx, Duration::from_millis(5)).await.unwrap();
+            assert_eq!(received, delay);
+            sender.await.unwrap();
+        }
+    }
 }
 
 impl DbInner {
@@ -183,6 +292,7 @@ impl DbInner {
             table_store,
             wal_observer,
             write_notifier,
+            caller_inserts: crate::batch_write::caller_inserts_enabled(),
             db_stats,
             mono_clock,
             system_clock,
@@ -282,17 +392,31 @@ impl DbInner {
         }
 
         let (tx, rx) = tokio::sync::oneshot::channel();
+        let (ticket, ticket_rx) = if txn.is_none() && self.caller_inserts {
+            let (ticket, ticket_rx) = tokio::sync::oneshot::channel();
+            (Some(ticket), Some(ticket_rx))
+        } else {
+            (None, None)
+        };
         let batch_msg = BatchWriterMessage::WriteBatch(WriteBatchRequest {
             batch,
             options: options.clone(),
             done: tx,
             txn,
+            ticket,
         });
 
         self.maybe_apply_backpressure().await?;
         self.write_notifier.send(batch_msg)?;
 
-        rx.await?
+        // The ticket comes before the result, or is dropped unsent.
+        let spin = caller_spin();
+        if let Some(ticket_rx) = ticket_rx {
+            if let Ok(ticket) = recv_spinning(ticket_rx, spin).await {
+                ticket.insert();
+            }
+        }
+        recv_spinning(rx, spin).await?
     }
 
     #[inline]

@@ -38,7 +38,7 @@ use crate::db_transaction::DbTransaction;
 use crate::dispatcher::MessageHandler;
 use crate::mem_table::KVTable;
 use crate::memtable_flusher::CheckpointCursor;
-use crate::memtable_insert::MemtableInsertPool;
+use crate::memtable_insert::{InsertGroup, InsertTicket, MemtableInsertPool};
 use crate::oracle::Oracle;
 use crate::types::RowEntry;
 use crate::utils::WatchableOnceCellReader;
@@ -64,6 +64,16 @@ const MEMTABLE_INSERT_TASKS_ENV: &str = "SLATEDB_MEMTABLE_INSERT_TASKS";
 /// The most queued writes the writer takes as one group.
 const MAX_GROUP_WRITES: usize = 4096;
 
+/// Environment variable: `1` makes the callers of a write group insert their
+/// own entries into the memtable, in parallel, instead of the writer and its
+/// helper threads. The writer still orders the group and makes it visible.
+const CALLER_INSERTS_ENV: &str = "SLATEDB_CALLER_INSERTS";
+
+/// Whether callers insert their own entries. See [`CALLER_INSERTS_ENV`].
+pub(crate) fn caller_inserts_enabled() -> bool {
+    std::env::var(CALLER_INSERTS_ENV).is_ok_and(|value| value == "1")
+}
+
 /// A batch with a sequence number and a place in the WAL, not yet in the
 /// memtable or visible to readers.
 struct PreparedWrite {
@@ -81,6 +91,8 @@ struct StagedWrite {
     /// The batch's keys, recorded for conflict checks when it is published.
     keys: HashSet<Bytes>,
     done: oneshot::Sender<WriteBatchResult>,
+    /// See [`WriteBatchRequest::ticket`].
+    ticket: Option<oneshot::Sender<InsertTicket>>,
 }
 
 /// A message processed by the batch writer event loop.
@@ -109,6 +121,9 @@ pub(crate) struct WriteBatchRequest {
     /// transfers from the caller to the writer. `None` for
     /// non-transactional writes. Fix for #1732.
     pub(crate) txn: Option<DbTransaction>,
+    /// With caller inserts, receives the write's entries to insert into the
+    /// memtable before `done`. Dropped unsent if the writer inserts them.
+    pub(crate) ticket: Option<oneshot::Sender<InsertTicket>>,
 }
 
 impl std::fmt::Debug for BatchWriterMessage {
@@ -137,6 +152,8 @@ pub(crate) struct WriteBatchEventHandler {
     memtable_insert_tasks: usize,
     /// The helper threads for group inserts, started on the first group.
     insert_pool: Option<MemtableInsertPool>,
+    /// Whether a group's callers insert its entries. See [`CALLER_INSERTS_ENV`].
+    caller_inserts: bool,
 }
 
 impl WriteBatchEventHandler {
@@ -155,6 +172,7 @@ impl WriteBatchEventHandler {
             wal_writer,
             memtable_insert_tasks,
             insert_pool: None,
+            caller_inserts: caller_inserts_enabled(),
         }
     }
 
@@ -171,6 +189,7 @@ impl WriteBatchEventHandler {
             options,
             done,
             txn: _,
+            ticket,
         } = request;
         let result = self
             .db_inner
@@ -178,7 +197,12 @@ impl WriteBatchEventHandler {
             .await;
         match result {
             Ok(Ok((write, keys))) => {
-                group.push(StagedWrite { write, keys, done });
+                group.push(StagedWrite {
+                    write,
+                    keys,
+                    done,
+                    ticket,
+                });
                 Ok(())
             }
             Ok(Err(error)) => {
@@ -198,11 +222,17 @@ impl WriteBatchEventHandler {
         if group.is_empty() {
             return Ok(());
         }
-        let helpers = self.memtable_insert_tasks - 1;
-        let pool = self
-            .insert_pool
-            .get_or_insert_with(|| MemtableInsertPool::new(helpers));
-        self.db_inner.insert_staged_writes(group, pool)?;
+        let prune = self.db_inner.settings.memtable_prune_overwrites;
+        if self.caller_inserts && !(prune && has_repeated_keys(group)) {
+            self.db_inner
+                .insert_staged_writes_by_callers(group, prune)?;
+        } else {
+            let helpers = self.memtable_insert_tasks - 1;
+            let pool = self
+                .insert_pool
+                .get_or_insert_with(|| MemtableInsertPool::new(helpers));
+            self.db_inner.insert_staged_writes(group, pool)?;
+        }
         self.db_inner
             .publish_staged_writes(group, self.wal_writer.as_deref())?;
         for staged in group.drain(..) {
@@ -215,6 +245,15 @@ impl WriteBatchEventHandler {
         }
         Ok(())
     }
+}
+
+/// Whether two writes of `group` share a key. Pruning inserts must then land
+/// in order, which callers inserting in parallel do not keep.
+fn has_repeated_keys(group: &[StagedWrite]) -> bool {
+    let mut seen = HashSet::with_capacity(group.iter().map(|staged| staged.keys.len()).sum());
+    group
+        .iter()
+        .any(|staged| staged.keys.iter().any(|key| !seen.insert(key)))
 }
 
 /// Sends `error` to the caller of every write in `group`.
@@ -245,6 +284,7 @@ impl MessageHandler<BatchWriterMessage> for WriteBatchEventHandler {
                 options,
                 done,
                 txn,
+                ticket: _,
             }) => {
                 let wal_writer = self.wal_writer.as_deref_mut();
                 let result = self
@@ -286,7 +326,7 @@ impl MessageHandler<BatchWriterMessage> for WriteBatchEventHandler {
     }
 
     fn max_batch(&self) -> usize {
-        if self.memtable_insert_tasks > 1 {
+        if self.memtable_insert_tasks > 1 || self.caller_inserts {
             MAX_GROUP_WRITES
         } else {
             1
@@ -464,16 +504,7 @@ impl DbInner {
         group: &mut [StagedWrite],
         pool: &MemtableInsertPool,
     ) -> Result<(), SlateDBError> {
-        let table = {
-            let guard = self.state.read();
-            let memtable = guard.memtable();
-            for staged in group.iter_mut() {
-                let touched_segments = std::mem::take(&mut staged.write.touched_segments);
-                self.status_manager.add_memtable_segments(&touched_segments);
-                memtable.record_touched_segments(touched_segments);
-            }
-            Arc::clone(memtable.table())
-        };
+        let table = self.group_memtable(group);
         let mut entries =
             Vec::with_capacity(group.iter().map(|staged| staged.write.entries.len()).sum());
         for staged in group.iter_mut() {
@@ -492,6 +523,51 @@ impl DbInner {
             ));
         }
         Ok(())
+    }
+
+    /// Inserts a group of staged writes into the active memtable: each
+    /// write's caller inserts its own entries once handed an [`InsertTicket`],
+    /// and this thread inserts those no caller has taken. Readers do not see
+    /// them until [`Self::publish_staged_writes`]. With `prune`, no key may be
+    /// in two writes of the group.
+    fn insert_staged_writes_by_callers(
+        &self,
+        group: &mut [StagedWrite],
+        prune: bool,
+    ) -> Result<(), SlateDBError> {
+        let table = self.group_memtable(group);
+        let inserts = InsertGroup::new(
+            table,
+            group
+                .iter_mut()
+                .map(|staged| std::mem::take(&mut staged.write.entries)),
+            prune,
+        );
+        for (slot, staged) in group.iter_mut().enumerate() {
+            if let Some(ticket) = staged.ticket.take() {
+                let _ = ticket.send(InsertTicket::new(Arc::clone(&inserts), slot));
+            }
+        }
+        if !inserts.finish() {
+            return Err(SlateDBError::BackgroundTaskPanic(
+                "memtable insert panicked".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Records the group's touched segments on the active memtable and
+    /// returns its table. Only the writer task freezes the memtable, so the
+    /// table stays active until the group's inserts finish.
+    fn group_memtable(&self, group: &mut [StagedWrite]) -> Arc<KVTable> {
+        let guard = self.state.read();
+        let memtable = guard.memtable();
+        for staged in group.iter_mut() {
+            let touched_segments = std::mem::take(&mut staged.write.touched_segments);
+            self.status_manager.add_memtable_segments(&touched_segments);
+            memtable.record_touched_segments(touched_segments);
+        }
+        Arc::clone(memtable.table())
     }
 
     /// Records each write of an inserted group for conflict checks and makes
@@ -894,6 +970,7 @@ mod tests {
                 options,
                 done,
                 txn: None,
+                ticket: None,
             }),
             rx,
         )
@@ -1328,5 +1405,116 @@ mod tests {
         assert_eq!(db.get(b"key").await.unwrap().unwrap().as_ref(), b"v3");
         assert_eq!(db.get(b"other").await.unwrap().unwrap().as_ref(), b"x");
         db.close().await.unwrap();
+    }
+
+    /// Writes of one or two keys each, with a ticket per write. Callers of
+    /// even writes insert their own entries; odd writes' callers are gone, so
+    /// the writer inserts them.
+    fn caller_insert_messages(
+        writes: &[&[&[u8]]],
+    ) -> (
+        Vec<BatchWriterMessage>,
+        Vec<oneshot::Receiver<WriteBatchResult>>,
+        Vec<tokio::task::JoinHandle<()>>,
+    ) {
+        let mut messages = Vec::new();
+        let mut receivers = Vec::new();
+        let mut callers = Vec::new();
+        for (i, keys) in writes.iter().enumerate() {
+            let mut batch = WriteBatch::new();
+            for key in *keys {
+                batch.put(key, format!("value{i}").as_bytes());
+            }
+            let (mut message, done_rx) = test_message(batch, WriteOptions::default());
+            let BatchWriterMessage::WriteBatch(request) = &mut message else {
+                unreachable!("test_message builds writes");
+            };
+            let (ticket, ticket_rx) = oneshot::channel();
+            request.ticket = Some(ticket);
+            if i % 2 == 0 {
+                callers.push(tokio::spawn(async move {
+                    if let Ok(ticket) = ticket_rx.await {
+                        ticket.insert();
+                    }
+                }));
+            }
+            messages.push(message);
+            receivers.push(done_rx);
+        }
+        (messages, receivers, callers)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_handle_batch_with_caller_inserts_publishes_group() {
+        let db = Db::open(
+            "/tmp/test_handle_batch_with_caller_inserts_publishes_group",
+            Arc::new(InMemory::new()),
+        )
+        .await
+        .unwrap();
+        let mut handler =
+            WriteBatchEventHandler::new(db.inner.clone(), Some(Box::new(FakeWalWriter::new(0))), 1);
+        handler.caller_inserts = true;
+        let keys: Vec<Vec<u8>> = (0..600)
+            .map(|i| format!("key{i:04}").into_bytes())
+            .collect();
+        let writes: Vec<Vec<&[u8]>> = keys
+            .chunks(2)
+            .map(|pair| pair.iter().map(Vec::as_slice).collect())
+            .collect();
+        let writes: Vec<&[&[u8]]> = writes.iter().map(Vec::as_slice).collect();
+        let (messages, receivers, callers) = caller_insert_messages(&writes);
+
+        handler.handle_batch(messages).await.unwrap();
+        for caller in callers {
+            caller.await.unwrap();
+        }
+        let mut last_seq = 0;
+        for done_rx in receivers {
+            let seq = done_rx.await.unwrap().unwrap().seqnum();
+            assert!(seq > last_seq);
+            last_seq = seq;
+        }
+        assert_eq!(active_memtable_entry_num(&db), 600);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_handle_batch_with_caller_inserts_prunes_repeated_keys_in_order() {
+        let db = Db::builder(
+            "/tmp/test_handle_batch_with_caller_inserts_prunes_repeated_keys_in_order",
+            Arc::new(InMemory::new()),
+        )
+        .with_settings(prune_settings())
+        .build()
+        .await
+        .unwrap();
+        let mut handler =
+            WriteBatchEventHandler::new(db.inner.clone(), Some(Box::new(FakeWalWriter::new(0))), 1);
+        handler.caller_inserts = true;
+
+        // Distinct keys: callers insert, and each insert prunes nothing.
+        let (messages, receivers, callers) =
+            caller_insert_messages(&[&[b"a"], &[b"b"], &[b"c"], &[b"d"]]);
+        handler.handle_batch(messages).await.unwrap();
+        for caller in callers {
+            caller.await.unwrap();
+        }
+        for done_rx in receivers {
+            done_rx.await.unwrap().unwrap();
+        }
+        assert_eq!(active_memtable_entry_num(&db), 4);
+
+        // A key in several writes of one group: the writer inserts them in
+        // order, so each version prunes the one before it.
+        let (messages, receivers, callers) =
+            caller_insert_messages(&[&[b"a"], &[b"x"], &[b"a"], &[b"a", b"y"]]);
+        handler.handle_batch(messages).await.unwrap();
+        for caller in callers {
+            caller.await.unwrap();
+        }
+        for done_rx in receivers {
+            done_rx.await.unwrap().unwrap();
+        }
+        assert_eq!(active_memtable_entry_num(&db), 6);
     }
 }
