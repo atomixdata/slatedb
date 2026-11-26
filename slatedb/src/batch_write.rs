@@ -669,12 +669,20 @@ impl DbInner {
         let mut replies = Vec::new();
         {
             let mut queue = self.caller_groups.lock();
-            while queue.front().is_some_and(|group| group.inserts.is_inserted()) {
+            while queue
+                .front()
+                .is_some_and(|group| group.inserts.is_inserted())
+            {
                 let group = queue.pop_front().expect("the queue has a head");
                 if group.inserts.panicked() {
                     let error =
                         SlateDBError::BackgroundTaskPanic("memtable insert panicked".to_string());
-                    replies.extend(group.writes.into_iter().map(|w| (w.done, Err(error.clone()))));
+                    replies.extend(
+                        group
+                            .writes
+                            .into_iter()
+                            .map(|w| (w.done, Err(error.clone()))),
+                    );
                     continue;
                 }
                 self.txn_manager.track_recent_committed_write_batches(
@@ -712,7 +720,10 @@ impl DbInner {
                 if queue.is_empty() {
                     return;
                 }
-                queue.iter().map(|group| Arc::clone(&group.inserts)).collect()
+                queue
+                    .iter()
+                    .map(|group| Arc::clone(&group.inserts))
+                    .collect()
             };
             for group in &groups {
                 group.insert_rest(0);
@@ -1811,6 +1822,16 @@ mod tests {
         assert!(db.inner.caller_groups.lock().is_empty());
         assert_eq!(active_memtable_entry_num(&db), 0);
         let guard = db.inner.state.read();
-        assert_eq!(guard.state().imm_memtable.front().unwrap().table().metadata().entry_num, 2);
+        assert_eq!(
+            guard
+                .state()
+                .imm_memtable
+                .front()
+                .unwrap()
+                .table()
+                .metadata()
+                .entry_num,
+            2
+        );
     }
 }
